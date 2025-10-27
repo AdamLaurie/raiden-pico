@@ -294,6 +294,9 @@ def run_glitch_test(num_iterations=1, verbose=True):
     print(f"ChipSHOUTER LPC Bootloader Glitch Test")
     print("=" * 60)
 
+    # Track timing
+    start_time = time.time()
+
     ser = None
 
     for iteration in range(num_iterations):
@@ -365,6 +368,11 @@ def run_glitch_test(num_iterations=1, verbose=True):
         except:
             pass
 
+    # Calculate timing
+    end_time = time.time()
+    total_time = end_time - start_time
+    time_per_attempt = total_time / num_iterations if num_iterations > 0 else 0
+
     # Print summary
     if num_iterations > 1:
         total_failed = fail_error19_count + fail_no_response_count
@@ -375,6 +383,9 @@ def run_glitch_test(num_iterations=1, verbose=True):
         print(f"  Failed (No Response):{fail_no_response_count}/{num_iterations}")
         print(f"  Unknown:             {unknown_count}/{num_iterations}")
         print(f"  Success Rate:        {(success_count / num_iterations) * 100:.1f}%")
+        print(f"\nTiming:")
+        print(f"  Total Time:          {total_time:.2f}s")
+        print(f"  Time per Attempt:    {time_per_attempt:.2f}s")
 
 
 def main():
