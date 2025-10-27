@@ -17,33 +17,50 @@ Tests ChipSHOUTER glitching of the LPC bootloader by attempting to bypass securi
 **Usage:**
 
 ```bash
-# Single glitch test
+# Single glitch test with default parameters (V=350, Pulse=8000 cycles)
 ./scripts/test_chipshouter_lpc_glitch.py
 
 # Run multiple iterations
 ./scripts/test_chipshouter_lpc_glitch.py -n 10
 
+# Custom voltage and pulse width
+./scripts/test_chipshouter_lpc_glitch.py -v 320 -p 10000
+
+# Custom voltage reduction step (default: 10V)
+./scripts/test_chipshouter_lpc_glitch.py --voltage-step 20
+
 # Quiet mode (less verbose output)
 ./scripts/test_chipshouter_lpc_glitch.py -q
 
-# Multiple iterations with summary
-./scripts/test_chipshouter_lpc_glitch.py -n 100
+# Multiple iterations with custom parameters
+./scripts/test_chipshouter_lpc_glitch.py -n 100 -v 350 -p 8000
 ```
+
+**Parameters:**
+
+- `-n, --num-iterations`: Number of test iterations (default: 1)
+- `-v, --voltage`: ChipSHOUTER voltage in volts (default: 350)
+- `-p, --pulse-width`: Pico glitch pulse width in cycles (default: 8000)
+- `--voltage-step`: Voltage reduction step on no-response failures (default: 10)
+- `-q, --quiet`: Suppress verbose output
 
 **Test Sequence:**
 
 1. Reboots the Pico for clean state
-2. Sets target to LPC
-3. Syncs with LPC bootloader (115200 baud, 12MHz crystal, 10ms reset delay)
-4. Configures UART trigger on byte 0x0d (carriage return)
-5. Sets ChipSHOUTER to hardware trigger HIGH
-6. Arms ChipSHOUTER
-7. Arms Pico trigger system
-8. Sends "R 0 516096" read command to target
-9. Analyzes response:
-   - Response "19" = Glitch FAILED (normal error response)
-   - Response "0" = Glitch SUCCESS (security bypass)
-   - No response or unexpected = May indicate successful glitch (target hung/crashed)
+2. Resets ChipSHOUTER
+3. Sets target to LPC
+4. Syncs with LPC bootloader (115200 baud, 12MHz crystal, 10ms reset delay)
+5. Configures ChipSHOUTER voltage and Pico pulse width
+6. Configures UART trigger on byte 0x0d (carriage return)
+7. Sets ChipSHOUTER to hardware trigger HIGH
+8. Arms ChipSHOUTER
+9. Arms Pico trigger system
+10. Sends "R 0 516096" read command to target
+11. Analyzes response:
+    - Response "19" = Glitch FAILED (normal error response)
+    - Response "0" = Glitch SUCCESS (security bypass)
+    - No response = Target hung/crashed (retries with reduced voltage)
+12. If no response: Automatically reduces ChipSHOUTER voltage by voltage_step and retries until getting error 19 or success
 
 **Example Output:**
 

