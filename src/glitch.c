@@ -351,6 +351,10 @@ void glitch_update_flags(void) {
     // Update flag outputs if configured
     // This can be called periodically from main loop
 
+    // Check if glitch fired and auto-disarm if needed
+    // This calls glitch_get_count() which checks FIFO empty and disarms
+    glitch_get_count();
+
     // Note: UART trigger is now handled in target_uart_process()
     // where hardware UART data is already being read
 
