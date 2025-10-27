@@ -32,7 +32,8 @@ target_include_directories(raiden_pico PRIVATE
 # Generate PIO headers
 pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/glitch.pio)
 pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/platform.pio)
-pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/uart.pio)
+# uart.pio not used - target UART uses hardware UART (uart1), not PIO
+# pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/uart.pio)
 
 # Link libraries
 target_link_libraries(raiden_pico

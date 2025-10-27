@@ -138,6 +138,15 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
     // Initialize UART1 on GP4/GP5 with specified baud
     target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, baud);
 
+    // Disable UART interrupt during bootloader communication to avoid race conditions
+    // We use blocking reads during bootloader sync, so interrupts would interfere
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+
+    // Clear any stale data from UART RX FIFO that may have accumulated
+    while (uart_is_readable(TARGET_UART_ID)) {
+        uart_getc(TARGET_UART_ID);
+    }
+
     // Target-specific bootloader entry
     switch (current_target_type) {
         case TARGET_LPC:
@@ -145,6 +154,9 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 
             // Clear response buffer
             target_uart_clear_response();
+
+            // Small delay to ensure target UART is fully ready after reset and UART init
+            sleep_ms(10);
 
             // 1. Send '?' (0x3F) - sync character
             uart_cli_send("Sending '?'...\r\n");
@@ -214,6 +226,9 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
             return false;
     }
 
+    // Re-enable UART RX interrupts for normal trigger operation
+    uart_set_irq_enables(TARGET_UART_ID, true, false);
+
     uart_cli_printf("OK: Bootloader mode active at %u baud on GP4/GP5\r\n", baud);
     return true;
 }
@@ -221,8 +236,24 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     target_baud = baud;
 
+    // Always deinitialize first to ensure clean state
+    // After Pico boot, UART peripheral and GPIO may be in undefined state
+    if (target_initialized) {
+        uart_set_irq_enables(TARGET_UART_ID, false, false);
+        irq_set_enabled(UART1_IRQ, false);
+    }
+    uart_deinit(TARGET_UART_ID);  // Always deinit, even on first use
+
+    // Deinitialize GPIO pins to clear any previous state
+    // Critical for first use after Pico reboot
+    gpio_deinit(tx_pin);
+    gpio_deinit(rx_pin);
+
     // Initialize UART1
     uart_init(TARGET_UART_ID, baud);
+
+    // Set UART format explicitly (8 data bits, 1 stop bit, no parity)
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
 
     // Set TX and RX pins for UART1
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
@@ -230,6 +261,9 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
 
     // Enable UART FIFO
     uart_set_fifo_enabled(TARGET_UART_ID, true);
+
+    // Small delay to allow UART hardware to stabilize after initialization
+    sleep_us(100);
 
     // Enable UART RX interrupt for minimal trigger latency
     irq_set_exclusive_handler(UART1_IRQ, target_uart_irq_handler);
@@ -254,6 +288,8 @@ void target_uart_send_byte(uint8_t byte) {
     }
 
     uart_putc_raw(TARGET_UART_ID, byte);
+    // Wait for TX FIFO to actually transmit the byte
+    uart_tx_wait_blocking(TARGET_UART_ID);
 
     // Display sent byte in debug mode
     if (debug_mode) {
@@ -521,6 +557,11 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
         }
 
         gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state
+
+        // Critical: After Pico reboot, reset pin may have been floating/LOW
+        // Give target time to come out of reset before first reset pulse
+        sleep_ms(100);
+
         reset_pin_initialized = true;
     }
 
