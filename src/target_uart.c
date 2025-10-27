@@ -320,6 +320,9 @@ void target_uart_send_string(const char *str) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
     }
 
+    // Disable UART RX interrupt to prevent it from bypassing echo filtering
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+
     // Clear response buffer before sending
     target_uart_clear_response();
 
@@ -399,6 +402,9 @@ void target_uart_send_string(const char *str) {
         sleep_us(100);  // Small delay to avoid busy waiting
     }
 
+    // Re-enable UART RX interrupt for trigger detection
+    uart_set_irq_enables(TARGET_UART_ID, true, false);
+
     // Display response
     target_uart_print_response_hex();
 }
@@ -408,6 +414,9 @@ void target_uart_send_hex(const char *hex_str) {
     if (!target_initialized) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
     }
+
+    // Disable UART RX interrupt to prevent it from bypassing echo filtering
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
 
     // Clear response buffer before sending
     target_uart_clear_response();
@@ -541,6 +550,9 @@ void target_uart_send_hex(const char *hex_str) {
         }
         sleep_us(100);  // Small delay to avoid busy waiting
     }
+
+    // Re-enable UART RX interrupt for trigger detection
+    uart_set_irq_enables(TARGET_UART_ID, true, false);
 
     // Display response
     target_uart_print_response_hex();
