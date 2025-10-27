@@ -78,6 +78,19 @@ void target_init(void) {
     // Initialize reset pin with defaults on startup
     // This ensures TARGET RESET works without explicit configuration
     target_reset_config(reset_pin, reset_period_ms, reset_active_high);
+
+    // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
+    // This works around an issue where first UART TX after boot fails
+    gpio_init(TARGET_UART_TX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    sleep_ms(10);
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_TX_PIN);
+    gpio_deinit(TARGET_UART_RX_PIN);
 }
 
 // Helper function to wait for and read a response with timeout
@@ -399,6 +412,9 @@ void target_uart_send_hex(const char *hex_str) {
     // Clear response buffer before sending
     target_uart_clear_response();
 
+    // Track what we're sending for echo removal
+    sent_data_len = 0;
+
     // Parse hex string and send bytes
     const char *p = hex_str;
     while (*p) {
@@ -423,6 +439,9 @@ void target_uart_send_hex(const char *hex_str) {
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
             }
+            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
+                sent_data[sent_data_len++] = byte;
+            }
             target_uart_send_byte(byte);
             p++;
         } else if (*p >= 'a' && *p <= 'f') {
@@ -434,6 +453,9 @@ void target_uart_send_hex(const char *hex_str) {
                 byte |= (*p - 'a' + 10);
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
+            }
+            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
+                sent_data[sent_data_len++] = byte;
             }
             target_uart_send_byte(byte);
             p++;
@@ -447,6 +469,9 @@ void target_uart_send_hex(const char *hex_str) {
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
             }
+            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
+                sent_data[sent_data_len++] = byte;
+            }
             target_uart_send_byte(byte);
             p++;
         } else {
@@ -455,6 +480,9 @@ void target_uart_send_hex(const char *hex_str) {
     }
 
     // Always append \r
+    if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
+        sent_data[sent_data_len++] = '\r';
+    }
     target_uart_send_byte('\r');
 
     uart_cli_send("OK: Data sent to target\r\n");
@@ -464,6 +492,9 @@ void target_uart_send_hex(const char *hex_str) {
 
     // Wait for response (500ms timeout) - actively poll UART
     uint32_t start = to_ms_since_boot(get_absolute_time());
+    uint16_t echo_match_pos = 0;
+    bool echo_skipped = false;
+
     while (to_ms_since_boot(get_absolute_time()) - start < 500) {
         // Read any incoming data
         while (uart_is_readable(TARGET_UART_ID)) {
@@ -481,8 +512,29 @@ void target_uart_send_hex(const char *hex_str) {
                 uart_cli_send("\r\n");
             }
 
-            // Store in response buffer
-            if (target_response_pos < TARGET_RESPONSE_SIZE - 1) {
+            // Check if this is part of the echo
+            if (!echo_skipped && echo_match_pos < sent_data_len) {
+                if (byte == (uint8_t)sent_data[echo_match_pos]) {
+                    echo_match_pos++;
+                    if (echo_match_pos == sent_data_len) {
+                        echo_skipped = true;  // Echo complete, start collecting real response
+                    }
+                    continue;  // Skip storing echo bytes
+                } else {
+                    // Not matching echo, must be actual response
+                    // Store any previously skipped bytes that weren't echo
+                    for (uint16_t i = 0; i < echo_match_pos; i++) {
+                        if (target_response_pos < TARGET_RESPONSE_SIZE - 1) {
+                            target_response[target_response_pos++] = sent_data[i];
+                            target_response_count++;
+                        }
+                    }
+                    echo_skipped = true;  // Stop trying to match echo
+                }
+            }
+
+            // Store in response buffer (after echo is skipped)
+            if (echo_skipped && target_response_pos < TARGET_RESPONSE_SIZE - 1) {
                 target_response[target_response_pos++] = byte;
                 target_response_count++;
             }
@@ -521,14 +573,33 @@ void target_uart_print_response_hex(void) {
         return;
     }
 
-    uart_cli_send("Response data (hex):\r\n");
-    for (uint16_t i = 0; i < target_response_pos; i++) {
-        uart_cli_printf("%02X ", (uint8_t)target_response[i]);
-        if ((i + 1) % 16 == 0) {
-            uart_cli_send("\r\n");
+    uart_cli_printf("Response (%u bytes):\r\n", target_response_count);
+
+    // Print in hex dump format: hex bytes on left, ASCII on right
+    for (uint16_t i = 0; i < target_response_pos; i += 16) {
+        // Print hex bytes
+        for (uint16_t j = 0; j < 16; j++) {
+            if (i + j < target_response_pos) {
+                uart_cli_printf("%02X ", (uint8_t)target_response[i + j]);
+            } else {
+                uart_cli_send("   ");  // Padding for incomplete line
+            }
         }
+
+        uart_cli_send(" | ");
+
+        // Print ASCII representation
+        for (uint16_t j = 0; j < 16 && (i + j) < target_response_pos; j++) {
+            uint8_t byte = (uint8_t)target_response[i + j];
+            if (byte >= 32 && byte < 127) {
+                uart_cli_printf("%c", byte);
+            } else {
+                uart_cli_send(".");
+            }
+        }
+
+        uart_cli_send("\r\n");
     }
-    uart_cli_send("\r\n");
 }
 
 void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
