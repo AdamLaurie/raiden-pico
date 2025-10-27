@@ -1,13 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(else echo \"Waiting... ($i/15)\")",
-      "Bash(BACKUP_NAME=raiden-pico-v0.3-blocking-read-20251027_102435:*)",
-      "Bash(ls:*)",
-      "Bash(then cp /tmp/restore-v0.3/raiden_pico.uf2 /media/addy/RP2350/)",
-      "Bash(else echo \"Waiting for bootloader... ($i/15)\")",
-      "Bash(then cp /home/addy/work/claude-code/raiden-pico/build/raiden_pico.uf2 /media/addy/RP2350/)",
-      "Bash(tee:*)"
+      "Bash(xargs:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(nm:*)",
+      "Bash(chmod:*)",
+      "Bash(then python3 -c \"import serial; s = serial.Serial(''/dev/ttyACM0'', 115200, timeout=1); s.write(b''REBOOT BL\\r\\n''); s.close()\")"
     ],
     "deny": [],
     "ask": []
