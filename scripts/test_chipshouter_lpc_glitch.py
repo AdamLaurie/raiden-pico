@@ -157,15 +157,20 @@ def setup_lpc_target(ser, verbose=False):
         print("LPC bootloader sync complete")
 
 
-def configure_glitch(ser, voltage=350, pulse_width=8000, verbose=False):
+def configure_glitch(ser, voltage=350, pause=8000, pulse_width=150, verbose=False):
     """Configure trigger and ChipSHOUTER settings."""
     if verbose:
-        print(f"\nConfiguring glitch parameters (V={voltage}, Pulse={pulse_width} cycles)...")
+        print(f"\nConfiguring glitch parameters (V={voltage}, Pause={pause}, Width={pulse_width} cycles)...")
 
     # Set ChipSHOUTER voltage
     response = send_command(ser, f"CS VOLTAGE {voltage}", wait_time=0.5, verbose=verbose)
     if "#" not in response:
         raise Exception(f"CS VOLTAGE command failed - no ChipSHOUTER prompt in response: '{response}'")
+
+    # Set Pico glitch pause (delay before glitch)
+    response = send_command(ser, f"SET PAUSE {pause}", wait_time=0.2, verbose=verbose)
+    if "OK:" not in response:
+        raise Exception(f"SET PAUSE command failed - response: {response}")
 
     # Set Pico glitch pulse width (in cycles)
     response = send_command(ser, f"SET WIDTH {pulse_width}", wait_time=0.2, verbose=verbose)
@@ -293,7 +298,7 @@ def perform_quick_glitch_test(ser, verbose=False):
         return "UNKNOWN"
 
 
-def run_glitch_test(num_iterations=1, voltage=350, pulse_width=8000, voltage_step=10, verbose=True):
+def run_glitch_test(num_iterations=1, voltage=350, pause=8000, pulse_width=150, voltage_step=10, verbose=True):
     """Run the complete glitch test sequence."""
 
     success_count = 0
@@ -332,7 +337,7 @@ def run_glitch_test(num_iterations=1, voltage=350, pulse_width=8000, voltage_ste
                     setup_lpc_target(ser, verbose=verbose)
 
                     # Configure glitch parameters
-                    configure_glitch(ser, voltage=current_voltage, pulse_width=pulse_width, verbose=verbose)
+                    configure_glitch(ser, voltage=current_voltage, pause=pause, pulse_width=pulse_width, verbose=verbose)
 
                     # Perform glitch test
                     result = perform_glitch_test(ser, verbose=verbose)
@@ -450,10 +455,16 @@ def main():
         help='ChipSHOUTER voltage (default: 350)'
     )
     parser.add_argument(
-        '-p', '--pulse-width',
+        '--pause',
         type=int,
         default=8000,
-        help='Pico glitch pulse width in cycles (default: 8000)'
+        help='Pico glitch pause in cycles (default: 8000)'
+    )
+    parser.add_argument(
+        '-p', '--pulse-width',
+        type=int,
+        default=150,
+        help='Pico glitch pulse width in cycles (default: 150)'
     )
     parser.add_argument(
         '--voltage-step',
@@ -473,6 +484,7 @@ def main():
         run_glitch_test(
             num_iterations=args.num_iterations,
             voltage=args.voltage,
+            pause=args.pause,
             pulse_width=args.pulse_width,
             voltage_step=args.voltage_step,
             verbose=not args.quiet
