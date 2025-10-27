@@ -1,0 +1,26 @@
+; PIO-based UART TX (8N1)
+.program pio_uart_tx
+.side_set 1 opt
+
+.wrap_target
+    pull block          side 1  ; Get byte to transmit, idle high
+    set x, 7            side 0  ; Start bit (low), load bit counter
+bitloop:
+    out pins, 1                 ; Output data bit
+    jmp x-- bitloop [6]         ; Loop for 8 bits with delay
+    nop                 side 1 [6]  ; Stop bit (high)
+.wrap
+
+; PIO-based UART RX (8N1)
+.program pio_uart_rx
+.wrap_target
+    wait 0 pin 0        ; Wait for start bit (HIGH to LOW)
+    set x, 7 [10]       ; Load bit counter, delay to center of first bit
+bitloop:
+    in pins, 1          ; Sample data bit
+    jmp x-- bitloop [6] ; Loop for 8 bits with delay
+    jmp pin good_stop   ; Check stop bit
+    irq 0               ; Signal framing error
+good_stop:
+    push block          ; Push byte to FIFO
+.wrap

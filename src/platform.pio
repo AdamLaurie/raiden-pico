@@ -1,0 +1,35 @@
+; Voltage PWM control
+.program voltage_pwm
+    pull block          ; Get PWM parameters: high_time in upper 16, low_time in lower 16
+    mov y, osr          ; Save to Y for reuse
+.wrap_target
+    mov osr, y          ; Reload parameters
+    out x, 16           ; Get high_time (upper 16 bits)
+    set pins, 1         ; Set output HIGH
+high_loop:
+    jmp x-- high_loop [1]  ; High period delay
+    out x, 16           ; Get low_time (lower 16 bits)
+    set pins, 0         ; Set output LOW
+low_loop:
+    jmp x-- low_loop [1]   ; Low period delay
+.wrap
+
+; Platform enable control with charge delay
+.program platform_enable
+.wrap_target
+    pull block          ; Get command: cycles (0=disable, >0=enable with charge delay)
+    out x, 32           ; Move to X
+    jmp !x disable      ; If X is 0, disable
+    set pins, 1         ; Enable output
+charge_loop:
+    jmp x-- charge_loop ; Wait for charge cycles
+.wrap
+disable:
+    set pins, 0         ; Disable output
+
+; Status input monitoring
+.program status_monitor
+.wrap_target
+    in pins, 1          ; Read status pin
+    push noblock        ; Push to FIFO (non-blocking, drops old data if full)
+.wrap

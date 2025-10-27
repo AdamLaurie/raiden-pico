@@ -1,0 +1,23 @@
+.program uart_rx_snoop
+; Snoops a UART RX line (8N1), sampling at mid-bit with 8x oversample.
+; SM clock must be set to 8 * baud.
+; IN pins must be configured to the target RX GPIO.
+
+.wrap_target
+    wait 0 pin 0          ; wait for start bit (line goes low)
+
+    ; Align to centre of first data bit: ~1.5 bit-times = 12 PIO cycles at 8x
+    nop        [7]        ; 8 cycles
+    nop        [3]        ; +4 cycles = 12
+
+    set y, 7              ; 8 data bits
+
+bitloop:
+    in     pins, 1  [7]   ; sample 1 bit, then wait remaining 7 cycles (total 8 per bit)
+    jmp    y-- bitloop
+
+    ; Burn one stop-bit time to re-arm next start detect (optional stop check omitted)
+    nop        [7]
+
+    push                  ; push 8-bit byte (autopush threshold = 8)
+.wrap

@@ -1,0 +1,104 @@
+; GPIO edge detection (rising edge)
+.program gpio_edge_detect
+.wrap_target
+    wait 0 pin 0        ; Wait for pin to be low
+    wait 1 pin 0        ; Wait for pin to go high (rising edge)
+    irq 0               ; Generate interrupt
+.wrap
+
+; GPIO falling edge detection
+.program gpio_falling_detect
+.wrap_target
+    wait 1 pin 0        ; Wait for pin to be high
+    wait 0 pin 0        ; Wait for pin to go low (falling edge)
+    irq 0               ; Generate interrupt
+.wrap
+
+; UART RX with byte matching - NO autopush, direct ISR comparison
+; SM clock = 8× baud rate, IN pin 0 = GP28 (jumpered from GP5)
+; RP2350B BUG: PIO and UART peripheral cannot share GPIO - requires GP5→GP28 jumper
+; Shift right to receive LSB-first UART data
+.program uart_rx_decoder
+    pull block          ; Get trigger byte from FIFO
+    mov y, osr          ; Store trigger byte in Y
+
+.wrap_target
+start:
+    mov isr, null       ; Clear ISR before receiving new byte
+    wait 0 pin 0        ; Wait for start bit
+    set x, 7 [10]       ; Preload bit counter, delay to eye of first data bit
+bitloop:
+    in pins, 1          ; Shift data bit into ISR (right shift)
+    jmp x-- bitloop [6] ; Loop 8 times, 8 cycles each
+
+    ; Now ISR contains the received byte (in bits [24:31] after right shift)
+    ; Move ISR to X for comparison
+    mov x, isr          ; X = received byte (bits [24:31] = data, bits [0:23] = 0)
+    jmp x!=y start      ; If not equal to trigger byte, loop back
+
+    ; Match! Trigger the glitch
+    irq set 0
+.wrap
+
+; Pulse generator with IRQ trigger
+; Waits for IRQ flag, then pulls parameters from FIFO: PAUSE, then (WIDTH, GAP) for each pulse
+.program pulse_generator
+.wrap_target
+start:
+    set pins, 0         ; Ensure glitch pin is LOW before waiting
+    wait 1 irq 0            ; Wait for IRQ 0 (shared between all SMs)
+    pull block          ; Get PAUSE value
+    out x, 32           ; Move to X
+pause_loop:
+    jmp x-- pause_loop  ; Wait for PAUSE cycles
+
+    ; Pulse loop - runs COUNT times (controlled by feeding data)
+pulse_loop:
+    pull block          ; Get WIDTH value
+    out x, 32           ; Move to X
+    set pins, 1         ; Set output HIGH
+width_loop:
+    jmp x-- width_loop  ; Wait for WIDTH cycles
+
+    pull block          ; Get GAP value
+    out x, 32           ; Move to X
+    set pins, 0         ; Set output LOW
+gap_loop:
+    jmp x-- gap_loop    ; Wait for GAP cycles
+.wrap                   ; Wrap back to start to wait for next trigger
+
+; Flag output - outputs 4-bit flags to GPIO
+.program flag_output
+.wrap_target
+    pull block          ; Get all 4 flags as 32-bit word
+    out pins, 4         ; Output lower 4 bits to pins
+.wrap
+
+; Clock generator with delay for precise timing
+.program clock_generator_delay
+    pull block          ; Get half-period cycle count
+    mov y, osr          ; Save to Y for reuse
+.wrap_target
+    set pins, 1         ; Set HIGH
+    mov x, y            ; Load half-period count
+high:
+    jmp x-- high        ; Delay for half period
+    set pins, 0         ; Set LOW
+    mov x, y            ; Load half-period count
+low:
+    jmp x-- low         ; Delay for half period
+.wrap
+
+; Simple clock generator
+.program clock_generator
+.wrap_target
+    set pins, 1         ; Set output HIGH
+    set pins, 0         ; Set output LOW
+.wrap
+
+; IRQ trigger helper - single instruction that sets IRQ 0 and wraps
+; This allows CPU to trigger via pio_sm_exec without instruction overhead
+.program irq_trigger
+.wrap_target
+    irq set 0           ; Set IRQ 0 and immediately wrap
+.wrap
