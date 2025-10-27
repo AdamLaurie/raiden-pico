@@ -218,7 +218,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] - Reset + bootloader\r\n");
-        uart_cli_send("                   (defaults: 115200, 12000, 300ms)\r\n");
+        uart_cli_send("                   (defaults: 115200, 12000, 10ms)\r\n");
         uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
         uart_cli_send("                   Examples: 3F, 68656C6C6F, \"hello\"\r\n");
         uart_cli_send("TARGET RESPONSE - Show response from target\r\n");
@@ -509,7 +509,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "SYNC") == 0) {
             uint32_t baud = 115200;       // Default baud
             uint32_t crystal_khz = 12000; // Default 12MHz crystal
-            uint32_t reset_delay_ms = 300; // Default 300ms delay
+            uint32_t reset_delay_ms = 10; // Default 10ms delay (tested reliable from 1ms-300ms)
             if (parts->count >= 3) {
                 baud = atoi(parts->parts[2]);
             }
