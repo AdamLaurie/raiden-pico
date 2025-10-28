@@ -68,8 +68,11 @@ def wait_for_response(ser, expected_text, timeout=5.0):
     return False, full_response
 
 
-def check_and_clear_chipshouter_faults(ser):
-    """Check for ChipSHOUTER faults and clear them."""
+def check_and_clear_chipshouter_faults(ser, voltage=None):
+    """Check for ChipSHOUTER faults and clear them.
+
+    Returns: (was_faulted, did_reset)
+    """
     # Check status
     response = send_command(ser, "CS STATUS", wait_time=0.5)
 
@@ -77,23 +80,36 @@ def check_and_clear_chipshouter_faults(ser):
     if "fault" in response.lower():
         print("WARNING: ChipSHOUTER is faulted! Clearing faults...")
 
-        # Clear faults
+        # Try to clear faults first (don't reset unless necessary)
         send_command(ser, "CS CLEAR FAULTS", wait_time=0.5)
         time.sleep(1.0)
 
-        # Reset to be sure
+        # Check if clear worked
+        response = send_command(ser, "CS STATUS", wait_time=0.5)
+        if "fault" not in response.lower():
+            print("ChipSHOUTER faults cleared successfully")
+            return True, False
+
+        # Clear didn't work - reset as last resort
+        print("WARNING: Clear faults didn't work, resetting ChipSHOUTER...")
         send_command(ser, "CS RESET", wait_time=0.5)
         time.sleep(5.0)
 
-        # Check status again
+        # Re-configure voltage after reset if provided
+        if voltage is not None:
+            print(f"Reconfiguring voltage to {voltage}V after reset...")
+            send_command(ser, f"CS VOLTAGE {voltage}", wait_time=0.5)
+            time.sleep(1.0)
+
+        # Check status after reset
         response = send_command(ser, "CS STATUS", wait_time=0.5)
         if "fault" in response.lower():
-            raise Exception("ChipSHOUTER still faulted after clear/reset!")
+            raise Exception("ChipSHOUTER still faulted after clear and reset!")
 
-        print("ChipSHOUTER faults cleared successfully")
-        return True
+        print("ChipSHOUTER reset complete, faults cleared")
+        return True, True
 
-    return False
+    return False, False
 
 
 def initial_setup(ser):
@@ -124,15 +140,16 @@ def initial_setup(ser):
 
     # Check and clear any ChipSHOUTER faults
     print("\nChecking ChipSHOUTER status...")
-    check_and_clear_chipshouter_faults(ser)
+    was_faulted, did_reset = check_and_clear_chipshouter_faults(ser)
 
-    # Reset ChipSHOUTER
-    print("\nResetting ChipSHOUTER...")
-    try:
-        send_command(ser, "CS RESET", wait_time=0.5)
-        time.sleep(5.0)
-    except Exception as e:
-        print(f"Warning: ChipSHOUTER reset error: {e}")
+    # Reset ChipSHOUTER if not already reset by fault handling
+    if not did_reset:
+        print("\nResetting ChipSHOUTER...")
+        try:
+            send_command(ser, "CS RESET", wait_time=0.5)
+            time.sleep(5.0)
+        except Exception as e:
+            print(f"Warning: ChipSHOUTER reset error: {e}")
 
     # Set target to LPC
     response = send_command(ser, "TARGET LPC", wait_time=0.2)
@@ -326,9 +343,13 @@ def run_marathon(duration_hours=12):
                         if current_time - last_fault_check >= 300:
                             print("\n[Periodic fault check]")
                             try:
-                                was_faulted = check_and_clear_chipshouter_faults(ser)
+                                was_faulted, did_reset = check_and_clear_chipshouter_faults(ser, voltage=voltage)
                                 if was_faulted:
                                     print("WARNING: ChipSHOUTER was faulted but has been cleared")
+                                    if did_reset:
+                                        print("ChipSHOUTER was reset - re-arming and reconfiguring...")
+                                        # After reset, need to reconfigure and re-arm
+                                        send_command(ser, "CS TRIGGER HARDWARE HIGH", wait_time=0.5)
                                     # Re-arm after clearing faults
                                     send_command(ser, "CS ARM", wait_time=1.0)
                             except Exception as e:
