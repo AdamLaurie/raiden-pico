@@ -102,8 +102,21 @@ If repositioning doesn't help:
 - **scripts/test_glitch_firing.py** - Glitch firing verification
 - **scripts/check_chipshouter_voltage.py** - ChipSHOUTER status check
 
+## UPDATE: Success - Crash Window Found!
+
+**After extended testing at lower voltages, we found a crash window:**
+- **Voltage: 300V** (not 400-500V as initially tested)
+- **Pause: 0-1000 cycles** (early timing, not late window)
+- **Width: 100-250 cycles**
+- **Result: Consistent target crashes (NO_RESPONSE)**
+
+This confirms:
+- ✅ ChipSHOUTER positioning is correct
+- ✅ EMFI is successfully affecting the target
+- ✅ Vulnerable timing windows exist
+
 ## Current Status
 
-All software testing completed. Hardware requires physical inspection and adjustment.
+**Marathon test running**: 8-hour automated parameter sweep to find security bypass window (response "0") near the crash parameters.
 
-The Raiden Pico platform is working perfectly - the issue is almost certainly physical positioning of the ChipSHOUTER coil relative to the target chip.
+The Raiden Pico platform is working perfectly. Initial short tests (5 min) only covered a limited parameter space. Extended testing (hours) with broader voltage/timing ranges revealed the crash window.

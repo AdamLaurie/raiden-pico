@@ -1,13 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(xargs:*)",
-      "Bash(git add:*)",
-      "Bash(git commit:*)",
-      "Bash(git push:*)",
-      "Bash(nm:*)",
-      "Bash(chmod:*)",
-      "Bash(then python3 -c \"import serial; s = serial.Serial(''/dev/ttyACM0'', 115200, timeout=1); s.write(b''REBOOT BL\\r\\n''); s.close()\")"
+      "Bash(timeout 60 python3:*)",
+      "Bash(timeout 5 python3:*)",
+      "Bash(git restore:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

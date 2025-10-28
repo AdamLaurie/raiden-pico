@@ -181,11 +181,23 @@ Checks ChipSHOUTER voltage and armed status.
 - Total testing time: ~13-14 minutes for all 312+ tests
 - Fast iteration enabled by not resetting between tests
 
-## Conclusion
+## Update: Crash Window Found!
 
-The glitching hardware and firmware are working correctly, but no successful glitch or crash has been achieved across 312+ parameter combinations covering the full valid parameter space.
+**NEW FINDING (2025-10-28)**: Crashes (NO_RESPONSE) found at:
+- **Voltage: 300V**
+- **Pause: 0-1000 cycles**
+- **Width: 100-250 cycles**
 
-The most likely issue is **physical positioning** of the ChipSHOUTER coil, which cannot be verified or adjusted through software testing alone. Physical inspection and adjustment of the setup is recommended.
+The initial quick tests (5 minutes, ~312 tests) showed only ERROR19 because they focused on higher voltages (400-500V) and later timing windows (6500-8000 cycles). However, when testing at **lower voltage (300V) with earlier timing (0-1000 cycles)**, we consistently get target crashes.
+
+## Conclusion (Updated)
+
+The glitching hardware and firmware are working correctly. We have found a **crash window** at V=300, early pause timing. This confirms:
+- ✅ ChipSHOUTER is physically positioned correctly
+- ✅ EMFI is affecting the target
+- ✅ Parameter space contains vulnerable windows
+
+**Next step**: Long-running tests (hours) to find the narrow success window within/near the crash parameters where we get security bypass (response "0") instead of just crashes.
 
 Alternative possibilities include:
 - Target is naturally EMFI-resistant

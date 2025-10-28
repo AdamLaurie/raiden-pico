@@ -87,9 +87,62 @@ Performing glitch test...
 ✓ GLITCH SUCCESS - Security bypass detected!
 ```
 
+### glitch_marathon.py
+
+Long-running parameter sweep designed to run for hours. Tests parameter space repeatedly to find rare glitch windows. Logs all results to timestamped CSV files.
+
+**Usage:**
+
+```bash
+# Run for 8 hours (default: 12 hours)
+./scripts/glitch_marathon.py --hours 8
+
+# Run in background
+nohup python3 scripts/glitch_marathon.py --hours 24 > marathon.log 2>&1 &
+
+# Monitor progress
+tail -f marathon.log
+
+# Analyze results
+python3 scripts/analyze_glitch_results.py glitch_results_*.csv
+```
+
+**Parameter Space:**
+- Voltage: 300-500V (5 values)
+- Pause: 0-8000 cycles (fine granularity near response timing)
+- Width: 100-250 cycles (7 values)
+- Total combinations: ~1540 per cycle
+
+**Performance:**
+- ~0.43 tests/second (2.3s per test)
+- ~1500 tests/hour
+- Logs all results to `glitch_results_YYYYMMDD_HHMMSS.csv`
+
+### analyze_glitch_results.py
+
+Analyzes glitch test results from CSV log files.
+
+**Usage:**
+
+```bash
+# Analyze specific file
+python3 scripts/analyze_glitch_results.py glitch_results_20251028_081812.csv
+
+# Analyze latest results
+python3 scripts/analyze_glitch_results.py glitch_results_*.csv
+```
+
+**Output:**
+- Success rate statistics
+- Successful parameter combinations
+- Crash parameter ranges
+- Timing statistics
+
 ## Notes
 
 - All scripts use `/dev/ttyACM0` for Pico serial communication
 - Default baud rate: 115200
 - Scripts automatically handle Pico reboot and reconnection
 - For best results, ensure ChipSHOUTER is properly configured with appropriate voltage, pulse width, and positioning
+- **Marathon tests**: Run for hours (8-24h) to find narrow glitch windows
+- **Results**: All results logged to timestamped CSV files for later analysis
