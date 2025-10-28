@@ -68,6 +68,34 @@ def wait_for_response(ser, expected_text, timeout=5.0):
     return False, full_response
 
 
+def check_and_clear_chipshouter_faults(ser):
+    """Check for ChipSHOUTER faults and clear them."""
+    # Check status
+    response = send_command(ser, "CS STATUS", wait_time=0.5)
+
+    # Look for fault state
+    if "fault" in response.lower():
+        print("WARNING: ChipSHOUTER is faulted! Clearing faults...")
+
+        # Clear faults
+        send_command(ser, "CS CLEAR FAULTS", wait_time=0.5)
+        time.sleep(1.0)
+
+        # Reset to be sure
+        send_command(ser, "CS RESET", wait_time=0.5)
+        time.sleep(5.0)
+
+        # Check status again
+        response = send_command(ser, "CS STATUS", wait_time=0.5)
+        if "fault" in response.lower():
+            raise Exception("ChipSHOUTER still faulted after clear/reset!")
+
+        print("ChipSHOUTER faults cleared successfully")
+        return True
+
+    return False
+
+
 def initial_setup(ser):
     """Perform one-time setup."""
     print("Performing initial setup...")
@@ -94,7 +122,12 @@ def initial_setup(ser):
             else:
                 raise Exception("Failed to reconnect to Pico after reboot")
 
+    # Check and clear any ChipSHOUTER faults
+    print("\nChecking ChipSHOUTER status...")
+    check_and_clear_chipshouter_faults(ser)
+
     # Reset ChipSHOUTER
+    print("\nResetting ChipSHOUTER...")
     try:
         send_command(ser, "CS RESET", wait_time=0.5)
         time.sleep(5.0)
@@ -228,6 +261,7 @@ def run_marathon(duration_hours=12):
 
     last_print_time = start_time
     last_test_count = 0
+    last_fault_check = start_time
 
     try:
         # Run until time expires
@@ -287,6 +321,20 @@ def run_marathon(duration_hours=12):
 
                             last_print_time = current_time
                             last_test_count = test_count
+
+                        # Check for ChipSHOUTER faults every 5 minutes
+                        if current_time - last_fault_check >= 300:
+                            print("\n[Periodic fault check]")
+                            try:
+                                was_faulted = check_and_clear_chipshouter_faults(ser)
+                                if was_faulted:
+                                    print("WARNING: ChipSHOUTER was faulted but has been cleared")
+                                    # Re-arm after clearing faults
+                                    send_command(ser, "CS ARM", wait_time=1.0)
+                            except Exception as e:
+                                print(f"Fault check error: {e}")
+                            last_fault_check = current_time
+                            print()
 
     except KeyboardInterrupt:
         print("\n\nTest interrupted by user")
