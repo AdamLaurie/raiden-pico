@@ -194,7 +194,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== Trigger Configuration ==\r\n");
         uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
-        uart_cli_send("TRIGGER GPIO <pin> <RISING|FALLING> - GPIO trigger\r\n");
+        uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
         uart_cli_send("TRIGGER UART <byte>    - UART byte trigger\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Platform Control ==\r\n");
@@ -241,7 +241,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("Examples:\r\n");
         uart_cli_send("  STAT → STATUS       GL → GLITCH         P → PINS\r\n");
         uart_cli_send("  TARG I → TARGET INIT                    O 5 → OUT 5\r\n");
-        uart_cli_send("  SET P 1000 → SET PAUSE 1000             TRIG G → TRIGGER GPIO\r\n");
+        uart_cli_send("  SET P 1000 → SET PAUSE 1000             TRIG G R → TRIGGER GPIO RISING\r\n");
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
@@ -428,15 +428,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             glitch_set_trigger_type(TRIGGER_NONE);
             uart_cli_send("OK: Trigger disabled\r\n");
         } else if (strcmp(parts->parts[1], "GPIO") == 0) {
-            if (parts->count < 4) {
-                uart_cli_send("ERROR: Usage: TRIGGER GPIO <pin> <RISING|FALLING>\r\n");
+            if (parts->count < 3) {
+                uart_cli_send("ERROR: Usage: TRIGGER GPIO <RISING|FALLING>\r\n");
                 return;
             }
-            uint8_t pin = atoi(parts->parts[2]);
-            edge_type_t edge = (strcmp(parts->parts[3], "RISING") == 0) ? EDGE_RISING : EDGE_FALLING;
-            glitch_set_trigger_pin(pin, edge);
+            edge_type_t edge = (strcmp(parts->parts[2], "RISING") == 0) ? EDGE_RISING : EDGE_FALLING;
+            glitch_set_trigger_pin(3, edge);  // GPIO trigger is hardcoded to GP3
             glitch_set_trigger_type(TRIGGER_GPIO);
-            uart_cli_printf("OK: GPIO trigger on pin %u, %s edge\r\n", pin,
+            uart_cli_printf("OK: GPIO trigger on GP3, %s edge\r\n",
                           edge == EDGE_RISING ? "RISING" : "FALLING");
         } else if (strcmp(parts->parts[1], "UART") == 0) {
             if (parts->count < 3) {

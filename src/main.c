@@ -63,6 +63,16 @@ int main() {
     }
 
     printf("Ready!\n");
+    printf("\n");
+    printf("========================================\n");
+    printf("       GPIO TRIGGER CONFIGURATION      \n");
+    printf("========================================\n");
+    printf("For GPIO trigger on GP3 (from GP15 RESET):\n");
+    printf("  Use DIRECT connection (no resistor)\n");
+    printf("  GP3 is input - safe for direct wire\n");
+    printf("  Resistor degrades edge detection!\n");
+    printf("========================================\n");
+    printf("\n");
 
     // Main loop
     while (true) {
