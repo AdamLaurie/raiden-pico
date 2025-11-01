@@ -153,6 +153,7 @@ bool glitch_arm(void) {
     sm_config_set_clkdiv(&c_pulse, 1.0);  // Run at full system clock speed for precise timing
     pio_gpio_init(glitch_pio, config.output_pin);
     pio_sm_set_consecutive_pindirs(glitch_pio, sm_pulse_gen, config.output_pin, 1, true);
+    gpio_put(config.output_pin, 0);  // Ensure output starts LOW (optimization: removed set pins, 0 from PIO)
 
     // Clear and initialize pulse generator - MUST be done every ARM for clean state
     pio_sm_clear_fifos(glitch_pio, sm_pulse_gen);

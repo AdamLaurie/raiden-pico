@@ -45,8 +45,7 @@ bitloop:
 .program pulse_generator
 .wrap_target
 start:
-    set pins, 0         ; Ensure glitch pin is LOW before waiting
-    wait 1 irq 0            ; Wait for IRQ 0 (shared between all SMs)
+    wait 1 irq 0        ; Wait for IRQ 0 (auto-clears), pin already LOW from init/previous pulse
     pull block          ; Get PAUSE value
     out x, 32           ; Move to X
 pause_loop:
