@@ -1,10 +1,16 @@
 # Raiden Pico
 
-A versatile voltage and clock glitching platform built on the Raspberry Pi Pico 2 (RP2350), designed for hardware security research and fault injection experiments.
+A versatile voltage and clock glitching platform built on the Raspberry Pi Pico 2 (RP2350), designed for hardware security research and fault injection experiments, written entirely by AI.
 
 ## Overview
 
 Raiden Pico is a high-precision glitching tool that leverages the RP2350's PIO (Programmable I/O) state machines to generate precise glitch pulses for fault injection attacks. It supports multiple glitching methodologies including direct voltage glitching, ChipSHOUTER electromagnetic fault injection (EMFI), and clock glitching.
+
+It was created as an experiment to see how useful AI could be in hardware hacking. All the code and test scripts in this project were written and tested by [Claude](https://www.claude.com/product/claude-code)*.
+
+The inspiration for the project came from discussions here: [Prompt||GTFO](https://www.knostic.ai/blog/prompt-gtfo-season-1).
+
+\* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope.
 
 ### Key Features
 
@@ -36,6 +42,12 @@ export PICO_SDK_PATH=/path/to/pico-sdk
 # 1. Hold BOOTSEL button while plugging in USB
 # 2. Copy UF2 file:
 cp build/raiden_pico.uf2 /media/$USER/RP2350/
+```
+
+Once flashed, for future updates the FLASH target can be used with make:
+
+```
+make FLASH
 ```
 
 ### Quick Flash via CLI
@@ -281,12 +293,13 @@ TARGET LPC
 TARGET SYNC 115200 12000 300
 
 # Configure UART trigger
-TRIGGER UART 63     # Trigger on '?' (0x3F)
+TRIGGER UART 0D     # Trigger on '\r' (13)
 
 # Configure glitch
 SET PAUSE 500
 SET WIDTH 100
 ARM ON
+TARGET SEND "R 0 516096"
 ```
 
 ### 3. ChipSHOUTER EMFI
@@ -306,7 +319,7 @@ SET WIDTH 200
 OUT 2
 
 # Trigger from GPIO
-TRIGGER GPIO 5 RISING
+TRIGGER GPIO RISING
 ARM ON
 ```
 
