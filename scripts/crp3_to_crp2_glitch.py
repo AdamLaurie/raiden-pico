@@ -16,16 +16,81 @@ SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 TIMEOUT = 2.0
 
-def send_command(ser, cmd, wait_time=0.2):
-    """Send command to Raiden Pico"""
-    if ser.in_waiting > 0:
-        ser.read(ser.in_waiting)
+def send_command(ser, cmd):
+    """Send command in API mode and check response"""
+    # Clear any pending data
+    ser.read(ser.in_waiting)
+
+    # Send command
     ser.write(f"{cmd}\r\n".encode())
-    time.sleep(wait_time)
+
+    # Wait for '.' (command received)
+    start = time.time()
+    while time.time() - start < 1.0:
+        if ser.in_waiting > 0:
+            char = ser.read(1).decode('utf-8', errors='ignore')
+            if char == '.':
+                break
+
+    # Wait for '+' (success) or '!' (failure)
+    start = time.time()
+    while time.time() - start < 1.0:
+        if ser.in_waiting > 0:
+            char = ser.read(1).decode('utf-8', errors='ignore')
+            if char == '+':
+                return True
+            elif char == '!':
+                return False
+
+    return False
+
+def check_cs_armed(ser):
+    """Check if ChipSHOUTER is armed by querying status"""
+    # Clear any pending data
+    ser.read(ser.in_waiting)
+
+    # Send CS STATUS command
+    ser.write(b"CS STATUS\r\n")
+
+    # Wait for '.' (command received)
+    start = time.time()
+    while time.time() - start < 1.0:
+        if ser.in_waiting > 0:
+            char = ser.read(1).decode('utf-8', errors='ignore')
+            if char == '.':
+                break
+
+    # Wait for '+' or '!' and collect full response
     response = ""
-    if ser.in_waiting > 0:
-        response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
-    return response
+    start = time.time()
+    got_response = False
+    while time.time() - start < 3.0:  # Longer timeout for status query
+        if ser.in_waiting > 0:
+            chunk = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+            response += chunk
+            if '+' in response or '!' in response:
+                got_response = True
+                # Give it a bit more time to collect full response
+                time.sleep(0.1)
+                if ser.in_waiting > 0:
+                    response += ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                break
+
+    if not got_response:
+        return False
+
+    # Check if "armed" appears in the status (ChipSHOUTER reports "armed" in status)
+    # The response format includes "# armed:" or "state armed" when armed
+    return "armed" in response.lower() and "disarmed" not in response.lower()
+
+def wait_for_cs_armed(ser, timeout=5.0):
+    """Poll CS STATUS until ChipSHOUTER reports armed or timeout"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if check_cs_armed(ser):
+            return True
+        time.sleep(0.1)  # Brief delay between polls
+    return False
 
 def wait_for_response(ser, expected_text, timeout=5.0):
     """Wait for specific text in serial response"""
@@ -43,15 +108,15 @@ def wait_for_response(ser, expected_text, timeout=5.0):
 def setup_gpio_trigger(ser, voltage, pause, width):
     """Configure GPIO trigger and glitch parameters"""
     # Set ChipSHOUTER voltage
-    send_command(ser, f"CS VOLTAGE {voltage}", wait_time=0.5)
+    send_command(ser, f"CS VOLTAGE {voltage}")
 
     # Set glitch timing parameters
-    send_command(ser, f"SET PAUSE {pause}", wait_time=0.2)
-    send_command(ser, f"SET WIDTH {width}", wait_time=0.2)
-    send_command(ser, f"SET COUNT 1", wait_time=0.2)
+    send_command(ser, f"SET PAUSE {pause}")
+    send_command(ser, f"SET WIDTH {width}")
+    send_command(ser, f"SET COUNT 1")
 
     # Configure GPIO trigger on GP3, rising edge (triggered by GP15 RESET)
-    send_command(ser, "TRIGGER GPIO RISING", wait_time=0.2)
+    send_command(ser, "TRIGGER GPIO RISING")
 
 def test_crp3_to_crp2_glitch(ser, voltage, pause, width):
     """
@@ -64,7 +129,7 @@ def test_crp3_to_crp2_glitch(ser, voltage, pause, width):
     """
     # Arm the glitch trigger BEFORE TARGET SYNC
     # TARGET SYNC will reset the target internally, triggering the GPIO glitch
-    send_command(ser, "ARM ON", wait_time=0.2)
+    send_command(ser, "ARM ON")
 
     # Try to SYNC with bootloader
     # TARGET SYNC command internally does:
@@ -126,14 +191,29 @@ def main():
     time.sleep(0.5)
 
     try:
+        # Enable API mode
+        print("Enabling API mode...")
+        ser.write(b"API ON\r\n")
+        time.sleep(0.2)
+        ser.read(ser.in_waiting)  # Clear response
+        print("✓ API mode enabled\n")
+
         # Initial setup
         print("Setting up system...")
-        send_command(ser, "TARGET LPC", wait_time=0.2)
+        send_command(ser, "TARGET LPC")
         setup_gpio_trigger(ser, voltage, pause, width)
 
         # ChipSHOUTER setup
-        send_command(ser, "CS TRIGGER HARDWARE HIGH", wait_time=0.5)
-        send_command(ser, "CS ARM", wait_time=1.0)
+        send_command(ser, "CS TRIGGER HARDWARE HIGH")
+        send_command(ser, "CS ARM")
+
+        # Poll status until ChipSHOUTER is armed
+        print("Waiting for ChipSHOUTER to arm...")
+        if wait_for_cs_armed(ser, timeout=5.0):
+            print("✓ ChipSHOUTER armed and ready")
+        else:
+            print("WARNING: ChipSHOUTER may not be armed (timeout)")
+
         print("Setup complete\n")
 
         # Counters
@@ -215,6 +295,9 @@ def main():
             print("Target bootloader is now accessible in CRP2 mode!")
 
     finally:
+        # Disable API mode
+        ser.write(b"API OFF\r\n")
+        time.sleep(0.2)
         ser.close()
 
 if __name__ == "__main__":
