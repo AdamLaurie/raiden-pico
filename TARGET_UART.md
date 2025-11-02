@@ -28,16 +28,18 @@ TARGET PINS 18 19    # Use GP18(TX)/GP19(RX) instead
 
 ## Implementation Details
 
-### PIO-Based UART
-Unlike the CLI UART (hardware UART0) and ChipShouter UART (hardware UART1), the target UART uses **PIO state machines** for maximum flexibility:
+### Hardware UART
+The target UART uses **hardware UART1** (GP4/GP5) for reliable communication:
 
-- **SM7**: UART TX (transmit to target)
-- **PIO1 SM0**: UART RX (receive from target)
+- **UART1 TX** (GP4) - Transmit to target
+- **UART1 RX** (GP5) - Receive from target
+- **PIO0 SM2** - Parallel monitoring of GP5 for byte-matching triggers only
 
-This allows:
-- Any GPIO pins (GP7-29)
+Benefits:
+- Hardware UART provides reliable, efficient communication
+- Fixed pins (GP4/GP5) for UART1
 - Any baud rate (300-1000000)
-- No conflicts with hardware UARTs
+- PIO monitoring enables byte-matching triggers without interfering with UART data flow
 
 ### State Machine Allocation
 ```

@@ -11,7 +11,8 @@
       "WebFetch(domain:github.com)",
       "Bash(cmake:*)",
       "Bash(make:*)",
-      "Bash(bash:*)"
+      "Bash(bash:*)",
+      "Bash(git reset:*)"
     ],
     "deny": [],
     "ask": []

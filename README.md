@@ -329,12 +329,19 @@ ARM ON
 
 ### PIO State Machines
 
-Raiden Pico uses the RP2350's PIO for precise timing:
+Raiden Pico uses the RP2350's PIO for precise timing-critical operations only:
 
-- **PIO0 SM0** - Glitch pulse generation with cycle-accurate timing
-- **PIO0 SM1** - Platform control PWM (voltage regulation)
-- **PIO1 SM0** - Target UART RX snooping for byte triggers
-- **PIO1 SM1** - ChipSHOUTER UART communication
+- **PIO0 SM0** - GPIO edge detection for trigger input
+- **PIO0 SM1** - Glitch pulse generation with cycle-accurate timing
+- **PIO0 SM2** - UART RX decoder for byte-matching triggers (monitors GP5)
+- **PIO0 SM3** - Clock generator for manual glitch triggering
+
+### Hardware Peripherals
+
+Non-timing-critical communications use standard hardware peripherals:
+
+- **UART0** (GP0/GP1) - ChipSHOUTER communication (115200 baud)
+- **UART1** (GP4/GP5) - Target device communication (configurable baud)
 
 ### Interrupt-Driven Design
 
