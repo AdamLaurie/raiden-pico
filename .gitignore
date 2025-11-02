@@ -31,4 +31,7 @@ compile_commands.json
 __pycache__/
 .env
 node_modules/
+
+# Test results and logs
 *.log
+*.csv
