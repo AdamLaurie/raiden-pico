@@ -5,7 +5,13 @@
       "Bash(timeout 5 python3:*)",
       "Bash(git restore:*)",
       "Bash(ls:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "WebSearch",
+      "WebFetch(domain:forums.raspberrypi.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(cmake:*)",
+      "Bash(make:*)",
+      "Bash(bash:*)"
     ],
     "deny": [],
     "ask": []

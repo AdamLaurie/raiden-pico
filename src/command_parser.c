@@ -300,7 +300,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf(" - TARGET SYNC with 5 retries\r\n");
         uart_cli_printf(" - Fixed ARM after GLITCH issue\r\n");
         uart_cli_printf(" - Ultra-low latency PIO-based UART triggering\r\n");
-        uart_cli_printf(" - RP2350B workaround (GP5→GP28 jumper)\r\n");
+        uart_cli_printf(" - RP2350 GPIO ISO bit handling for PIO/UART sharing\r\n");
         uart_cli_send("OK\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
@@ -311,18 +311,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uint32_t revision = sysinfo_hw->gitref_rp2350;
 
         uart_cli_send("=== System Status ===\r\n");
-        uart_cli_printf("Chip:        RP2350");
-
-        // Debug: print raw values
-        uart_cli_printf(" (ID:0x%08x Rev:0x%08x)", chip_id, revision);
-
-        // Check revision bit 28 for A/B variant
-        if (revision & (1 << 28)) {
-            uart_cli_printf(" - Variant B (PIO bug present)\r\n");
-            uart_cli_send("WARNING: RP2350B requires jumper wire GP5→GP28 for UART trigger!\r\n");
-        } else {
-            uart_cli_printf(" - Variant A (PIO works correctly)\r\n");
-        }
+        uart_cli_printf("Chip:        RP2350 (ID:0x%08x Rev:0x%08x)\r\n", chip_id, revision);
         uint32_t count = glitch_get_count();  // Check count first (updates armed flag if PIO fired)
         uart_cli_printf("Armed:       %s\r\n", flags->armed ? "YES" : "NO");
         uart_cli_printf("Glitch Count: %u\r\n", count);
@@ -460,8 +449,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP0  - ChipSHOUTER UART TX (UART0)\r\n");
         uart_cli_send("GP1  - ChipSHOUTER UART RX (UART0)\r\n");
         uart_cli_send("GP4  - Target UART TX (UART1)\r\n");
-        uart_cli_send("GP5  - Target UART RX (UART1)\r\n");
-        uart_cli_send("GP28 - PIO Monitor (JUMPER FROM GP5 REQUIRED!)\r\n");
+        uart_cli_send("GP5  - Target UART RX (UART1, also PIO monitored)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_printf("GP%u  - Glitch Output\r\n", cfg->output_pin);

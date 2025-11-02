@@ -4,6 +4,7 @@
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
 #include "hardware/irq.h"
+#include "hardware/structs/padsbank0.h"  // For direct PADS register access (ISO bit)
 #include "pico/stdlib.h"
 #include "glitch.pio.h"
 #include <string.h>
@@ -184,27 +185,24 @@ bool glitch_arm(void) {
     // NOW set up and enable the UART decoder if using UART trigger
     // It must be started AFTER pulse generator is ready to receive IRQ 5
     if (config.trigger == TRIGGER_UART) {
-        // RP2350B SILICON BUG WORKAROUND: GP5→GP28 jumper required
-        // Bug: PIO and UART peripheral cannot coexist on the same GPIO pin
-        // - UART1 hardware uses GP5 (for target RX/TX communication)
-        // - PIO monitors GP28 (for UART trigger detection)
-        // - Jumper wire connects GP5→GP28 to share the UART RX signal
-        // Hardware setup: Jumper wire from GP5 (Pin 7) to GP28 (Pin 34)
-
         // Configure UART RX decoder state machine
         pio_sm_config c_uart = uart_rx_decoder_program_get_default_config(offset_uart_match);
 
-        // Configure GP28 for PIO0 usage - use pio_gpio_init for proper PIO control
-        pio_gpio_init(glitch_pio, 28);
-        // Set as input (false = input, true = output)
-        pio_sm_set_consecutive_pindirs(glitch_pio, sm_uart_trigger, 28, 1, false);
+        // RP2350 GPIO Isolation Bit Handling:
+        // GP5 is configured for UART function by target_uart.c. The RP2350 has a GPIO
+        // isolation latch (ISO bit) that prevents changes to output control signals
+        // from reaching the pad. This bit must be explicitly cleared for the PIO to
+        // read GP5 while the hardware UART is also using it.
+        //
+        // According to RP2350 datasheet: "Input from the pin is visible to all
+        // peripherals regardless of the function select setting" - but only if the
+        // ISO bit is cleared. The SDK gpio_set_function() clears ISO for the selected
+        // function, but doesn't clear it globally for all peripherals reading the pin.
+        hw_clear_bits(&padsbank0_hw->io[5], PADS_BANK0_GPIO0_ISO_BITS);
 
-        // IMPORTANT: Disable pullup/pulldown on GP28 to allow jumper signal through
-        gpio_set_pulls(28, false, false);  // No pullup, no pulldown
-
-        // Configure GP28 as input for PIO monitoring (jumpered from GP5)
-        sm_config_set_in_pins(&c_uart, 28);  // IN pins base = GP28 (for 'in pins, 1')
-        sm_config_set_jmp_pin(&c_uart, 28);  // JMP pin = GP28 (for 'wait pin 0')
+        // Configure GP5 as input for PIO monitoring (same pin as hardware UART RX)
+        sm_config_set_in_pins(&c_uart, 5);  // IN pins base = GP5 (for 'in pins, 1')
+        sm_config_set_jmp_pin(&c_uart, 5);  // JMP pin = GP5 (for 'wait pin 0')
         sm_config_set_in_shift(&c_uart, true, false, 32);  // Shift RIGHT, NO autopush
         // Note: Using ISR directly for comparison, no autopush needed
 

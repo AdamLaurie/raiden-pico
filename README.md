@@ -17,29 +17,9 @@ Raiden Pico is a high-precision glitching tool that leverages the RP2350's PIO (
 
 ## Hardware Requirements
 
-- **Raspberry Pi Pico 2** (RP2350) - **Must be Rev B or later** (see Silicon Issues below)
+- **Raspberry Pi Pico 2** (RP2350)
 - Target microcontroller
 - Optional: ChipSHOUTER or voltage glitching hardware
-
-### RP2350 Silicon Issue - CRITICAL
-
-**⚠️ RP2350-A (Rev A) has a silicon bug that prevents proper operation!**
-
-The RP2350-A has a critical PIO GPIO sharing bug where multiple PIO state machines cannot reliably share the same GPIO pin. This breaks Raiden Pico's architecture which requires:
-- PIO0 SM0: Glitch pulse generation
-- PIO1 SM0: UART RX snooping (for trigger detection)
-
-Both state machines need to read from the target UART RX pin simultaneously.
-
-**Solution**: Use RP2350-B (Rev B) or later hardware, which fixes this issue.
-
-**Workaround for Rev B**: A hardware jumper wire from GP5 (target RX) to GP28 is required to provide a separate input for the UART trigger PIO state machine.
-
-Check your chip revision:
-```
-STATUS
-```
-The output will indicate if you have variant A (buggy) or B (fixed with jumper).
 
 ## Installation
 
@@ -336,9 +316,8 @@ ARM ON
 
 - **GPIO 2** - Glitch output (default)
 - **GPIO 4** - Target UART TX
-- **GPIO 5** - Target UART RX
+- **GPIO 5** - Target UART RX (also PIO monitored for UART triggers)
 - **GPIO 15** - Target reset (active low)
-- **GPIO 28** - UART trigger input (Rev B workaround)
 
 ### ChipSHOUTER Connection
 
@@ -364,10 +343,6 @@ Raiden Pico uses the RP2350's PIO for precise timing:
 - Non-blocking UART reads prevent missed triggers
 
 ## Troubleshooting
-
-### "RP2350B requires jumper wire GP5→GP28"
-
-This is normal for Rev B hardware. Connect a wire from GPIO 5 to GPIO 28 to enable UART triggering.
 
 ### Target bootloader sync fails
 
