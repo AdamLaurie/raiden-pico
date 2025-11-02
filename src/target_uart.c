@@ -587,29 +587,35 @@ void target_uart_print_response_hex(void) {
 
     uart_cli_printf("Response (%u bytes):\r\n", target_response_count);
 
-    // Print in hex dump format: hex bytes on left, ASCII on right
-    for (uint16_t i = 0; i < target_response_pos; i += 16) {
-        // Print hex bytes
-        for (uint16_t j = 0; j < 16; j++) {
-            if (i + j < target_response_pos) {
-                uart_cli_printf("%02X ", (uint8_t)target_response[i + j]);
-            } else {
-                uart_cli_send("   ");  // Padding for incomplete line
+    // Print each line as received (line-delimited by \n)
+    // Output full hex line without breaking into 16-byte chunks
+    uint16_t line_start = 0;
+
+    for (uint16_t i = 0; i < target_response_pos; i++) {
+        uint8_t byte = (uint8_t)target_response[i];
+
+        // Check for line ending
+        if (byte == '\n') {
+            // Print all hex bytes for this line
+            for (uint16_t j = line_start; j < i; j++) {
+                uint8_t line_byte = (uint8_t)target_response[j];
+                if (line_byte != '\r') {  // Skip CR
+                    uart_cli_printf("%02X ", line_byte);
+                }
+            }
+            uart_cli_send("\r\n");
+            line_start = i + 1;
+        }
+    }
+
+    // Print any remaining bytes after last newline
+    if (line_start < target_response_pos) {
+        for (uint16_t j = line_start; j < target_response_pos; j++) {
+            uint8_t line_byte = (uint8_t)target_response[j];
+            if (line_byte != '\r') {  // Skip CR
+                uart_cli_printf("%02X ", line_byte);
             }
         }
-
-        uart_cli_send(" | ");
-
-        // Print ASCII representation
-        for (uint16_t j = 0; j < 16 && (i + j) < target_response_pos; j++) {
-            uint8_t byte = (uint8_t)target_response[i + j];
-            if (byte >= 32 && byte < 127) {
-                uart_cli_printf("%c", byte);
-            } else {
-                uart_cli_send(".");
-            }
-        }
-
         uart_cli_send("\r\n");
     }
 }
