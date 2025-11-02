@@ -51,3 +51,11 @@ pico_enable_stdio_uart(raiden_pico 0)
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(raiden_pico)
+
+# Add flash target
+add_custom_target(flash
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/flash.sh
+    DEPENDS raiden_pico
+    COMMENT "Flashing firmware to Pico2"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)

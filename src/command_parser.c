@@ -9,12 +9,20 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #define MAX_CMD_LENGTH 256
+#define MAX_ERROR_LENGTH 256
 
 // Command parsing buffer
 static char parse_buffer[MAX_CMD_LENGTH];
 static char *part_buffers[MAX_CMD_PARTS];
+
+// API mode state
+static bool api_mode = false;
+static bool command_failed = false;
+static char last_error[MAX_ERROR_LENGTH] = {0};
 
 // Helper function to send multi-line response with proper line endings
 static void send_multiline_response(const char* response) {
@@ -96,11 +104,32 @@ const char* command_parser_match(const char *abbrev, const char **candidates, ui
     }
 }
 
+// API-aware error reporting
+static void api_error(const char *msg) {
+    command_failed = true;
+    strncpy(last_error, msg, MAX_ERROR_LENGTH - 1);
+    last_error[MAX_ERROR_LENGTH - 1] = '\0';
+    if (!api_mode) {
+        uart_cli_send(msg);
+    }
+}
+
+static void api_error_printf(const char *format, ...) {
+    command_failed = true;
+    va_list args;
+    va_start(args, format);
+    vsnprintf(last_error, MAX_ERROR_LENGTH, format, args);
+    va_end(args);
+    if (!api_mode) {
+        uart_cli_send(last_error);
+    }
+}
+
 // Helper function to match and replace a part
 static bool match_and_replace(char **part, const char **candidates, uint8_t count, const char *context) {
     const char *matched = command_parser_match(*part, candidates, count);
     if (matched == NULL) {
-        uart_cli_printf("ERROR: Ambiguous %s '%s' - be more specific\r\n", context, *part);
+        api_error_printf("ERROR: Ambiguous %s '%s' - be more specific\r\n", context, *part);
         return false;
     }
     *part = (char*)matched;
@@ -112,14 +141,22 @@ void command_parser_execute(cmd_parts_t *parts) {
         return;
     }
 
+    // Initialize API state for this command
+    command_failed = false;
+
+    // Send '.' in API mode to acknowledge command received
+    if (api_mode) {
+        uart_cli_send(".");
+    }
+
     // Match primary command
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "OUT", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
-        "HELP", "REBOOT", "DEBUG"
+        "HELP", "REBOOT", "DEBUG", "API", "ERROR"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 16, "command")) {
-        return;
+    if (!match_and_replace(&parts->parts[0], primary_commands, 18, "command")) {
+        goto api_response;
     }
 
     // Match sub-commands if present
@@ -127,27 +164,27 @@ void command_parser_execute(cmd_parts_t *parts) {
         if (strcmp(parts->parts[0], "PLATFORM") == 0) {
             const char *platform_subcmds[] = {"SET", "VOLTAGE", "CHARGE", "HVPIN", "VPIN"};
             if (!match_and_replace(&parts->parts[1], platform_subcmds, 5, "PLATFORM sub-command")) {
-                return;
+                goto api_response;
             }
         } else if (strcmp(parts->parts[0], "CS") == 0) {
             const char *chipshot_subcmds[] = {"ARM", "DISARM", "FIRE", "STATUS", "VOLTAGE", "PULSE", "RESET", "TRIGGER"};
             if (!match_and_replace(&parts->parts[1], chipshot_subcmds, 8, "CS sub-command")) {
-                return;
+                goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET"};
             if (!match_and_replace(&parts->parts[1], target_subcmds, 7, "TARGET sub-command")) {
-                return;
+                goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
             const char *sweep_subcmds[] = {"START", "STOP", "STATUS", "RANGE"};
             if (!match_and_replace(&parts->parts[1], sweep_subcmds, 4, "SWEEP sub-command")) {
-                return;
+                goto api_response;
             }
         } else if (strcmp(parts->parts[0], "RESPONSE") == 0) {
             const char *response_subcmds[] = {"GET", "CLEAR", "COUNT"};
             if (!match_and_replace(&parts->parts[1], response_subcmds, 3, "RESPONSE sub-command")) {
-                return;
+                goto api_response;
             }
         }
     }
@@ -156,27 +193,27 @@ void command_parser_execute(cmd_parts_t *parts) {
     if (strcmp(parts->parts[0], "TRIGGER") == 0 && parts->count == 2) {
         const char *trigger_types[] = {"NONE", "UART", "GPIO"};
         if (!match_and_replace(&parts->parts[1], trigger_types, 3, "trigger type")) {
-            return;
+            goto api_response;
         }
     } else if (strcmp(parts->parts[0], "PLATFORM") == 0 && strcmp(parts->parts[1], "SET") == 0 && parts->count == 3) {
         const char *platform_types[] = {"MANUAL", "CHIPSHOUTER", "EMFI", "CROWBAR"};
         if (!match_and_replace(&parts->parts[2], platform_types, 4, "platform type")) {
-            return;
+            goto api_response;
         }
     } else if (strcmp(parts->parts[0], "ARM") == 0 && parts->count == 2) {
         const char *arm_states[] = {"ON", "OFF"};
         if (!match_and_replace(&parts->parts[1], arm_states, 2, "ARM state")) {
-            return;
+            goto api_response;
         }
     } else if (strcmp(parts->parts[0], "SET") == 0 && parts->count >= 2) {
         const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP"};
         if (!match_and_replace(&parts->parts[1], variables, 4, "variable name")) {
-            return;
+            goto api_response;
         }
     } else if (strcmp(parts->parts[0], "GET") == 0 && parts->count == 2) {
         const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP"};
         if (!match_and_replace(&parts->parts[1], variables, 4, "variable name")) {
-            return;
+            goto api_response;
         }
     }
 
@@ -235,6 +272,17 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
         uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
         uart_cli_send("CS RESET                  - Reset ChipSHOUTER and verify errors cleared\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== API Mode (for scripting) ==\r\n");
+        uart_cli_send("API ON                 - Enable API mode (minimal output)\r\n");
+        uart_cli_send("API OFF                - Disable API mode (verbose output)\r\n");
+        uart_cli_send("API                    - Show current API mode state\r\n");
+        uart_cli_send("ERROR                  - Get last error message\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("API Mode Response Format:\r\n");
+        uart_cli_send("  .  = Command received\r\n");
+        uart_cli_send("  +  = Command succeeded\r\n");
+        uart_cli_send("  !  = Command failed (use ERROR to get details)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Command Shortcuts ==\r\n");
         uart_cli_send("Non-ambiguous shortcuts supported for commands, sub-commands, and arguments.\r\n");
@@ -298,7 +346,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         if (parts->count != 3) {
             uart_cli_send("ERROR: Usage: SET <PAUSE|WIDTH|GAP|COUNT> <value>\r\n");
             uart_cli_send("       Value is in system clock cycles (150MHz = 6.67ns per cycle)\r\n");
-            return;
+            goto api_response;
         }
 
         uint32_t value = atoi(parts->parts[2]);
@@ -320,7 +368,7 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "GET") == 0) {
         if (parts->count != 2) {
             uart_cli_send("ERROR: Usage: GET <PAUSE|WIDTH|GAP|COUNT>\r\n");
-            return;
+            goto api_response;
         }
 
         glitch_config_t *cfg = glitch_get_config();
@@ -336,20 +384,31 @@ void command_parser_execute(cmd_parts_t *parts) {
         }
 
     } else if (strcmp(parts->parts[0], "ARM") == 0) {
-        if (parts->count != 2) {
-            uart_cli_send("ERROR: Usage: ARM <ON|OFF>\r\n");
-            return;
-        }
-
-        if (strcmp(parts->parts[1], "ON") == 0) {
-            if (glitch_arm()) {
-                uart_cli_send("OK: System armed\r\n");
+        if (parts->count == 1) {
+            // Query ARM status
+            system_flags_t* flags = glitch_get_flags();
+            if (flags->armed) {
+                uart_cli_send("ARMED\r\n");
             } else {
-                uart_cli_send("ERROR: Failed to arm system\r\n");
+                uart_cli_send("DISARMED\r\n");
             }
-        } else if (strcmp(parts->parts[1], "OFF") == 0) {
-            glitch_disarm();
-            uart_cli_send("OK: System disarmed\r\n");
+        } else if (parts->count == 2) {
+            if (strcmp(parts->parts[1], "ON") == 0) {
+                if (glitch_arm()) {
+                    uart_cli_send("OK: System armed\r\n");
+                } else {
+                    uart_cli_send("ERROR: Failed to arm system\r\n");
+                }
+            } else if (strcmp(parts->parts[1], "OFF") == 0) {
+                glitch_disarm();
+                uart_cli_send("OK: System disarmed\r\n");
+            } else {
+                api_error("ERROR: Usage: ARM <ON|OFF>\r\n");
+                goto api_response;
+            }
+        } else {
+            api_error("ERROR: Usage: ARM [ON|OFF]\r\n");
+            goto api_response;
         }
 
     } else if (strcmp(parts->parts[0], "GLITCH") == 0) {
@@ -421,7 +480,7 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "TRIGGER") == 0) {
         if (parts->count == 1) {
             uart_cli_send("ERROR: Usage: TRIGGER <NONE|GPIO|UART>\r\n");
-            return;
+            goto api_response;
         }
         // Argument matching already done above
         if (strcmp(parts->parts[1], "NONE") == 0) {
@@ -430,7 +489,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "GPIO") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: TRIGGER GPIO <RISING|FALLING>\r\n");
-                return;
+                goto api_response;
             }
             edge_type_t edge = (strcmp(parts->parts[2], "RISING") == 0) ? EDGE_RISING : EDGE_FALLING;
             glitch_set_trigger_pin(3, edge);  // GPIO trigger is hardcoded to GP3
@@ -440,7 +499,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "UART") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: TRIGGER UART <byte>\r\n");
-                return;
+                goto api_response;
             }
             // Parse hex value (support both 0x0D and 0D formats)
             uint8_t byte;
@@ -468,7 +527,7 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "OUT") == 0) {
         if (parts->count < 2) {
             uart_cli_send("ERROR: Usage: OUT <pin>\r\n");
-            return;
+            goto api_response;
         }
         uint8_t pin = atoi(parts->parts[1]);
         glitch_set_output_pin(pin);
@@ -486,7 +545,7 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         if (parts->count < 2) {
             uart_cli_send("ERROR: Usage: TARGET <LPC|STM32|BOOTLOADER|SEND|RESPONSE|RESET>\r\n");
-            return;
+            goto api_response;
         }
 
         if (strcmp(parts->parts[1], "LPC") == 0) {
@@ -548,7 +607,7 @@ void command_parser_execute(cmd_parts_t *parts) {
 
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: TARGET SEND <hex_data or \"text\">\r\n");
-                return;
+                goto api_response;
             }
 
             // Get original command to check for quoted string
@@ -646,7 +705,7 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         if (parts->count < 2) {
             uart_cli_send("ERROR: Usage: CS <ARM|DISARM|FIRE|STATUS|VOLTAGE|PULSE|RESET|TRIGGER>\r\n");
-            return;
+            goto api_response;
         }
 
         if (strcmp(parts->parts[1], "ARM") == 0) {
@@ -708,7 +767,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "VOLTAGE") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: CS VOLTAGE <value>\r\n");
-                return;
+                goto api_response;
             }
             uint32_t voltage = atoi(parts->parts[2]);
             chipshot_set_voltage(voltage);
@@ -727,7 +786,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "PULSE") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: CS PULSE <nanoseconds>\r\n");
-                return;
+                goto api_response;
             }
             uint32_t pulse_ns = atoi(parts->parts[2]);
             chipshot_set_pulse(pulse_ns);
@@ -790,26 +849,26 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "TRIGGER") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("ERROR: Usage: CS TRIGGER HW <HIGH|LOW> | CS TRIGGER SW\r\n");
-                return;
+                goto api_response;
             }
 
             // Match HW/SW argument
             const char *trigger_modes[] = {"HW", "SW"};
             if (!match_and_replace(&parts->parts[2], trigger_modes, 2, "trigger mode")) {
-                return;
+                goto api_response;
             }
 
             if (strcmp(parts->parts[2], "HW") == 0) {
                 // Hardware trigger mode requires HIGH or LOW argument
                 if (parts->count < 4) {
                     uart_cli_send("ERROR: Usage: CS TRIGGER HW <HIGH|LOW>\r\n");
-                    return;
+                    goto api_response;
                 }
 
                 // Match HIGH/LOW argument
                 const char *polarity_args[] = {"HIGH", "LOW"};
                 if (!match_and_replace(&parts->parts[3], polarity_args, 2, "trigger polarity")) {
-                    return;
+                    goto api_response;
                 }
 
                 bool active_high = (strcmp(parts->parts[3], "HIGH") == 0);
@@ -836,7 +895,42 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         }
 
+    } else if (strcmp(parts->parts[0], "API") == 0) {
+        if (parts->count < 2) {
+            // No argument - show current state
+            uart_cli_printf("API mode: %s\r\n", api_mode ? "ON" : "OFF");
+        } else if (strcmp(parts->parts[1], "ON") == 0) {
+            api_mode = true;
+            uart_cli_send("OK: API mode enabled\r\n");
+        } else if (strcmp(parts->parts[1], "OFF") == 0) {
+            api_mode = false;
+            uart_cli_send("OK: API mode disabled\r\n");
+        } else {
+            api_error("ERROR: Usage: API [ON|OFF]\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "ERROR") == 0) {
+        // Return last error message
+        if (last_error[0] != '\0') {
+            uart_cli_send(last_error);
+            if (last_error[strlen(last_error)-1] != '\n') {
+                uart_cli_send("\r\n");
+            }
+        } else {
+            uart_cli_send("No error recorded\r\n");
+        }
+
     } else {
-        uart_cli_printf("ERROR: Unknown command '%s' (use HELP)\r\n", parts->parts[0]);
+        api_error_printf("ERROR: Unknown command '%s' (use HELP)\r\n", parts->parts[0]);
+    }
+
+api_response:
+    // Send API mode response
+    if (api_mode) {
+        if (command_failed) {
+            uart_cli_send("!");
+        } else {
+            uart_cli_send("+");
+        }
     }
 }
