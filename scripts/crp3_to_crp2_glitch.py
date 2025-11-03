@@ -411,10 +411,9 @@ def test_crp3_to_crp2_glitch(ser, voltage, pause, width):
         print(f"\n✓✓✓ CRP3→CRP2 SUCCESS! Bootloader active!", flush=True)
         print(f"Reading flash memory...", flush=True)
 
-        # Read maximum: 516096 - 0x200 offset = 515584 bytes
-        # Start from address 0x200 to avoid boot vectors
-        # End address: 0x200 + 515584 = 0x7E000
-        if read_flash_memory(ser, 0x200, 516096 - 0x200, uue_file):
+        # Read full flash memory from address 0
+        # Total size: 516096 bytes (504 KB)
+        if read_flash_memory(ser, 0, 516096, uue_file):
             return "SUCCESS", response_snippet, uue_file
         else:
             print("WARNING: Flash read failed, but glitch was successful", flush=True)
