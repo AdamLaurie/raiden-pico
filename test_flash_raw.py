@@ -181,12 +181,10 @@ while lines_remaining > 0:
         # Both will be read at start of next loop iteration
 
 # Read end marker (backtick character - LPC uses backtick for space)
+# In non-API mode, we may get '>' prompt directly instead
 end_marker = read_line(ser)
-if end_marker != '`':
-    print(f"WARNING: Expected end marker (backtick), got: {repr(end_marker)}")
-
-# Wait for final '>' prompt
-ser.read(1)
+if end_marker not in ('`', '>'):
+    print(f"WARNING: Unexpected end marker: {repr(end_marker)}")
 
 print(f"\n✓ Successfully read {len(uue_lines)} UUE lines")
 

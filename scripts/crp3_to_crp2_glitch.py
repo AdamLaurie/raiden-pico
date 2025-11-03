@@ -338,12 +338,10 @@ def read_flash_memory(ser, address, num_bytes, output_file):
             ser.write(b'TARGET SEND "OK"\r\n')
 
     # Read end marker (backtick character - LPC uses backtick for space)
+    # In non-API mode, we may get '>' prompt directly instead
     end_marker = read_line()
-    if end_marker != '`':
-        print(f"WARNING: Expected end marker (backtick), got: {repr(end_marker)}", flush=True)
-
-    # Wait for final '>' prompt
-    ser.read(1)
+    if end_marker not in ('`', '>'):
+        print(f"WARNING: Unexpected end marker: {repr(end_marker)}", flush=True)
 
     print(f"\n✓ Successfully read {len(uuencoded_lines)} UUE lines", flush=True)
 
