@@ -78,6 +78,40 @@ def send_command_get_data(ser, cmd, timeout=1.0):
 
     return None
 
+def check_cs_responsive(ser):
+    """Check if ChipSHOUTER is responding to STATUS command"""
+    # Clear any pending data
+    ser.read(ser.in_waiting)
+
+    # Send CS STATUS command
+    ser.write(b"CS STATUS\r\n")
+
+    # Wait for '.' (command received)
+    start = time.time()
+    while time.time() - start < 1.0:
+        if ser.in_waiting > 0:
+            char = ser.read(1).decode('utf-8', errors='ignore')
+            if char == '.':
+                break
+
+    # Wait for '+' or '!' and collect full response
+    response = ""
+    start = time.time()
+    got_response = False
+    while time.time() - start < 3.0:  # Longer timeout for status query
+        if ser.in_waiting > 0:
+            chunk = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+            response += chunk
+            if '+' in response or '!' in response:
+                got_response = True
+                # Give it a bit more time to collect full response
+                time.sleep(0.1)
+                if ser.in_waiting > 0:
+                    response += ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                break
+
+    return got_response
+
 def check_cs_armed(ser):
     """Check if ChipSHOUTER is armed by querying status"""
     # Clear any pending data
@@ -117,13 +151,30 @@ def check_cs_armed(ser):
     # The response format includes "# armed:" or "state armed" when armed
     return "armed" in response.lower() and "disarmed" not in response.lower()
 
+def wait_for_cs_responsive(ser, timeout=5.0):
+    """Poll CS STATUS until ChipSHOUTER responds or timeout"""
+    start = time.time()
+    check_count = 0
+    while time.time() - start < timeout:
+        check_count += 1
+        if check_cs_responsive(ser):
+            print(f"  (Responsive after {check_count} status checks)")
+            return True
+        time.sleep(0.3)  # Poll every 300ms (longer for reset)
+    print(f"  (Timeout after {check_count} status checks)")
+    return False
+
 def wait_for_cs_armed(ser, timeout=5.0):
     """Poll CS STATUS until ChipSHOUTER reports armed or timeout"""
     start = time.time()
+    check_count = 0
     while time.time() - start < timeout:
+        check_count += 1
         if check_cs_armed(ser):
+            print(f"  (Armed after {check_count} status checks)")
             return True
-        time.sleep(0.1)  # Brief delay between polls
+        time.sleep(0.2)  # Poll every 200ms
+    print(f"  (Timeout after {check_count} status checks)")
     return False
 
 def wait_for_response(ser, expected_text, timeout=5.0):
@@ -165,7 +216,7 @@ def setup_uart_trigger(ser, voltage, pause, width):
     # Configure UART trigger on '\r' character (0x0D) for ISP read commands
     send_command(ser, "TRIGGER UART 13")  # 13 = '\r' (0x0D)
 
-def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, isp_voltage=None, isp_pause=None, isp_width=None):
+def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, isp_voltage=None, isp_pause=None, isp_width=None, debug=True):
     """
     Read flash memory from target using LPC ISP R command and save as UUE file
 
@@ -418,29 +469,10 @@ def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, is
             print(f"  Progress: {len(uuencoded_lines)}/{expected_lines} lines ({len(uuencoded_lines) * 45} bytes)", flush=True)
 
         # If more lines to read, send OK to continue
+        # NOTE: Continuation commands don't need glitching - CRP check only happens
+        # once at the start of the R command. Toggling API mode mid-read breaks the
+        # ISP session, so we skip ARM ON for continuations.
         if lines_remaining > 0:
-            # If glitching, ARM before sending OK (UART trigger on '\r' echo)
-            if use_glitch:
-                # Re-enable API mode briefly to ARM
-                ser.write(b"API ON\r\n")
-                time.sleep(0.05)
-                ser.read(ser.in_waiting)
-
-                # Send ARM ON command
-                ser.write(b"ARM ON\r\n")
-                time.sleep(0.05)
-                # Wait for response
-                while ser.in_waiting > 0:
-                    char = ser.read(1).decode('utf-8', errors='ignore')
-                    if char == '+':
-                        break
-                ser.read(ser.in_waiting)  # Clear
-
-                # Back to non-API mode
-                ser.write(b"API OFF\r\n")
-                time.sleep(0.05)
-                ser.read(ser.in_waiting)
-
             ser.write(b'TARGET SEND "OK"\r\n')
 
     # Read end marker (backtick character - LPC uses backtick for space)
@@ -519,10 +551,10 @@ def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_volt
         print("  [1.5] Sending ARM ON (Pico trigger)...", flush=True)
     send_command(ser, "ARM ON")
 
-    # Try to SYNC with bootloader
+    # Try to SYNC with bootloader (2 retries for faster iterations)
     if debug:
         print("  [1.6] Sending TARGET SYNC (will reset target and trigger boot glitch)...", flush=True)
-    ser.write(b"TARGET SYNC 115200 12000 10\r\n")
+    ser.write(b"TARGET SYNC 115200 12000 10 2\r\n")
     success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=15.0)
 
     # Return response snippet for logging
@@ -649,20 +681,43 @@ def main():
 
         # Initial setup
         print("Setting up system...")
+
+        # Reset Pico firmware to clean state
+        print("Resetting Pico firmware...")
+        send_command(ser, "RESET")
+        time.sleep(0.5)  # Give Pico time to reset
+
+        # Re-enable API mode after reset
+        ser.write(b"API ON\r\n")
+        time.sleep(0.2)
+        ser.read(ser.in_waiting)
+        print("✓ Pico reset complete")
+
         send_command(ser, "TARGET LPC")
         print("✓ Target set to LPC")
 
-        # ARM ChipSHOUTER once at start (stays armed after firing)
+        # Reset and ARM ChipSHOUTER once at start (stays armed after firing)
+        print("Resetting ChipSHOUTER...")
+        send_command(ser, "CS RESET")
+
+        # Wait for CS to be responsive after reset
+        print("Waiting for ChipSHOUTER to respond after reset...")
+        if not wait_for_cs_responsive(ser, timeout=10.0):
+            print("ERROR: ChipSHOUTER not responsive after reset")
+            ser.close()
+            return
+        print("✓ ChipSHOUTER ready")
+
         print("Arming ChipSHOUTER...")
         send_command(ser, "CS TRIGGER HARDWARE HIGH")
         send_command(ser, "CS ARM")
 
-        # Wait for armed status
+        # Wait for armed status by polling CS STATUS
         print("Waiting for ChipSHOUTER to arm...")
-        if wait_for_cs_armed(ser, timeout=0.5):
+        if wait_for_cs_armed(ser, timeout=10.0):
             print("✓ ChipSHOUTER armed and ready")
         else:
-            print("ERROR: ChipSHOUTER failed to arm")
+            print("ERROR: ChipSHOUTER failed to arm after 10 seconds")
             ser.close()
             return
         print()
