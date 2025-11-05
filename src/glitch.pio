@@ -1,16 +1,46 @@
-; GPIO edge detection (rising edge)
+; GPIO RISING edge detection (0->1) - ONE-SHOT trigger with debouncing
+; Debounce: wait for LOW, add delay, verify LOW, then wait for HIGH
+.program gpio_edge_detect_rising
+start:
+    wait 0 pin 0        ; Wait for trigger pin to be LOW
+    nop [31]            ; Debounce delay: 32 cycles @ 150MHz = ~213ns
+    nop [31]            ; Additional 32 cycles = ~426ns total
+    nop [31]            ; Additional 32 cycles = ~639ns total
+    wait 0 pin 0        ; Verify pin is still LOW (stable)
+    wait 1 pin 0        ; Wait for RISING edge (LOW->HIGH)
+    irq set 0           ; Trigger glitch via IRQ
+.wrap_target
+    jmp 0               ; Halt: infinite loop, one-shot trigger
+.wrap
+
+; GPIO FALLING edge detection (1->0) - ONE-SHOT trigger with debouncing
+; Debounce: wait for HIGH, add delay, verify HIGH, then wait for LOW
+.program gpio_edge_detect_falling
+start:
+    wait 1 pin 0        ; Wait for trigger pin to be HIGH
+    nop [31]            ; Debounce delay: 32 cycles @ 150MHz = ~213ns
+    nop [31]            ; Additional 32 cycles = ~426ns total
+    nop [31]            ; Additional 32 cycles = ~639ns total
+    wait 1 pin 0        ; Verify pin is still HIGH (stable)
+    wait 0 pin 0        ; Wait for FALLING edge (HIGH->LOW)
+    irq set 0           ; Trigger glitch via IRQ
+.wrap_target
+    jmp 0               ; Halt: infinite loop, one-shot trigger
+.wrap
+
+; GPIO edge detection (rising edge) - LEGACY, keeping for reference
 .program gpio_edge_detect
 .wrap_target
     wait 0 pin 0        ; Wait for pin to be low
-    wait 1 pin 0        ; Wait for pin to go high (rising edge)
+    wait 1 pin 0        ; Wait for pin to go high (RISING edge)
     irq 0               ; Generate interrupt
 .wrap
 
-; GPIO falling edge detection
+; GPIO falling edge detection - LEGACY, keeping for reference
 .program gpio_falling_detect
 .wrap_target
     wait 1 pin 0        ; Wait for pin to be high
-    wait 0 pin 0        ; Wait for pin to go low (falling edge)
+    wait 0 pin 0        ; Wait for pin to go low (FALLING edge)
     irq 0               ; Generate interrupt
 .wrap
 
@@ -41,11 +71,11 @@ bitloop:
 .wrap
 
 ; Pulse generator with IRQ trigger
-; Waits for IRQ flag, then pulls parameters from FIFO: PAUSE, then (WIDTH, GAP) for each pulse
+; Waits for IRQ 0, then pulls parameters from FIFO: PAUSE, then (WIDTH, GAP) for each pulse
 .program pulse_generator
 .wrap_target
 start:
-    wait 1 irq 0        ; Wait for IRQ 0 (auto-clears), pin already LOW from init/previous pulse
+    wait 1 irq 0        ; Wait for IRQ 0 (auto-clears)
     pull block          ; Get PAUSE value
     out x, 32           ; Move to X
 pause_loop:

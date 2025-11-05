@@ -8,6 +8,7 @@
 #include "pico/stdlib.h"
 #include "glitch.pio.h"
 #include <string.h>
+#include <stdio.h>
 
 // PIO and state machine allocations
 static PIO glitch_pio = pio0;
@@ -16,6 +17,9 @@ static uint sm_pulse_gen = 1;
 static uint sm_flag_output = 2;  // Can reuse for UART trigger since not used simultaneously
 static uint sm_clock_gen = 3;
 static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
+
+// GPIO fire pin for trigger signaling (edge detect sets HIGH, pulse gen waits on it)
+#define FIRE_PIN 10
 
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
@@ -32,10 +36,11 @@ static uint32_t precalc_width_cycles = 0;
 static uint32_t precalc_gap_cycles = 0;
 
 // PIO program offsets
-static uint offset_edge_detect;
+static uint offset_edge_detect_rising;   // Rising edge detect program
+static uint offset_edge_detect_falling;  // Falling edge detect program
 static uint offset_pulse_gen;
-static uint offset_flag_output;
-static uint offset_clock_gen;
+// offset_flag_output removed - unused program
+// offset_clock_gen removed - unused program
 static uint offset_uart_match;
 static uint offset_irq_trigger;
 
@@ -59,13 +64,18 @@ void glitch_init(void) {
     glitch_count = 0;
     pio_irq5_count = 0;
 
-    // Load PIO programs
-    offset_edge_detect = pio_add_program(glitch_pio, &gpio_edge_detect_program);
+    // Initialize fire pin as output, LOW (used for triggering pulse generator)
+    gpio_init(FIRE_PIN);
+    gpio_set_dir(FIRE_PIN, GPIO_OUT);
+    gpio_put(FIRE_PIN, 0);
+
+    // Load PIO programs (CRITICAL: Must fit in 32 instruction words!)
+    offset_edge_detect_rising = pio_add_program(glitch_pio, &gpio_edge_detect_rising_program);
+    offset_edge_detect_falling = pio_add_program(glitch_pio, &gpio_edge_detect_falling_program);
     offset_pulse_gen = pio_add_program(glitch_pio, &pulse_generator_program);
-    offset_flag_output = pio_add_program(glitch_pio, &flag_output_program);
-    offset_clock_gen = pio_add_program(glitch_pio, &clock_generator_program);
-    offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);
+    // offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);  // DISABLED - RP2350 bug
     offset_irq_trigger = pio_add_program(glitch_pio, &irq_trigger_program);
+    // Total: rising(9) + falling(8) + pulse_gen(12) + irq_trigger(1) = 30 instructions
 
     // PIO state machines are configured and started in glitch_arm() based on trigger type
     // Output pin is configured for PIO control in glitch_arm()
@@ -130,31 +140,40 @@ bool glitch_arm(void) {
         // Initialize GPIO trigger pin
         gpio_init(config.trigger_pin);
         gpio_set_dir(config.trigger_pin, GPIO_IN);
-        gpio_pull_up(config.trigger_pin);
+        gpio_pull_up(config.trigger_pin);  // Pull HIGH (typical for reset signals)
 
-        // Configure edge detect PIO
-        pio_sm_config c_edge;
-        if (config.trigger_edge == EDGE_RISING) {
-            c_edge = gpio_edge_detect_program_get_default_config(offset_edge_detect);
-        } else {
-            c_edge = gpio_falling_detect_program_get_default_config(offset_edge_detect);
-        }
-        sm_config_set_in_pins(&c_edge, config.trigger_pin);
-        pio_sm_init(glitch_pio, sm_edge_detect, offset_edge_detect, &c_edge);
+        // Select program with debouncing based on edge type
+        uint program_offset = (config.trigger_edge == EDGE_RISING) ?
+                              offset_edge_detect_rising : offset_edge_detect_falling;
+        const pio_program_t *program = (config.trigger_edge == EDGE_RISING) ?
+                                       &gpio_edge_detect_rising_program : &gpio_edge_detect_falling_program;
+
+        printf("GPIO edge detect: %s with debouncing (program offset=%u)\n",
+               (config.trigger_edge == EDGE_RISING) ? "RISING" : "FALLING", program_offset);
+
+        // Configure edge detect state machine (uses IRQ, no fire pin)
+        // Use the program's get_default_config which has correct wrap settings + debounce
+        pio_sm_config c_edge = (config.trigger_edge == EDGE_RISING) ?
+                                gpio_edge_detect_rising_program_get_default_config(program_offset) :
+                                gpio_edge_detect_falling_program_get_default_config(program_offset);
+        sm_config_set_in_pins(&c_edge, config.trigger_pin);   // IN pins for 'wait' instruction
+
+        // Initialize and start edge detect SM
+        pio_sm_init(glitch_pio, sm_edge_detect, program_offset, &c_edge);
         pio_sm_set_enabled(glitch_pio, sm_edge_detect, true);
-
     }
 
     // Clear any pending IRQs before starting configuration
     pio_interrupt_clear(glitch_pio, GLITCH_IRQ_NUM);
 
-    // Configure pulse generator FIRST (for all trigger types) - must be ready before UART decoder!
+    // Configure pulse generator FIRST (for all trigger types) - must be ready before trigger!
     pio_sm_config c_pulse = pulse_generator_program_get_default_config(offset_pulse_gen);
-    sm_config_set_set_pins(&c_pulse, config.output_pin, 1);
+    // Note: Pulse generator uses IRQ not pins, so no sm_config_set_in_pins needed
+    sm_config_set_set_pins(&c_pulse, config.output_pin, 1);  // SET pins for glitch output
     sm_config_set_clkdiv(&c_pulse, 1.0);  // Run at full system clock speed for precise timing
     pio_gpio_init(glitch_pio, config.output_pin);
     pio_sm_set_consecutive_pindirs(glitch_pio, sm_pulse_gen, config.output_pin, 1, true);
-    gpio_put(config.output_pin, 0);  // Ensure output starts LOW (optimization: removed set pins, 0 from PIO)
+    gpio_put(config.output_pin, 0);  // Ensure output starts LOW
 
     // Clear and initialize pulse generator - MUST be done every ARM for clean state
     pio_sm_clear_fifos(glitch_pio, sm_pulse_gen);
@@ -266,17 +285,17 @@ bool glitch_execute(void) {
         return false;
     }
 
-    // Use sm_clock_gen (which is unused) to trigger IRQ 5
-    // Configure and enable it briefly with the irq_trigger program
+    // Use sm_flag_output (SM2) to trigger IRQ 0 via irq_trigger program
+    // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
     pio_sm_config c_irq = irq_trigger_program_get_default_config(offset_irq_trigger);
-    pio_sm_init(glitch_pio, sm_clock_gen, offset_irq_trigger, &c_irq);
-    pio_sm_set_enabled(glitch_pio, sm_clock_gen, true);
+    pio_sm_init(glitch_pio, sm_flag_output, offset_irq_trigger, &c_irq);
+    pio_sm_set_enabled(glitch_pio, sm_flag_output, true);
 
     // Wait for it to execute one cycle
     busy_wait_us(1);
 
     // Disable it
-    pio_sm_set_enabled(glitch_pio, sm_clock_gen, false);
+    pio_sm_set_enabled(glitch_pio, sm_flag_output, false);
 
     // Increment glitch count
     glitch_count++;
