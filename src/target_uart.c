@@ -37,6 +37,9 @@ static bool reset_pin_initialized = false;
 // Debug mode
 static bool debug_mode = false;
 
+// Transparent bridge timeout (milliseconds)
+static uint32_t bridge_timeout_ms = 50;
+
 // Forward declarations (implemented below)
 void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud);
 void target_uart_send_byte(uint8_t byte);
@@ -320,45 +323,33 @@ void target_uart_send_string(const char *str) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
     }
 
-    // Disable UART RX interrupt to prevent it from bypassing echo filtering
+    // Disable UART RX interrupt
     uart_set_irq_enables(TARGET_UART_ID, false, false);
 
-    // Clear response buffer before sending
-    target_uart_clear_response();
-
-    // Track what we're sending for echo removal
-    sent_data_len = 0;
+    // Send command to target
     const char *p = str;
-    while (*p && sent_data_len < TARGET_RESPONSE_SIZE - 1) {
-        sent_data[sent_data_len++] = *p;
-        p++;
-    }
-    sent_data[sent_data_len++] = '\r';  // Add the \r we'll append
-
-    // Send each character in the string
-    p = str;
     while (*p) {
-        target_uart_send_byte(*p);
+        uart_putc_raw(TARGET_UART_ID, *p);
         p++;
     }
-
-    // Always append \r
-    target_uart_send_byte('\r');
-
-    uart_cli_send("OK: String sent to target\r\n");
+    // Append \r
+    uart_putc_raw(TARGET_UART_ID, '\r');
+    uart_tx_wait_blocking(TARGET_UART_ID);
 
     // External trigger check function
     extern void glitch_check_uart_trigger(uint8_t byte);
 
-    // Wait for response (500ms timeout) - actively poll UART
+    // Transparent bridge: forward ALL bytes from target to host (raw, no processing)
+    // Timeout resets on each received byte
     uint32_t start = to_ms_since_boot(get_absolute_time());
-    uint16_t echo_match_pos = 0;
-    bool echo_skipped = false;
 
-    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
-        // Read any incoming data
+    while (to_ms_since_boot(get_absolute_time()) - start < bridge_timeout_ms) {
+        // Read any incoming data from target
         while (uart_is_readable(TARGET_UART_ID)) {
             uint8_t byte = uart_getc(TARGET_UART_ID);
+
+            // Reset timeout on any data received
+            start = to_ms_since_boot(get_absolute_time());
 
             // Check for UART trigger byte
             glitch_check_uart_trigger(byte);
@@ -372,41 +363,13 @@ void target_uart_send_string(const char *str) {
                 uart_cli_send("\r\n");
             }
 
-            // Check if this is part of the echo
-            if (!echo_skipped && echo_match_pos < sent_data_len) {
-                if (byte == (uint8_t)sent_data[echo_match_pos]) {
-                    echo_match_pos++;
-                    if (echo_match_pos == sent_data_len) {
-                        echo_skipped = true;  // Echo complete, start collecting real response
-                    }
-                    continue;  // Skip storing echo bytes
-                } else {
-                    // Not matching echo, must be actual response
-                    // Store any previously skipped bytes that weren't echo
-                    for (uint16_t i = 0; i < echo_match_pos; i++) {
-                        if (target_response_pos < TARGET_RESPONSE_SIZE - 1) {
-                            target_response[target_response_pos++] = sent_data[i];
-                            target_response_count++;
-                        }
-                    }
-                    echo_skipped = true;  // Stop trying to match echo
-                }
-            }
-
-            // Store in response buffer (after echo is skipped)
-            if (echo_skipped && target_response_pos < TARGET_RESPONSE_SIZE - 1) {
-                target_response[target_response_pos++] = byte;
-                target_response_count++;
-            }
+            // Forward raw byte directly to host (transparent bridge)
+            putchar_raw(byte);
         }
-        sleep_us(100);  // Small delay to avoid busy waiting
     }
 
     // Re-enable UART RX interrupt for trigger detection
     uart_set_irq_enables(TARGET_UART_ID, true, false);
-
-    // Display response
-    target_uart_print_response_hex();
 }
 
 void target_uart_send_hex(const char *hex_str) {
@@ -415,14 +378,8 @@ void target_uart_send_hex(const char *hex_str) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
     }
 
-    // Disable UART RX interrupt to prevent it from bypassing echo filtering
+    // Disable UART RX interrupt
     uart_set_irq_enables(TARGET_UART_ID, false, false);
-
-    // Clear response buffer before sending
-    target_uart_clear_response();
-
-    // Track what we're sending for echo removal
-    sent_data_len = 0;
 
     // Parse hex string and send bytes
     const char *p = hex_str;
@@ -448,10 +405,7 @@ void target_uart_send_hex(const char *hex_str) {
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
             }
-            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
-                sent_data[sent_data_len++] = byte;
-            }
-            target_uart_send_byte(byte);
+            uart_putc_raw(TARGET_UART_ID, byte);
             p++;
         } else if (*p >= 'a' && *p <= 'f') {
             uint8_t byte = (*p - 'a' + 10) << 4;
@@ -463,10 +417,7 @@ void target_uart_send_hex(const char *hex_str) {
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
             }
-            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
-                sent_data[sent_data_len++] = byte;
-            }
-            target_uart_send_byte(byte);
+            uart_putc_raw(TARGET_UART_ID, byte);
             p++;
         } else if (*p >= 'A' && *p <= 'F') {
             uint8_t byte = (*p - 'A' + 10) << 4;
@@ -478,36 +429,31 @@ void target_uart_send_hex(const char *hex_str) {
             } else if (*p >= 'A' && *p <= 'F') {
                 byte |= (*p - 'A' + 10);
             }
-            if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
-                sent_data[sent_data_len++] = byte;
-            }
-            target_uart_send_byte(byte);
+            uart_putc_raw(TARGET_UART_ID, byte);
             p++;
         } else {
             p++;
         }
     }
 
-    // Always append \r
-    if (sent_data_len < TARGET_RESPONSE_SIZE - 1) {
-        sent_data[sent_data_len++] = '\r';
-    }
-    target_uart_send_byte('\r');
-
-    uart_cli_send("OK: Data sent to target\r\n");
+    // Append \r
+    uart_putc_raw(TARGET_UART_ID, '\r');
+    uart_tx_wait_blocking(TARGET_UART_ID);
 
     // External trigger check function
     extern void glitch_check_uart_trigger(uint8_t byte);
 
-    // Wait for response (500ms timeout) - actively poll UART
+    // Transparent bridge: forward ALL bytes from target to host (raw, no processing)
+    // Timeout resets on each received byte
     uint32_t start = to_ms_since_boot(get_absolute_time());
-    uint16_t echo_match_pos = 0;
-    bool echo_skipped = false;
 
-    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
-        // Read any incoming data
+    while (to_ms_since_boot(get_absolute_time()) - start < bridge_timeout_ms) {
+        // Read any incoming data from target
         while (uart_is_readable(TARGET_UART_ID)) {
             uint8_t byte = uart_getc(TARGET_UART_ID);
+
+            // Reset timeout on any data received
+            start = to_ms_since_boot(get_absolute_time());
 
             // Check for UART trigger byte
             glitch_check_uart_trigger(byte);
@@ -521,41 +467,13 @@ void target_uart_send_hex(const char *hex_str) {
                 uart_cli_send("\r\n");
             }
 
-            // Check if this is part of the echo
-            if (!echo_skipped && echo_match_pos < sent_data_len) {
-                if (byte == (uint8_t)sent_data[echo_match_pos]) {
-                    echo_match_pos++;
-                    if (echo_match_pos == sent_data_len) {
-                        echo_skipped = true;  // Echo complete, start collecting real response
-                    }
-                    continue;  // Skip storing echo bytes
-                } else {
-                    // Not matching echo, must be actual response
-                    // Store any previously skipped bytes that weren't echo
-                    for (uint16_t i = 0; i < echo_match_pos; i++) {
-                        if (target_response_pos < TARGET_RESPONSE_SIZE - 1) {
-                            target_response[target_response_pos++] = sent_data[i];
-                            target_response_count++;
-                        }
-                    }
-                    echo_skipped = true;  // Stop trying to match echo
-                }
-            }
-
-            // Store in response buffer (after echo is skipped)
-            if (echo_skipped && target_response_pos < TARGET_RESPONSE_SIZE - 1) {
-                target_response[target_response_pos++] = byte;
-                target_response_count++;
-            }
+            // Forward raw byte directly to host (transparent bridge)
+            putchar_raw(byte);
         }
-        sleep_us(100);  // Small delay to avoid busy waiting
     }
 
     // Re-enable UART RX interrupt for trigger detection
     uart_set_irq_enables(TARGET_UART_ID, true, false);
-
-    // Display response
-    target_uart_print_response_hex();
 }
 
 void target_uart_process(void) {
@@ -636,14 +554,8 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
         gpio_init(reset_pin);
         gpio_set_dir(reset_pin, GPIO_OUT);
 
-        // Set pull resistor based on active state
-        // Active high: pull down when inactive (default state is LOW)
-        // Active low:  pull up when inactive (default state is HIGH)
-        if (active_high) {
-            gpio_pull_down(reset_pin);
-        } else {
-            gpio_pull_up(reset_pin);
-        }
+        // Disable pull resistors to avoid interfering with edge detection
+        gpio_disable_pulls(reset_pin);
 
         gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state
 
@@ -680,4 +592,12 @@ void target_set_debug(bool enable) {
 
 bool target_get_debug(void) {
     return debug_mode;
+}
+
+void target_set_timeout(uint32_t timeout_ms) {
+    bridge_timeout_ms = timeout_ms;
+}
+
+uint32_t target_get_timeout(void) {
+    return bridge_timeout_ms;
 }

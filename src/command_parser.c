@@ -1,6 +1,7 @@
 #include "command_parser.h"
 #include "uart_cli.h"
 #include "glitch.h"
+#include "target_uart.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "pico/bootrom.h"
@@ -172,8 +173,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
-            const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 7, "TARGET sub-command")) {
+            const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 8, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
@@ -254,13 +255,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET <LPC|STM32> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] - Reset + bootloader\r\n");
-        uart_cli_send("                   (defaults: 115200, 12000, 10ms)\r\n");
+        uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
+        uart_cli_send("                   (defaults: 115200, 12000, 10ms, 5 retries)\r\n");
         uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
         uart_cli_send("                   Examples: 3F, 68656C6C6F, \"hello\"\r\n");
         uart_cli_send("TARGET RESPONSE - Show response from target\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
+        uart_cli_send("TARGET TIMEOUT [<ms>] - Get/set transparent bridge timeout\r\n");
+        uart_cli_send("                   (default: 50ms)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ChipSHOUTER Control ==\r\n");
         uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
@@ -556,6 +559,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             uint32_t baud = 115200;       // Default baud
             uint32_t crystal_khz = 12000; // Default 12MHz crystal
             uint32_t reset_delay_ms = 10; // Default 10ms delay (tested reliable from 1ms-300ms)
+            uint32_t retries = 5;         // Default 5 retries
             if (parts->count >= 3) {
                 baud = atoi(parts->parts[2]);
             }
@@ -565,12 +569,19 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (parts->count >= 5) {
                 reset_delay_ms = atoi(parts->parts[4]);
             }
+            if (parts->count >= 6) {
+                retries = atoi(parts->parts[5]);
+                // Ensure at least 1 retry
+                if (retries < 1) {
+                    retries = 1;
+                }
+            }
 
-            // Try up to 5 times to sync with target
+            // Try up to specified times to sync with target
             bool sync_success = false;
-            for (int retry = 0; retry < 5; retry++) {
+            for (uint32_t retry = 0; retry < retries; retry++) {
                 if (retry > 0) {
-                    uart_cli_printf("Retry %d/5...\r\n", retry);
+                    uart_cli_printf("Retry %u/%u...\r\n", retry, retries);
                 }
                 uart_cli_send("Resetting target...\r\n");
                 target_reset_execute();
@@ -581,13 +592,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                     sync_success = true;
                     break;
                 }
-                if (retry < 4) {  // Don't print on last retry
+                if (retry < retries - 1) {  // Don't print on last retry
                     uart_cli_send("Sync failed, retrying...\r\n");
                     sleep_ms(100);  // Small delay between retries
                 }
             }
             if (!sync_success) {
-                uart_cli_send("ERROR: Failed to sync with target after 5 attempts\r\n");
+                uart_cli_printf("ERROR: Failed to sync with target after %u attempts\r\n", retries);
             }
         } else if (strcmp(parts->parts[1], "SEND") == 0) {
             extern void target_uart_send_string(const char *str);
@@ -670,6 +681,21 @@ void command_parser_execute(cmd_parts_t *parts) {
             // If no parameters given, also execute the reset
             if (!has_params) {
                 target_reset_execute();
+            }
+        } else if (strcmp(parts->parts[1], "TIMEOUT") == 0) {
+            if (parts->count >= 3) {
+                // Set timeout
+                uint32_t timeout_ms = atoi(parts->parts[2]);
+                target_set_timeout(timeout_ms);
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Target bridge timeout set to %lu ms\r\n", timeout_ms);
+                uart_cli_send(msg);
+            } else {
+                // Show current timeout
+                uint32_t timeout_ms = target_get_timeout();
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Target bridge timeout: %lu ms\r\n", timeout_ms);
+                uart_cli_send(msg);
             }
         }
 

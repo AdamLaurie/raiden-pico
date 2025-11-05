@@ -57,4 +57,8 @@ bool target_is_initialized(void);
 void target_set_debug(bool enable);
 bool target_get_debug(void);
 
+// Transparent bridge timeout control (milliseconds)
+void target_set_timeout(uint32_t timeout_ms);
+uint32_t target_get_timeout(void);
+
 #endif // TARGET_UART_H
