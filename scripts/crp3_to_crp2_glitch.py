@@ -202,6 +202,7 @@ def setup_gpio_trigger(ser, voltage, pause, width):
 
     # Configure GPIO trigger on GP3, rising edge (triggered by GP15 RESET)
     send_command(ser, "TRIGGER GPIO RISING")
+    #send_command(ser, "TRIGGER GPIO FALLING")
 
 def setup_uart_trigger(ser, voltage, pause, width):
     """Configure UART trigger for ISP read glitching"""
@@ -551,11 +552,11 @@ def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_volt
         print("  [1.5] Sending ARM ON (Pico trigger)...", flush=True)
     send_command(ser, "ARM ON")
 
-    # Try to SYNC with bootloader (2 retries for faster iterations)
+    # Try to SYNC with bootloader (1 attempt)
     if debug:
         print("  [1.6] Sending TARGET SYNC (will reset target and trigger boot glitch)...", flush=True)
-    ser.write(b"TARGET SYNC 115200 12000 10 2\r\n")
-    success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=15.0)
+    ser.write(b"TARGET SYNC 115200 12000 10 1\r\n")
+    success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=5.0)
 
     # Return response snippet for logging
     response_snippet = response[:150] if response else ""
