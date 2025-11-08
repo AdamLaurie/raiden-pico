@@ -70,8 +70,9 @@ bitloop:
     irq set 0
 .wrap
 
-; Pulse generator with IRQ trigger
-; Waits for IRQ 0, then pulls parameters from FIFO: PAUSE, then (WIDTH, GAP) for each pulse
+; Pulse generator with IRQ trigger and COUNT loop
+; Waits for IRQ 0, then pulls: PAUSE, COUNT, WIDTH, GAP
+; Loops COUNT times emitting WIDTH (HIGH) and GAP (LOW) pulses
 .program pulse_generator
 .wrap_target
 start:
@@ -81,19 +82,27 @@ start:
 pause_loop:
     jmp x-- pause_loop  ; Wait for PAUSE cycles
 
-    ; Pulse loop - runs COUNT times (controlled by feeding data)
-pulse_loop:
+    pull block          ; Get COUNT value
+    out y, 32           ; COUNT in Y (outer loop counter)
     pull block          ; Get WIDTH value
-    out x, 32           ; Move to X
+    mov isr, osr        ; Save WIDTH to ISR (preserved across loop)
+    pull block          ; Get GAP value
+                        ; GAP stays in OSR (preserved across loop)
+
+pulse_loop:
+    ; Emit WIDTH pulse (HIGH)
+    mov x, isr          ; Load WIDTH from ISR
     set pins, 1         ; Set output HIGH
 width_loop:
     jmp x-- width_loop  ; Wait for WIDTH cycles
 
-    pull block          ; Get GAP value
-    out x, 32           ; Move to X
+    ; Emit GAP (LOW)
+    mov x, osr          ; Load GAP from OSR
     set pins, 0         ; Set output LOW
 gap_loop:
     jmp x-- gap_loop    ; Wait for GAP cycles
+
+    jmp y-- pulse_loop  ; Loop COUNT times
 .wrap                   ; Wrap back to start to wait for next trigger
 
 ; Flag output - outputs 4-bit flags to GPIO

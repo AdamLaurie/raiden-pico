@@ -184,13 +184,14 @@ bool glitch_arm(void) {
 
     // Pre-load PIO FIFO with timing values so they're ready when IRQ fires
     // For PIO-based UART trigger, this enables hardware-only triggering with no CPU involvement
+    // FIFO order: PAUSE, COUNT, WIDTH, GAP (4 values total - fits in FIFO)
+    // Note: Load COUNT-1 because the PIO loop executes (COUNT-1)+1 times
     pio_sm_put_blocking(glitch_pio, sm_pulse_gen, precalc_pause_cycles);
-    for (uint32_t i = 0; i < config.count; i++) {
-        pio_sm_put_blocking(glitch_pio, sm_pulse_gen, precalc_width_cycles);
-        pio_sm_put_blocking(glitch_pio, sm_pulse_gen, precalc_gap_cycles);
-    }
+    pio_sm_put_blocking(glitch_pio, sm_pulse_gen, config.count > 0 ? config.count - 1 : 0);
+    pio_sm_put_blocking(glitch_pio, sm_pulse_gen, precalc_width_cycles);
+    pio_sm_put_blocking(glitch_pio, sm_pulse_gen, precalc_gap_cycles);
 
-    // Enable PIO state machine - it will wait for IRQ 5 before executing
+    // Enable PIO state machine - it will wait for IRQ 0 before executing
     pio_sm_set_enabled(glitch_pio, sm_pulse_gen, true);
 
     // NOW set up and enable the UART decoder if using UART trigger
