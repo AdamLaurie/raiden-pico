@@ -61,4 +61,10 @@ bool target_get_debug(void);
 void target_set_timeout(uint32_t timeout_ms);
 uint32_t target_get_timeout(void);
 
+// Target power control
+void target_power_on(void);
+void target_power_off(void);
+void target_power_cycle(uint32_t time_ms);
+bool target_power_get_state(void);
+
 #endif // TARGET_UART_H

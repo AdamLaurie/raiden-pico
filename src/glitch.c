@@ -18,9 +18,6 @@ static uint sm_flag_output = 2;  // Can reuse for UART trigger since not used si
 static uint sm_clock_gen = 3;
 static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
 
-// GPIO fire pin for trigger signaling (edge detect sets HIGH, pulse gen waits on it)
-#define FIRE_PIN 10
-
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
 
@@ -63,11 +60,6 @@ void glitch_init(void) {
     // Reset glitch count
     glitch_count = 0;
     pio_irq5_count = 0;
-
-    // Initialize fire pin as output, LOW (used for triggering pulse generator)
-    gpio_init(FIRE_PIN);
-    gpio_set_dir(FIRE_PIN, GPIO_OUT);
-    gpio_put(FIRE_PIN, 0);
 
     // Load PIO programs (CRITICAL: Must fit in 32 instruction words!)
     offset_edge_detect_rising = pio_add_program(glitch_pio, &gpio_edge_detect_rising_program);

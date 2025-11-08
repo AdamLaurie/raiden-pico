@@ -173,8 +173,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
-            const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 8, "TARGET sub-command")) {
+            const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 9, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
@@ -221,65 +221,8 @@ void command_parser_execute(cmd_parts_t *parts) {
     // Execute commands
     if (strcmp(parts->parts[0], "HELP") == 0) {
         uart_cli_send("=== Raiden Pico Command Reference ===\r\n\r\n");
-        uart_cli_send("== Glitch Configuration ==\r\n");
-        uart_cli_send("SET PAUSE <cycles>     - Set glitch pause (system cycles @ 150MHz)\r\n");
-        uart_cli_send("SET WIDTH <cycles>     - Set glitch width (1 cycle = 6.67ns)\r\n");
-        uart_cli_send("SET GAP <cycles>       - Set gap between glitches\r\n");
-        uart_cli_send("SET COUNT <n>          - Set number of glitches\r\n");
-        uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns)\r\n");
-        uart_cli_send("GET PAUSE|WIDTH|GAP|COUNT - Get current values\r\n");
-        uart_cli_send("OUT <pin>              - Set glitch output pin\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Trigger Configuration ==\r\n");
-        uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
-        uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
-        uart_cli_send("TRIGGER UART <byte>    - UART byte trigger\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Platform Control ==\r\n");
-        uart_cli_send("PLATFORM SET <MANUAL|CHIPSHOUTER|EMFI|CROWBAR>\r\n");
-        uart_cli_send("PLATFORM VOLTAGE <mv>  - Set platform voltage\r\n");
-        uart_cli_send("PLATFORM CHARGE <ms>   - Set charge time\r\n");
-        uart_cli_send("PLATFORM HVPIN <pin>   - Set HV enable pin\r\n");
-        uart_cli_send("PLATFORM VPIN <pin>    - Set voltage control pin\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Glitch Control ==\r\n");
-        uart_cli_send("ARM ON|OFF             - Arm/disarm glitch\r\n");
-        uart_cli_send("GLITCH                 - Execute single glitch\r\n");
-        uart_cli_send("STATUS                 - Show current status\r\n");
-        uart_cli_send("PINS                   - Show pin configuration\r\n");
-        uart_cli_send("RESET                  - Reset system\r\n");
-        uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
-        uart_cli_send("DEBUG [ON|OFF]         - Toggle target UART debug display\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("TARGET <LPC|STM32> - Set target type\r\n");
-        uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
-        uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
-        uart_cli_send("                   (defaults: 115200, 12000, 10ms, 5 retries)\r\n");
-        uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
-        uart_cli_send("                   Examples: 3F, 68656C6C6F, \"hello\"\r\n");
-        uart_cli_send("TARGET RESPONSE - Show response from target\r\n");
-        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
-        uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
-        uart_cli_send("TARGET TIMEOUT [<ms>] - Get/set transparent bridge timeout\r\n");
-        uart_cli_send("                   (default: 50ms)\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== ChipSHOUTER Control ==\r\n");
-        uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
-        uart_cli_send("CS DISARM                 - Disarm ChipSHOUTER\r\n");
-        uart_cli_send("CS FIRE                   - Trigger ChipSHOUTER\r\n");
-        uart_cli_send("CS STATUS                 - Get ChipSHOUTER status\r\n");
-        uart_cli_send("CS VOLTAGE <V>            - Set ChipSHOUTER voltage\r\n");
-        uart_cli_send("CS PULSE <us>             - Set ChipSHOUTER pulse width\r\n");
-        uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
-        uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
-        uart_cli_send("CS RESET                  - Reset ChipSHOUTER and verify errors cleared\r\n");
-        uart_cli_send("\r\n");
         uart_cli_send("== API Mode (for scripting) ==\r\n");
-        uart_cli_send("API ON                 - Enable API mode (minimal output)\r\n");
-        uart_cli_send("API OFF                - Disable API mode (verbose output)\r\n");
-        uart_cli_send("API                    - Show current API mode state\r\n");
+        uart_cli_send("API [ON|OFF]           - Enable/disable/show API mode (minimal output)\r\n");
         uart_cli_send("ERROR                  - Get last error message\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("API Mode Response Format:\r\n");
@@ -287,12 +230,66 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  +  = Command succeeded\r\n");
         uart_cli_send("  !  = Command failed (use ERROR to get details)\r\n");
         uart_cli_send("\r\n");
+        uart_cli_send("== ChipSHOUTER Control ==\r\n");
+        uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
+        uart_cli_send("CS DISARM                 - Disarm ChipSHOUTER\r\n");
+        uart_cli_send("CS FIRE                   - Trigger ChipSHOUTER\r\n");
+        uart_cli_send("CS PULSE [<us>]           - Set/get ChipSHOUTER pulse width\r\n");
+        uart_cli_send("CS RESET                  - Reset ChipSHOUTER and verify errors cleared\r\n");
+        uart_cli_send("CS STATUS                 - Get ChipSHOUTER status\r\n");
+        uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
+        uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
+        uart_cli_send("CS VOLTAGE [<V>]          - Set/get ChipSHOUTER voltage\r\n");
+        uart_cli_send("\r\n");
         uart_cli_send("== Command Shortcuts ==\r\n");
         uart_cli_send("Non-ambiguous shortcuts supported for commands, sub-commands, and arguments.\r\n");
         uart_cli_send("Examples:\r\n");
         uart_cli_send("  STAT → STATUS       GL → GLITCH         P → PINS\r\n");
-        uart_cli_send("  TARG I → TARGET INIT                    O 5 → OUT 5\r\n");
+        uart_cli_send("  TARG B → TARGET BOOTLOADER              O 5 → OUT 5\r\n");
         uart_cli_send("  SET P 1000 → SET PAUSE 1000             TRIG G R → TRIGGER GPIO RISING\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Glitch Configuration ==\r\n");
+        uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT] - Get current glitch parameter(s)\r\n");
+        uart_cli_send("OUT [<pin>]            - Set/get glitch output pin\r\n");
+        uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
+        uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns @ 150MHz)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Glitch Control ==\r\n");
+        uart_cli_send("ARM [ON|OFF]           - Arm/disarm/show glitch system\r\n");
+        uart_cli_send("DEBUG [ON|OFF]         - Toggle/show target UART debug display\r\n");
+        uart_cli_send("GLITCH                 - Execute single glitch\r\n");
+        uart_cli_send("PINS                   - Show pin configuration\r\n");
+        uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
+        uart_cli_send("RESET                  - Reset system\r\n");
+        uart_cli_send("STATUS                 - Show current status\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Platform Control ==\r\n");
+        uart_cli_send("PLATFORM CHARGE <ms>   - Set charge time\r\n");
+        uart_cli_send("PLATFORM HVPIN <pin>   - Set HV enable pin\r\n");
+        uart_cli_send("PLATFORM SET <MANUAL|CHIPSHOUTER|EMFI|CROWBAR>\r\n");
+        uart_cli_send("PLATFORM VOLTAGE <mv>  - Set platform voltage\r\n");
+        uart_cli_send("PLATFORM VPIN <pin>    - Set voltage control pin\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Target Control ==\r\n");
+        uart_cli_send("TARGET <LPC|STM32>     - Set target type\r\n");
+        uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
+        uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
+        uart_cli_send("TARGET POWER [ON|OFF|CYCLE] [ms] - Control/show target power on GP10\r\n");
+        uart_cli_send("                   (CYCLE default: 300ms, default state: ON)\r\n");
+        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
+        uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
+        uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
+        uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
+        uart_cli_send("                   Examples: 3F, 68656C6C6F, \"hello\"\r\n");
+        uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
+        uart_cli_send("                   (defaults: 115200, 12000, 10ms, 5 retries)\r\n");
+        uart_cli_send("TARGET TIMEOUT [<ms>]  - Get/set transparent bridge timeout (default: 50ms)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Trigger Configuration ==\r\n");
+        uart_cli_send("TRIGGER [NONE|GPIO|UART] - Configure/show trigger\r\n");
+        uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
+        uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
+        uart_cli_send("TRIGGER UART <byte>    - UART byte trigger\r\n");
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
@@ -313,66 +310,117 @@ void command_parser_execute(cmd_parts_t *parts) {
         uint32_t chip_id = sysinfo_hw->chip_id;
         uint32_t revision = sysinfo_hw->gitref_rp2350;
 
-        uart_cli_send("=== System Status ===\r\n");
-        uart_cli_printf("Chip:        RP2350 (ID:0x%08x Rev:0x%08x)\r\n", chip_id, revision);
+        uart_cli_send("=== System Status ===\r\n\r\n");
+
+        // System info
+        uart_cli_send("== System ==\r\n");
+        uart_cli_printf("Chip:         RP2350 (ID:0x%08x Rev:0x%08x)\r\n", chip_id, revision);
+        uart_cli_printf("API Mode:     %s\r\n", api_mode ? "ON" : "OFF");
+        uart_cli_send("\r\n");
+
+        // Glitch parameters
+        uart_cli_send("== Glitch Parameters ==\r\n");
         uint32_t count = glitch_get_count();  // Check count first (updates armed flag if PIO fired)
-        uart_cli_printf("Armed:       %s\r\n", flags->armed ? "YES" : "NO");
+        uart_cli_printf("Armed:        %s\r\n", flags->armed ? "YES" : "NO");
         uart_cli_printf("Glitch Count: %u\r\n", count);
-        uart_cli_printf("Pause:       %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
-        uart_cli_printf("Width:       %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
-        uart_cli_printf("Gap:         %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
-        uart_cli_printf("Count:       %u\r\n", cfg->count);
+        uart_cli_printf("Pause:        %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
+        uart_cli_printf("Width:        %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
+        uart_cli_printf("Gap:          %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+        uart_cli_printf("Count:        %u\r\n", cfg->count);
+        uart_cli_printf("Output Pin:   GP%u\r\n", cfg->output_pin);
+        uart_cli_send("\r\n");
+
+        // Trigger configuration
+        uart_cli_send("== Trigger ==\r\n");
         const char* trigger_str = "NONE";
         if (cfg->trigger == TRIGGER_GPIO) {
             trigger_str = "GPIO";
         } else if (cfg->trigger == TRIGGER_UART) {
             trigger_str = "UART";
         }
-        uart_cli_printf("Trigger:     %s\r\n", trigger_str);
-        if (cfg->trigger == TRIGGER_UART) {
-            uart_cli_printf("UART Byte:   0x%02X\r\n", cfg->trigger_byte);
+        uart_cli_printf("Type:         %s\r\n", trigger_str);
+        if (cfg->trigger == TRIGGER_GPIO) {
+            uart_cli_printf("Pin:          GP%u\r\n", cfg->trigger_pin);
+            uart_cli_printf("Edge:         %s\r\n", cfg->trigger_edge == EDGE_RISING ? "RISING" : "FALLING");
+        } else if (cfg->trigger == TRIGGER_UART) {
+            uart_cli_printf("Byte:         0x%02X (%u)\r\n", cfg->trigger_byte, cfg->trigger_byte);
         }
-        uart_cli_printf("Output Pin:  %u\r\n", cfg->output_pin);
+        uart_cli_send("\r\n");
+
+        // Target configuration
+        extern target_type_t target_get_type(void);
+        extern bool target_get_debug(void);
+        extern uint32_t target_get_timeout(void);
+        extern bool target_power_get_state(void);
+
+        uart_cli_send("== Target ==\r\n");
+        target_type_t target_type = target_get_type();
+        const char* target_type_str = "NONE";
+        if (target_type == TARGET_LPC) {
+            target_type_str = "LPC";
+        } else if (target_type == TARGET_STM32) {
+            target_type_str = "STM32";
+        }
+        uart_cli_printf("Type:         %s\r\n", target_type_str);
+        uart_cli_printf("Power (GP10): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+        uart_cli_printf("Reset (GP15): HIGH, LOW 300ms pulse\r\n");
+        uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
+        uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
 
     } else if (strcmp(parts->parts[0], "SET") == 0) {
-        if (parts->count != 3) {
+        glitch_config_t *cfg = glitch_get_config();
+
+        if (parts->count == 1) {
+            // Show all current glitch parameters
+            uart_cli_send("Current glitch parameters:\r\n");
+            uart_cli_printf("  PAUSE: %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
+            uart_cli_printf("  WIDTH: %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
+            uart_cli_printf("  GAP:   %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            uart_cli_printf("  COUNT: %u\r\n", cfg->count);
+        } else if (parts->count != 3) {
             uart_cli_send("ERROR: Usage: SET <PAUSE|WIDTH|GAP|COUNT> <value>\r\n");
             uart_cli_send("       Value is in system clock cycles (150MHz = 6.67ns per cycle)\r\n");
             goto api_response;
-        }
+        } else {
+            uint32_t value = atoi(parts->parts[2]);
 
-        uint32_t value = atoi(parts->parts[2]);
-
-        if (strcmp(parts->parts[1], "PAUSE") == 0) {
-            glitch_set_pause(value);
-            uart_cli_printf("OK: PAUSE set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
-        } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
-            glitch_set_width(value);
-            uart_cli_printf("OK: WIDTH set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
-        } else if (strcmp(parts->parts[1], "GAP") == 0) {
-            glitch_set_gap(value);
-            uart_cli_printf("OK: GAP set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
-        } else if (strcmp(parts->parts[1], "COUNT") == 0) {
-            glitch_set_count(value);
-            uart_cli_printf("OK: COUNT set to %u\r\n", value);
+            if (strcmp(parts->parts[1], "PAUSE") == 0) {
+                glitch_set_pause(value);
+                uart_cli_printf("OK: PAUSE set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+            } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
+                glitch_set_width(value);
+                uart_cli_printf("OK: WIDTH set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+            } else if (strcmp(parts->parts[1], "GAP") == 0) {
+                glitch_set_gap(value);
+                uart_cli_printf("OK: GAP set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+            } else if (strcmp(parts->parts[1], "COUNT") == 0) {
+                glitch_set_count(value);
+                uart_cli_printf("OK: COUNT set to %u\r\n", value);
+            }
         }
 
     } else if (strcmp(parts->parts[0], "GET") == 0) {
-        if (parts->count != 2) {
-            uart_cli_send("ERROR: Usage: GET <PAUSE|WIDTH|GAP|COUNT>\r\n");
-            goto api_response;
-        }
-
         glitch_config_t *cfg = glitch_get_config();
 
-        if (strcmp(parts->parts[1], "PAUSE") == 0) {
-            uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
-        } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
-            uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
-        } else if (strcmp(parts->parts[1], "GAP") == 0) {
-            uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
-        } else if (strcmp(parts->parts[1], "COUNT") == 0) {
-            uart_cli_printf("%u\r\n", cfg->count);
+        if (parts->count == 1) {
+            // Show all glitch parameters
+            uart_cli_printf("PAUSE: %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
+            uart_cli_printf("WIDTH: %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
+            uart_cli_printf("GAP:   %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            uart_cli_printf("COUNT: %u\r\n", cfg->count);
+        } else if (parts->count != 2) {
+            uart_cli_send("ERROR: Usage: GET <PAUSE|WIDTH|GAP|COUNT>\r\n");
+            goto api_response;
+        } else {
+            if (strcmp(parts->parts[1], "PAUSE") == 0) {
+                uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
+            } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
+                uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
+            } else if (strcmp(parts->parts[1], "GAP") == 0) {
+                uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            } else if (strcmp(parts->parts[1], "COUNT") == 0) {
+                uart_cli_printf("%u\r\n", cfg->count);
+            }
         }
 
     } else if (strcmp(parts->parts[0], "ARM") == 0) {
@@ -463,18 +511,28 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP7  - Voltage PWM (default)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("GP15 - Target Reset (default)\r\n");
+        uart_cli_send("GP10 - Target Power (default ON)\r\n");
+        uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
         uart_cli_send("GP25 - Status LED\r\n");
 
     } else if (strcmp(parts->parts[0], "TRIGGER") == 0) {
+        glitch_config_t *cfg = glitch_get_config();
+
         if (parts->count == 1) {
-            uart_cli_send("ERROR: Usage: TRIGGER <NONE|GPIO|UART>\r\n");
-            goto api_response;
-        }
-        // Argument matching already done above
-        if (strcmp(parts->parts[1], "NONE") == 0) {
+            // Show current trigger configuration
+            uart_cli_printf("Trigger type: ");
+            if (cfg->trigger == TRIGGER_NONE) {
+                uart_cli_send("NONE\r\n");
+            } else if (cfg->trigger == TRIGGER_GPIO) {
+                uart_cli_printf("GPIO (Pin: GP%u, Edge: %s)\r\n",
+                    cfg->trigger_pin,
+                    cfg->trigger_edge == EDGE_RISING ? "RISING" : "FALLING");
+            } else if (cfg->trigger == TRIGGER_UART) {
+                uart_cli_printf("UART (Byte: 0x%02X)\r\n", cfg->trigger_byte);
+            }
+        } else if (strcmp(parts->parts[1], "NONE") == 0) {
             glitch_set_trigger_type(TRIGGER_NONE);
             uart_cli_send("OK: Trigger disabled\r\n");
         } else if (strcmp(parts->parts[1], "GPIO") == 0) {
@@ -516,13 +574,19 @@ void command_parser_execute(cmd_parts_t *parts) {
         }
 
     } else if (strcmp(parts->parts[0], "OUT") == 0) {
-        if (parts->count < 2) {
+        glitch_config_t *cfg = glitch_get_config();
+
+        if (parts->count == 1) {
+            // Show current output pin
+            uart_cli_printf("Output pin: GP%u\r\n", cfg->output_pin);
+        } else if (parts->count < 2) {
             uart_cli_send("ERROR: Usage: OUT <pin>\r\n");
             goto api_response;
+        } else {
+            uint8_t pin = atoi(parts->parts[1]);
+            glitch_set_output_pin(pin);
+            uart_cli_printf("OK: Glitch output set to pin %u\r\n", pin);
         }
-        uint8_t pin = atoi(parts->parts[1]);
-        glitch_set_output_pin(pin);
-        uart_cli_printf("OK: Glitch output set to pin %u\r\n", pin);
 
     } else if (strcmp(parts->parts[0], "TARGET") == 0) {
         extern void target_set_type(target_type_t type);
@@ -535,7 +599,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|STM32|BOOTLOADER|SEND|RESPONSE|RESET>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|STM32|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
             goto api_response;
         }
 
@@ -697,6 +761,30 @@ void command_parser_execute(cmd_parts_t *parts) {
                 snprintf(msg, sizeof(msg), "Target bridge timeout: %lu ms\r\n", timeout_ms);
                 uart_cli_send(msg);
             }
+        } else if (strcmp(parts->parts[1], "POWER") == 0) {
+            if (parts->count < 3) {
+                // Show current power state
+                bool power_state = target_power_get_state();
+                uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
+            } else {
+                // Match power command
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 3, "POWER command")) {
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "ON") == 0) {
+                    target_power_on();
+                } else if (strcmp(parts->parts[2], "OFF") == 0) {
+                    target_power_off();
+                } else if (strcmp(parts->parts[2], "CYCLE") == 0) {
+                    uint32_t cycle_time_ms = 300;  // Default 300ms
+                    if (parts->count >= 4) {
+                        cycle_time_ms = atoi(parts->parts[3]);
+                    }
+                    target_power_cycle(cycle_time_ms);
+                }
+            }
         }
 
     } else if (strcmp(parts->parts[0], "CS") == 0) {
@@ -780,40 +868,58 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         } else if (strcmp(parts->parts[1], "VOLTAGE") == 0) {
             if (parts->count < 3) {
-                uart_cli_send("ERROR: Usage: CS VOLTAGE <value>\r\n");
-                goto api_response;
-            }
-            uint32_t voltage = atoi(parts->parts[2]);
-            chipshot_set_voltage(voltage);
-            uart_cli_printf("ChipSHOUTER: Sent voltage %u command\r\n", voltage);
-
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
+                // Show current voltage by querying status
+                uart_cli_send("ChipSHOUTER: Querying status for voltage...\r\n");
+                chipshot_get_status();
+                const char* response = chipshot_uart_read_response_blocking(2000);
+                if (response) {
+                    send_multiline_response(response);
+                    uart_cli_send("\r\n");
+                } else {
+                    uart_cli_send("No response from ChipSHOUTER\r\n");
+                }
             } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
+                uint32_t voltage = atoi(parts->parts[2]);
+                chipshot_set_voltage(voltage);
+                uart_cli_printf("ChipSHOUTER: Sent voltage %u command\r\n", voltage);
+
+                // Blocking read with 2 second timeout
+                const char* response = chipshot_uart_read_response_blocking(2000);
+                if (response) {
+                    uart_cli_send("ChipSHOUTER response:\r\n");
+                    send_multiline_response(response);
+                    uart_cli_send("\r\n");
+                } else {
+                    uart_cli_send("No response from ChipSHOUTER\r\n");
+                }
             }
 
         } else if (strcmp(parts->parts[1], "PULSE") == 0) {
             if (parts->count < 3) {
-                uart_cli_send("ERROR: Usage: CS PULSE <nanoseconds>\r\n");
-                goto api_response;
-            }
-            uint32_t pulse_ns = atoi(parts->parts[2]);
-            chipshot_set_pulse(pulse_ns);
-            uart_cli_printf("ChipSHOUTER: Sent pulse %u ns command\r\n", pulse_ns);
-
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
+                // Show current pulse width by querying status
+                uart_cli_send("ChipSHOUTER: Querying status for pulse width...\r\n");
+                chipshot_get_status();
+                const char* response = chipshot_uart_read_response_blocking(2000);
+                if (response) {
+                    send_multiline_response(response);
+                    uart_cli_send("\r\n");
+                } else {
+                    uart_cli_send("No response from ChipSHOUTER\r\n");
+                }
             } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
+                uint32_t pulse_ns = atoi(parts->parts[2]);
+                chipshot_set_pulse(pulse_ns);
+                uart_cli_printf("ChipSHOUTER: Sent pulse %u ns command\r\n", pulse_ns);
+
+                // Blocking read with 2 second timeout
+                const char* response = chipshot_uart_read_response_blocking(2000);
+                if (response) {
+                    uart_cli_send("ChipSHOUTER response:\r\n");
+                    send_multiline_response(response);
+                    uart_cli_send("\r\n");
+                } else {
+                    uart_cli_send("No response from ChipSHOUTER\r\n");
+                }
             }
 
         } else if (strcmp(parts->parts[1], "RESET") == 0) {

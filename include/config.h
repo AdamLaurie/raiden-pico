@@ -122,4 +122,11 @@ typedef struct {
     bool configured;
 } target_reset_config_t;
 
+// Target Power Configuration
+typedef struct {
+    uint8_t pin;
+    uint32_t cycle_time_ms;
+    bool configured;
+} target_power_config_t;
+
 #endif // CONFIG_H

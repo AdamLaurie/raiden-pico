@@ -34,6 +34,11 @@ static uint32_t reset_period_ms = 300;  // Default 300ms reset period
 static bool reset_active_high = false;
 static bool reset_pin_initialized = false;
 
+// Power configuration
+static uint8_t power_pin = 10;  // GP10
+static uint32_t power_cycle_time_ms = 300;  // Default 300ms cycle time
+static bool power_pin_initialized = false;
+
 // Debug mode
 static bool debug_mode = false;
 
@@ -81,6 +86,12 @@ void target_init(void) {
     // Initialize reset pin with defaults on startup
     // This ensures TARGET RESET works without explicit configuration
     target_reset_config(reset_pin, reset_period_ms, reset_active_high);
+
+    // Initialize power pin - default to ON (HIGH)
+    gpio_init(power_pin);
+    gpio_set_dir(power_pin, GPIO_OUT);
+    gpio_put(power_pin, 1);  // Default ON (HIGH)
+    power_pin_initialized = true;
 
     // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
     // This works around an issue where first UART TX after boot fails
@@ -600,4 +611,51 @@ void target_set_timeout(uint32_t timeout_ms) {
 
 uint32_t target_get_timeout(void) {
     return bridge_timeout_ms;
+}
+
+void target_power_on(void) {
+    if (!power_pin_initialized) {
+        gpio_init(power_pin);
+        gpio_set_dir(power_pin, GPIO_OUT);
+        power_pin_initialized = true;
+    }
+    gpio_put(power_pin, 1);  // HIGH = ON
+    uart_cli_send("OK: Target power ON\r\n");
+}
+
+void target_power_off(void) {
+    if (!power_pin_initialized) {
+        gpio_init(power_pin);
+        gpio_set_dir(power_pin, GPIO_OUT);
+        power_pin_initialized = true;
+    }
+    gpio_put(power_pin, 0);  // LOW = OFF
+    uart_cli_send("OK: Target power OFF\r\n");
+}
+
+void target_power_cycle(uint32_t time_ms) {
+    if (!power_pin_initialized) {
+        gpio_init(power_pin);
+        gpio_set_dir(power_pin, GPIO_OUT);
+        power_pin_initialized = true;
+    }
+
+    // Turn OFF
+    gpio_put(power_pin, 0);
+    uart_cli_printf("OK: Target power cycling (OFF for %u ms)...\r\n", time_ms);
+    sleep_ms(time_ms);
+
+    // Turn back ON
+    gpio_put(power_pin, 1);
+    uart_cli_send("OK: Target power ON\r\n");
+}
+
+bool target_power_get_state(void) {
+    if (!power_pin_initialized) {
+        gpio_init(power_pin);
+        gpio_set_dir(power_pin, GPIO_OUT);
+        gpio_put(power_pin, 1);  // Default ON
+        power_pin_initialized = true;
+    }
+    return gpio_get(power_pin);
 }
