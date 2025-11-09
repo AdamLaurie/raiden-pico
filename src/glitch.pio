@@ -111,6 +111,59 @@ low:
     jmp x-- low         ; Delay for half period
 .wrap
 
+; Clock generator with glitch boost
+; Preload: normal_period, fast_period
+; When glitch fires, C code pushes count and normal_period to FIFO
+.program clock_generator_with_boost
+    pull block          ; Get normal_period
+    mov y, osr          ; Save to Y
+    pull block          ; Get fast_period
+    mov isr, osr        ; Save to ISR
+.wrap_target
+norm:
+    ; Normal clock
+    set pins, 1
+    mov x, y
+h:
+    jmp x-- h
+    set pins, 0
+    mov x, y
+l:
+    jmp x-- l
+
+    ; Check for boost command
+    pull noblock
+    jmp !osre norm      ; No boost, continue normal
+
+    ; Got boost command
+
+do_boost:
+    ; Boost: OSR = count
+    mov x, osr
+
+boost:
+    ; Fast HIGH
+    set pins, 1
+    mov osr, isr        ; Load fast_period
+    mov y, osr          ; Use Y as temp counter
+fh:
+    jmp y-- fh
+
+    ; Fast LOW
+    set pins, 0
+    mov osr, isr
+    mov y, osr
+fl:
+    jmp y-- fl
+
+    jmp x-- boost       ; Loop count times
+
+    ; Restore Y = normal_period
+    pull block
+    mov y, osr
+    jmp norm
+.wrap
+
 ; Simple clock generator
 .program clock_generator
 .wrap_target

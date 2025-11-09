@@ -28,6 +28,7 @@ static system_flags_t flags;
 static clock_config_t clock_config;
 static uint32_t glitch_count = 0;
 static volatile uint32_t pio_irq5_count = 0;  // Debug counter for PIO IRQ fires
+static volatile bool clock_boost_enabled = false;  // Whether clock boost is active
 
 // Pre-calculated cycle values for fast glitch execution
 static uint32_t precalc_pause_cycles = 0;
@@ -40,6 +41,7 @@ static uint offset_edge_detect_falling;  // Falling edge detect program
 static uint offset_pulse_gen;
 static uint offset_clock_gen_delay;  // Clock generator with delay
 static uint offset_clock_gen;        // Simple clock generator
+static uint offset_clock_gen_boost;  // Clock generator with glitch boost
 static uint offset_uart_match;
 static uint offset_irq_trigger;
 
@@ -70,20 +72,39 @@ void glitch_init(void) {
     pio_irq5_count = 0;
 
     // Load PIO programs for glitching (PIO0 - must fit in 32 instruction words!)
-    offset_edge_detect_rising = pio_add_program(glitch_pio, &gpio_edge_detect_rising_program);
-    offset_edge_detect_falling = pio_add_program(glitch_pio, &gpio_edge_detect_falling_program);
+    // Core programs always loaded
     offset_pulse_gen = pio_add_program(glitch_pio, &pulse_generator_program);
-    // offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);  // DISABLED - RP2350 bug
     offset_irq_trigger = pio_add_program(glitch_pio, &irq_trigger_program);
-    // Total PIO0: rising(9) + falling(8) + pulse_gen(12) + irq_trigger(1) = 30 instructions
+    // Total: pulse_gen(12) + irq_trigger(1) = 13 instructions
+    // Trigger programs (GPIO/UART) loaded dynamically in glitch_arm() based on trigger type
+
+    printf("PIO0 init: pulse_gen@%u, irq_trigger@%u\n", offset_pulse_gen, offset_irq_trigger);
 
     // Load clock generator programs into PIO1 (separate instruction memory)
     offset_clock_gen_delay = pio_add_program(clock_pio, &clock_generator_delay_program);
     offset_clock_gen = pio_add_program(clock_pio, &clock_generator_program);
-    // Total PIO1: clock_delay(6) + clock(2) = 8 instructions
+    offset_clock_gen_boost = pio_add_program(clock_pio, &clock_generator_with_boost_program);
+    // Total PIO1: clock_delay(6) + clock(2) + clock_boost(19) = 27 instructions
 
     // PIO state machines are configured and started in glitch_arm() based on trigger type
     // Output pin is configured for PIO control in glitch_arm()
+}
+
+// Helper function to trigger clock boost when glitch fires
+static void clock_trigger_boost(void) {
+    if (!clock_boost_enabled || !clock_config.enabled) {
+        return;
+    }
+
+    // Calculate timing
+    uint32_t system_clock = clock_get_hz(clk_sys);
+    uint32_t normal_half_period = (system_clock / 2) / clock_config.frequency;
+
+    // Push 2 words: count, normal_period (non-blocking)
+    if (pio_sm_get_tx_fifo_level(clock_pio, sm_clock_gen) <= 2) {
+        pio_sm_put(clock_pio, sm_clock_gen, config.count);
+        pio_sm_put(clock_pio, sm_clock_gen, normal_half_period);
+    }
 }
 
 glitch_config_t* glitch_get_config(void) {
@@ -140,18 +161,38 @@ bool glitch_arm(void) {
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
 
+    // Remove ALL possible trigger programs to free PIO space before loading new one
+    // This is simpler than tracking what's loaded - just remove everything
+    pio_remove_program(glitch_pio, &gpio_edge_detect_rising_program, offset_edge_detect_rising);
+    pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
+    pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+
     // Configure trigger based on type
     if (config.trigger == TRIGGER_GPIO) {
+
         // Initialize GPIO trigger pin
         gpio_init(config.trigger_pin);
         gpio_set_dir(config.trigger_pin, GPIO_IN);
         gpio_pull_up(config.trigger_pin);  // Pull HIGH (typical for reset signals)
 
-        // Select program with debouncing based on edge type
-        uint program_offset = (config.trigger_edge == EDGE_RISING) ?
-                              offset_edge_detect_rising : offset_edge_detect_falling;
+        // Load the appropriate edge detect program dynamically to save PIO space
         const pio_program_t *program = (config.trigger_edge == EDGE_RISING) ?
                                        &gpio_edge_detect_rising_program : &gpio_edge_detect_falling_program;
+
+        // Check if program can be added
+        if (!pio_can_add_program(glitch_pio, program)) {
+            printf("ERROR: PIO0 is full, cannot load GPIO edge detect program!\n");
+            return false;
+        }
+
+        uint program_offset = pio_add_program(glitch_pio, program);
+
+        // Save offset for later reference
+        if (config.trigger_edge == EDGE_RISING) {
+            offset_edge_detect_rising = program_offset;
+        } else {
+            offset_edge_detect_falling = program_offset;
+        }
 
         printf("GPIO edge detect: %s with debouncing (program offset=%u)\n",
                (config.trigger_edge == EDGE_RISING) ? "RISING" : "FALLING", program_offset);
@@ -163,9 +204,18 @@ bool glitch_arm(void) {
                                 gpio_edge_detect_falling_program_get_default_config(program_offset);
         sm_config_set_in_pins(&c_edge, config.trigger_pin);   // IN pins for 'wait' instruction
 
-        // Initialize and start edge detect SM
+        // Clear and initialize edge detect SM
+        pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
+        pio_sm_restart(glitch_pio, sm_edge_detect);
         pio_sm_init(glitch_pio, sm_edge_detect, program_offset, &c_edge);
         pio_sm_set_enabled(glitch_pio, sm_edge_detect, true);
+
+        // Save offset for disarm cleanup
+        if (config.trigger_edge == EDGE_RISING) {
+            offset_edge_detect_rising = program_offset;
+        } else {
+            offset_edge_detect_falling = program_offset;
+        }
     }
 
     // Clear any pending IRQs before starting configuration
@@ -210,6 +260,9 @@ bool glitch_arm(void) {
     // NOW set up and enable the UART decoder if using UART trigger
     // It must be started AFTER pulse generator is ready to receive IRQ 5
     if (config.trigger == TRIGGER_UART) {
+        // Load UART decoder program dynamically
+        offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);
+
         // Configure UART RX decoder state machine
         pio_sm_config c_uart = uart_rx_decoder_program_get_default_config(offset_uart_match);
 
@@ -268,6 +321,9 @@ void glitch_disarm(void) {
     pio_sm_set_enabled(glitch_pio, sm_pulse_gen, false);
     pio_sm_set_enabled(glitch_pio, sm_uart_trigger, false);
 
+    // Note: We don't remove programs here - they'll be removed on next arm
+    // This keeps disarm simple and fast
+
     // Clear any pending IRQs to prevent false triggers on next arm
     pio_interrupt_clear(glitch_pio, GLITCH_IRQ_NUM);
 
@@ -286,10 +342,12 @@ void glitch_disarm(void) {
 
 bool glitch_execute(void) {
     // Manual glitch execution (for TRIGGER_NONE mode or manual testing)
-    // For GPIO and UART triggers, PIO handles everything autonomously
     if (!flags.armed) {
         return false;
     }
+
+    // Trigger clock boost if enabled
+    clock_trigger_boost();
 
     // Use sm_flag_output (SM2) to trigger IRQ 0 via irq_trigger program
     // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
@@ -428,25 +486,19 @@ void clock_enable(void) {
     uint32_t system_clock = clock_get_hz(clk_sys);
     uint32_t target_half_period = (system_clock / 2) / clock_config.frequency;
 
-    // Use clock_generator_delay for frequencies that need timing control
-    // Use simple clock_generator for max speed (target_half_period < 2)
-    if (target_half_period >= 2) {
-        // Use delay-based clock generator
-        pio_sm_config c = clock_generator_delay_program_get_default_config(offset_clock_gen_delay);
-        sm_config_set_set_pins(&c, clock_config.pin, 1);
-        sm_config_set_clkdiv(&c, 1.0);  // Full speed
+    // Always use boost-capable clock generator
+    pio_sm_config c = clock_generator_with_boost_program_get_default_config(offset_clock_gen_boost);
+    sm_config_set_set_pins(&c, clock_config.pin, 1);
+    sm_config_set_clkdiv(&c, 1.0);  // Full speed
 
-        // Initialize and load half-period count
-        pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_delay, &c);
-        pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period - 1);  // -1 for loop overhead
-    } else {
-        // Use simple clock generator (max speed, ~75MHz toggle)
-        pio_sm_config c = clock_generator_program_get_default_config(offset_clock_gen);
-        sm_config_set_set_pins(&c, clock_config.pin, 1);
-        sm_config_set_clkdiv(&c, 1.0);  // Full speed
+    // Initialize and preload: normal_period, fast_period
+    uint32_t fast_half_period = target_half_period / 2;  // 2x frequency
+    pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_boost, &c);
+    pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period);
+    pio_sm_put_blocking(clock_pio, sm_clock_gen, fast_half_period);
 
-        pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen, &c);
-    }
+    // Enable clock boost feature (boost triggered by glitch_execute)
+    clock_boost_enabled = true;
 
     // Enable the state machine
     pio_sm_set_enabled(clock_pio, sm_clock_gen, true);
@@ -457,6 +509,9 @@ void clock_disable(void) {
     if (!clock_config.enabled) {
         return;
     }
+
+    // Disable clock boost
+    clock_boost_enabled = false;
 
     // Disable state machine
     pio_sm_set_enabled(clock_pio, sm_clock_gen, false);
