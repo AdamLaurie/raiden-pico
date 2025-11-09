@@ -28,22 +28,6 @@ start:
     jmp 0               ; Halt: infinite loop, one-shot trigger
 .wrap
 
-; GPIO edge detection (rising edge) - LEGACY, keeping for reference
-.program gpio_edge_detect
-.wrap_target
-    wait 0 pin 0        ; Wait for pin to be low
-    wait 1 pin 0        ; Wait for pin to go high (RISING edge)
-    irq 0               ; Generate interrupt
-.wrap
-
-; GPIO falling edge detection - LEGACY, keeping for reference
-.program gpio_falling_detect
-.wrap_target
-    wait 1 pin 0        ; Wait for pin to be high
-    wait 0 pin 0        ; Wait for pin to go low (FALLING edge)
-    irq 0               ; Generate interrupt
-.wrap
-
 ; UART RX with byte matching - NO autopush, direct ISR comparison
 ; SM clock = 8× baud rate, IN pin 0 = GP28 (jumpered from GP5)
 ; RP2350B BUG: PIO and UART peripheral cannot share GPIO - requires GP5→GP28 jumper

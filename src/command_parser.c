@@ -306,15 +306,48 @@ void command_parser_execute(cmd_parts_t *parts) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
 
-        // Check chip variant
+        // Check chip variant and package
         uint32_t chip_id = sysinfo_hw->chip_id;
         uint32_t revision = sysinfo_hw->gitref_rp2350;
+        uint32_t package_sel = sysinfo_hw->package_sel;  // 0=QFN60, 1=QFN80
+
+        // Determine variant and package from PACKAGE_SEL register
+        // PACKAGE_SEL: 0 = QFN-60 (RP2350A, 30 GPIOs), 1 = QFN-80 (RP2350B, 48 GPIOs, PSRAM)
+        const char *variant;
+        const char *package;
+        bool has_psram;
+        uint32_t num_gpios;
+
+        if (package_sel == 1) {
+            variant = "B";
+            package = "QFN-80";
+            has_psram = true;
+            num_gpios = 48;
+        } else {
+            variant = "A";
+            package = "QFN-60";
+            has_psram = false;
+            num_gpios = 30;
+        }
+
+        // Check for WiFi model (compile-time detection)
+        #ifdef RASPBERRYPI_PICO2_W
+        const char *wifi_str = " W";
+        #else
+        const char *wifi_str = "";
+        #endif
 
         uart_cli_send("=== System Status ===\r\n\r\n");
 
         // System info
         uart_cli_send("== System ==\r\n");
-        uart_cli_printf("Chip:         RP2350 (ID:0x%08x Rev:0x%08x)\r\n", chip_id, revision);
+        uart_cli_printf("Model:        Raspberry Pi Pico 2%s\r\n", wifi_str);
+        uart_cli_printf("Chip:         RP2350%s (%s, %u GPIOs)\r\n", variant, package, num_gpios);
+        if (has_psram) {
+            uart_cli_printf("Memory:       PSRAM\r\n");
+        }
+        uart_cli_printf("Chip ID:      0x%08x\r\n", chip_id);
+        uart_cli_printf("Revision:     0x%08x\r\n", revision);
         uart_cli_printf("API Mode:     %s\r\n", api_mode ? "ON" : "OFF");
         uart_cli_send("\r\n");
 
