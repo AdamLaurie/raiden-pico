@@ -35,3 +35,4 @@ node_modules/
 # Test results and logs
 *.log
 *.csv
+*.uue

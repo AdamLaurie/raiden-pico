@@ -44,4 +44,11 @@ uint32_t glitch_get_count(void);
 // Update flag outputs (call periodically from main loop)
 void glitch_update_flags(void);
 
+// Clock generator control
+void clock_set_frequency(uint32_t freq_hz);
+void clock_enable(void);
+void clock_disable(void);
+bool clock_is_enabled(void);
+uint32_t clock_get_frequency(void);
+
 #endif // GLITCH_H

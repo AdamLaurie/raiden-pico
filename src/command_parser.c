@@ -241,6 +241,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
         uart_cli_send("CS VOLTAGE [<V>]          - Set/get ChipSHOUTER voltage\r\n");
         uart_cli_send("\r\n");
+        uart_cli_send("== Clock Generator ==\r\n");
+        uart_cli_send("CLOCK [<freq>] [ON|OFF]   - Set/get clock frequency and enable/disable\r\n");
+        uart_cli_send("                            Examples: CLOCK 12000000 ON, CLOCK ON, CLOCK OFF\r\n");
+        uart_cli_send("\r\n");
         uart_cli_send("== Command Shortcuts ==\r\n");
         uart_cli_send("Non-ambiguous shortcuts supported for commands, sub-commands, and arguments.\r\n");
         uart_cli_send("Examples:\r\n");
@@ -400,6 +404,18 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
 
+        uart_cli_send("\r\n");
+        uart_cli_send("== Clock Generator ==\r\n");
+        uint32_t clock_freq = clock_get_frequency();
+        bool clock_enabled = clock_is_enabled();
+        if (clock_freq == 0) {
+            uart_cli_send("Status:       Not configured\r\n");
+        } else {
+            uart_cli_printf("Frequency:    %u Hz\r\n", clock_freq);
+            uart_cli_printf("Status:       %s\r\n", clock_enabled ? "ON" : "OFF");
+            uart_cli_send("Pin:          GP8\r\n");
+        }
+
     } else if (strcmp(parts->parts[0], "SET") == 0) {
         glitch_config_t *cfg = glitch_get_config();
 
@@ -484,6 +500,65 @@ void command_parser_execute(cmd_parts_t *parts) {
             goto api_response;
         }
 
+    } else if (strcmp(parts->parts[0], "CLOCK") == 0) {
+        if (parts->count == 1) {
+            // Show current clock status
+            uint32_t freq = clock_get_frequency();
+            bool enabled = clock_is_enabled();
+            if (freq == 0) {
+                uart_cli_send("Clock: not configured\r\n");
+            } else {
+                uart_cli_printf("Clock: %u Hz (%s)\r\n", freq, enabled ? "ON" : "OFF");
+            }
+        } else {
+            // Parse arguments: CLOCK [freq] [ON|OFF]
+            uint32_t new_freq = 0;
+            bool set_freq = false;
+            bool set_enable = false;
+            bool enable = false;
+
+            for (int i = 1; i < parts->count; i++) {
+                if (strcmp(parts->parts[i], "ON") == 0) {
+                    set_enable = true;
+                    enable = true;
+                } else if (strcmp(parts->parts[i], "OFF") == 0) {
+                    set_enable = true;
+                    enable = false;
+                } else {
+                    // Try to parse as frequency
+                    new_freq = atoi(parts->parts[i]);
+                    if (new_freq > 0) {
+                        set_freq = true;
+                    }
+                }
+            }
+
+            // Apply changes
+            if (set_freq) {
+                clock_set_frequency(new_freq);
+                uart_cli_printf("OK: Clock frequency set to %u Hz\r\n", new_freq);
+            }
+
+            if (set_enable) {
+                if (enable) {
+                    if (clock_get_frequency() == 0) {
+                        uart_cli_send("ERROR: Set frequency first\r\n");
+                        goto api_response;
+                    }
+                    clock_enable();
+                    uart_cli_send("OK: Clock enabled\r\n");
+                } else {
+                    clock_disable();
+                    uart_cli_send("OK: Clock disabled\r\n");
+                }
+            }
+
+            // Show final status if both were set
+            if (set_freq && set_enable && enable) {
+                uart_cli_printf("Clock running at %u Hz\r\n", clock_get_frequency());
+            }
+        }
+
     } else if (strcmp(parts->parts[0], "GLITCH") == 0) {
         if (glitch_execute()) {
             uart_cli_send("OK: Glitch executed\r\n");
@@ -534,6 +609,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP1  - ChipSHOUTER UART RX (UART0)\r\n");
         uart_cli_send("GP4  - Target UART TX (UART1)\r\n");
         uart_cli_send("GP5  - Target UART RX (UART1, also PIO monitored)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== Clock Generator ==\r\n");
+        uart_cli_send("GP8  - Clock Output\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_printf("GP%u  - Glitch Output\r\n", cfg->output_pin);

@@ -198,7 +198,7 @@ def setup_gpio_trigger(ser, voltage, pause, width):
     # Set glitch timing parameters
     send_command(ser, f"SET PAUSE {pause}")
     send_command(ser, f"SET WIDTH {width}")
-    send_command(ser, f"SET COUNT 1")
+    send_command(ser, f"SET COUNT 3")
 
     # Configure GPIO trigger on GP3, rising edge (triggered by GP15 RESET)
     send_command(ser, "TRIGGER GPIO RISING")

@@ -19,7 +19,7 @@
 #define PIN_FLAG_RUNNING 3
 #define PIN_FLAG_TRIGGERED 4
 #define PIN_FLAG_FINISHED 5
-#define PIN_CLOCK 6
+#define PIN_CLOCK 8
 
 // PIO State Machine Allocation
 #define SM_TRIGGER 0
@@ -128,5 +128,12 @@ typedef struct {
     uint32_t cycle_time_ms;
     bool configured;
 } target_power_config_t;
+
+// Clock Generator Configuration
+typedef struct {
+    uint8_t pin;
+    uint32_t frequency;
+    bool enabled;
+} clock_config_t;
 
 #endif // CONFIG_H

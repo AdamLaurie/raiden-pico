@@ -12,10 +12,11 @@
 
 // PIO and state machine allocations
 static PIO glitch_pio = pio0;
+static PIO clock_pio = pio1;     // Separate PIO for clock to avoid instruction memory overflow
 static uint sm_edge_detect = 0;
 static uint sm_pulse_gen = 1;
 static uint sm_flag_output = 2;  // Can reuse for UART trigger since not used simultaneously
-static uint sm_clock_gen = 3;
+static uint sm_clock_gen = 0;    // Clock uses PIO1 SM0
 static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
 
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
@@ -24,6 +25,7 @@ static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
 // Configuration and state
 static glitch_config_t config;
 static system_flags_t flags;
+static clock_config_t clock_config;
 static uint32_t glitch_count = 0;
 static volatile uint32_t pio_irq5_count = 0;  // Debug counter for PIO IRQ fires
 
@@ -36,8 +38,8 @@ static uint32_t precalc_gap_cycles = 0;
 static uint offset_edge_detect_rising;   // Rising edge detect program
 static uint offset_edge_detect_falling;  // Falling edge detect program
 static uint offset_pulse_gen;
-// offset_flag_output removed - unused program
-// offset_clock_gen removed - unused program
+static uint offset_clock_gen_delay;  // Clock generator with delay
+static uint offset_clock_gen;        // Simple clock generator
 static uint offset_uart_match;
 static uint offset_irq_trigger;
 
@@ -57,17 +59,28 @@ void glitch_init(void) {
     // Initialize flags
     memset(&flags, 0, sizeof(flags));
 
+    // Initialize clock configuration
+    memset(&clock_config, 0, sizeof(clock_config));
+    clock_config.pin = PIN_CLOCK;  // GP6
+    clock_config.frequency = 0;
+    clock_config.enabled = false;
+
     // Reset glitch count
     glitch_count = 0;
     pio_irq5_count = 0;
 
-    // Load PIO programs (CRITICAL: Must fit in 32 instruction words!)
+    // Load PIO programs for glitching (PIO0 - must fit in 32 instruction words!)
     offset_edge_detect_rising = pio_add_program(glitch_pio, &gpio_edge_detect_rising_program);
     offset_edge_detect_falling = pio_add_program(glitch_pio, &gpio_edge_detect_falling_program);
     offset_pulse_gen = pio_add_program(glitch_pio, &pulse_generator_program);
     // offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);  // DISABLED - RP2350 bug
     offset_irq_trigger = pio_add_program(glitch_pio, &irq_trigger_program);
-    // Total: rising(9) + falling(8) + pulse_gen(12) + irq_trigger(1) = 30 instructions
+    // Total PIO0: rising(9) + falling(8) + pulse_gen(12) + irq_trigger(1) = 30 instructions
+
+    // Load clock generator programs into PIO1 (separate instruction memory)
+    offset_clock_gen_delay = pio_add_program(clock_pio, &clock_generator_delay_program);
+    offset_clock_gen = pio_add_program(clock_pio, &clock_generator_program);
+    // Total PIO1: clock_delay(6) + clock(2) = 8 instructions
 
     // PIO state machines are configured and started in glitch_arm() based on trigger type
     // Output pin is configured for PIO control in glitch_arm()
@@ -373,4 +386,92 @@ void glitch_update_flags(void) {
     if (flags.armed) {
         // Blink LED or set status pin
     }
+}
+
+// Clock generator control functions
+void clock_set_frequency(uint32_t freq_hz) {
+    bool was_enabled = clock_config.enabled;
+
+    // Disable clock if it was running
+    if (was_enabled) {
+        clock_disable();
+    }
+
+    // Update frequency
+    clock_config.frequency = freq_hz;
+
+    // Re-enable if it was running
+    if (was_enabled) {
+        clock_enable();
+    }
+}
+
+void clock_enable(void) {
+    if (clock_config.enabled) {
+        return;  // Already enabled
+    }
+
+    if (clock_config.frequency == 0) {
+        return;  // No frequency set
+    }
+
+    // Disable first to ensure clean state
+    pio_sm_set_enabled(clock_pio, sm_clock_gen, false);
+    pio_sm_clear_fifos(clock_pio, sm_clock_gen);
+
+    // Initialize GPIO for clock output
+    pio_gpio_init(clock_pio, clock_config.pin);
+    pio_sm_set_consecutive_pindirs(clock_pio, sm_clock_gen, clock_config.pin, 1, true);
+
+    // System clock is 150MHz (6.67ns per cycle)
+    // Target frequency determines cycles per half-period
+    uint32_t system_clock = clock_get_hz(clk_sys);
+    uint32_t target_half_period = (system_clock / 2) / clock_config.frequency;
+
+    // Use clock_generator_delay for frequencies that need timing control
+    // Use simple clock_generator for max speed (target_half_period < 2)
+    if (target_half_period >= 2) {
+        // Use delay-based clock generator
+        pio_sm_config c = clock_generator_delay_program_get_default_config(offset_clock_gen_delay);
+        sm_config_set_set_pins(&c, clock_config.pin, 1);
+        sm_config_set_clkdiv(&c, 1.0);  // Full speed
+
+        // Initialize and load half-period count
+        pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_delay, &c);
+        pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period - 1);  // -1 for loop overhead
+    } else {
+        // Use simple clock generator (max speed, ~75MHz toggle)
+        pio_sm_config c = clock_generator_program_get_default_config(offset_clock_gen);
+        sm_config_set_set_pins(&c, clock_config.pin, 1);
+        sm_config_set_clkdiv(&c, 1.0);  // Full speed
+
+        pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen, &c);
+    }
+
+    // Enable the state machine
+    pio_sm_set_enabled(clock_pio, sm_clock_gen, true);
+    clock_config.enabled = true;
+}
+
+void clock_disable(void) {
+    if (!clock_config.enabled) {
+        return;
+    }
+
+    // Disable state machine
+    pio_sm_set_enabled(clock_pio, sm_clock_gen, false);
+    pio_sm_clear_fifos(clock_pio, sm_clock_gen);
+
+    // Set clock pin LOW
+    gpio_put(clock_config.pin, 0);
+
+    clock_config.enabled = false;
+}
+
+bool clock_is_enabled(void) {
+    return clock_config.enabled;
+}
+
+uint32_t clock_get_frequency(void) {
+    return clock_config.frequency;
 }
