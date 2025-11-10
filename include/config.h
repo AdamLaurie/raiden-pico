@@ -16,36 +16,8 @@
 // Reserved GPIO Pins
 // GP0/GP1 used for ChipSHOUTER UART0
 #define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
-#define PIN_FLAG_RUNNING 3
-#define PIN_FLAG_TRIGGERED 4
-#define PIN_FLAG_FINISHED 5
-#define PIN_CLOCK 8
 #define PIN_GLITCH_OUT_INV 11  // Glitch pulse output (inverted)
-
-// PIO State Machine Allocation
-#define SM_TRIGGER 0
-#define SM_PULSE 1
-#define SM_FLAGS 2
-#define SM_CLOCK 3
-#define SM_VOLTAGE 4
-#define SM_HV_ENABLE 5
-#define SM_STATUS 6
-#define SM_TARGET_TX 7
-
-// Buffer Sizes
-#define CMD_BUFFER_SIZE 256
-#define RESPONSE_BUFFER_SIZE 256
-#define UART_RX_BUFFER_SIZE 128
-
-// Glitch Configuration Limits
-#define MAX_PAUSE_US 1000000
-#define MAX_WIDTH_US 1000000
-#define MAX_GAP_US 1000000
-#define MAX_COUNT 1000
-#define MAX_VOLTAGE 500
-
-// PIO Clock Frequency
-#define PIO_CLOCK_HZ 1000000  // 1 MHz for microsecond timing
+#define PIN_CLOCK 8            // Clock generator output
 
 // Platform Types
 typedef enum {
