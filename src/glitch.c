@@ -96,15 +96,21 @@ static void clock_trigger_boost(void) {
         return;
     }
 
-    // Calculate timing
+    // Calculate normal period for restoration
     uint32_t system_clock = clock_get_hz(clk_sys);
     uint32_t normal_half_period = (system_clock / 2) / clock_config.frequency;
 
-    // Push 2 words: count, normal_period (non-blocking)
-    if (pio_sm_get_tx_fifo_level(clock_pio, sm_clock_gen) <= 2) {
-        pio_sm_put(clock_pio, sm_clock_gen, config.count);
-        pio_sm_put(clock_pio, sm_clock_gen, normal_half_period);
-    }
+    // Trigger boost by:
+    // 1. Loading count into OSR
+    // 2. Pushing normal_period to FIFO (for restoration after boost)
+    // 3. Jumping to entry_boost label
+    pio_sm_put(clock_pio, sm_clock_gen, config.count);
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_pull(false, false));  // pull block -> OSR
+    pio_sm_put(clock_pio, sm_clock_gen, normal_half_period - 1);
+
+    // Jump to boost entry point
+    uint boost_offset = offset_clock_gen_boost + clock_generator_with_boost_offset_entry_boost;
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_jmp(boost_offset));
 }
 
 glitch_config_t* glitch_get_config(void) {
@@ -486,22 +492,27 @@ void clock_enable(void) {
     uint32_t system_clock = clock_get_hz(clk_sys);
     uint32_t target_half_period = (system_clock / 2) / clock_config.frequency;
 
-    // Always use boost-capable clock generator
+    // Configure boost-capable clock generator
     pio_sm_config c = clock_generator_with_boost_program_get_default_config(offset_clock_gen_boost);
     sm_config_set_set_pins(&c, clock_config.pin, 1);
     sm_config_set_clkdiv(&c, 1.0);  // Full speed
-
-    // Initialize and preload: normal_period, fast_period
-    uint32_t fast_half_period = target_half_period / 2;  // 2x frequency
     pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_boost, &c);
-    pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period);
-    pio_sm_put_blocking(clock_pio, sm_clock_gen, fast_half_period);
 
-    // Enable clock boost feature (boost triggered by glitch_execute)
-    clock_boost_enabled = true;
+    // Initialize Y (normal period) and ISR (fast period) registers manually
+    uint32_t fast_half_period = (target_half_period / 2);  // 2x frequency
+    pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period - 1);
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_pull(false, false));
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_mov(pio_y, pio_osr));
+
+    pio_sm_put_blocking(clock_pio, sm_clock_gen, fast_half_period - 1);
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_pull(false, false));
+    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_mov(pio_isr, pio_osr));
 
     // Enable the state machine
     pio_sm_set_enabled(clock_pio, sm_clock_gen, true);
+
+    // Enable clock boost feature
+    clock_boost_enabled = true;
     clock_config.enabled = true;
 }
 
