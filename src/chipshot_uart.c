@@ -236,11 +236,11 @@ void chipshot_set_trigger_hw(bool active_high) {
     // Configure pull resistor on glitch output pin based on active high/low
     if (active_high) {
         // Active high: configure pull-down so pin idles low
-        gpio_pull_down(cfg->output_pin);
+        gpio_pull_down(PIN_GLITCH_OUT);
         chipshot_uart_send("set hwtrig_mode 1\n");
     } else {
         // Active low: configure pull-up so pin idles high
-        gpio_pull_up(cfg->output_pin);
+        gpio_pull_up(PIN_GLITCH_OUT);
         chipshot_uart_send("set hwtrig_mode 0\n");
     }
 }

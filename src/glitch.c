@@ -53,10 +53,10 @@ void glitch_init(void) {
     config.gap_cycles = 100;     // 100 cycles = 0.67us at 150MHz
     config.count = 1;
     config.trigger = TRIGGER_NONE;
-    config.output_pin = 2;  // Default glitch output pin
     config.trigger_pin = 3;  // Default trigger pin
     config.trigger_edge = EDGE_RISING;
     config.trigger_byte = 0x00;
+    // Glitch output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
 
     // Initialize flags
     memset(&flags, 0, sizeof(flags));
@@ -150,9 +150,7 @@ void glitch_set_trigger_byte(uint8_t byte) {
     config.trigger_byte = byte;
 }
 
-void glitch_set_output_pin(uint8_t pin) {
-    config.output_pin = pin;
-}
+// Output pins are hardwired - no need for setter function
 
 bool glitch_arm(void) {
     if (flags.armed) {
@@ -229,12 +227,20 @@ bool glitch_arm(void) {
 
     // Configure pulse generator FIRST (for all trigger types) - must be ready before trigger!
     pio_sm_config c_pulse = pulse_generator_program_get_default_config(offset_pulse_gen);
-    // Note: Pulse generator uses IRQ not pins, so no sm_config_set_in_pins needed
-    sm_config_set_set_pins(&c_pulse, config.output_pin, 1);  // SET pins for glitch output
+    // Set up normal glitch output (SET pins)
+    sm_config_set_set_pins(&c_pulse, PIN_GLITCH_OUT, 1);
+    // Set up inverted glitch output (SIDE pins)
+    sm_config_set_sideset_pins(&c_pulse, PIN_GLITCH_OUT_INV);
     sm_config_set_clkdiv(&c_pulse, 1.0);  // Run at full system clock speed for precise timing
-    pio_gpio_init(glitch_pio, config.output_pin);
-    pio_sm_set_consecutive_pindirs(glitch_pio, sm_pulse_gen, config.output_pin, 1, true);
-    gpio_put(config.output_pin, 0);  // Ensure output starts LOW
+
+    // Initialize normal output pin (PIO control)
+    pio_gpio_init(glitch_pio, PIN_GLITCH_OUT);
+    pio_sm_set_consecutive_pindirs(glitch_pio, sm_pulse_gen, PIN_GLITCH_OUT, 1, true);
+
+    // Initialize inverted output pin with hardware inversion (PIO control)
+    pio_gpio_init(glitch_pio, PIN_GLITCH_OUT_INV);
+    pio_sm_set_consecutive_pindirs(glitch_pio, sm_pulse_gen, PIN_GLITCH_OUT_INV, 1, true);
+    gpio_set_outover(PIN_GLITCH_OUT_INV, GPIO_OVERRIDE_INVERT);  // Hardware inversion
 
     // Clear and initialize pulse generator - MUST be done every ARM for clean state
     pio_sm_clear_fifos(glitch_pio, sm_pulse_gen);
@@ -339,9 +345,7 @@ void glitch_disarm(void) {
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
 
     // No need to restore GP5 - PIO was just snooping, UART function never changed
-
-    // Reset output pin
-    gpio_put(config.output_pin, 0);
+    // Output pins are controlled by PIO, will return to idle state automatically
 
     flags.armed = false;
 }
@@ -395,8 +399,7 @@ void glitch_reset(void) {
     // Reset glitch count
     glitch_count = 0;
 
-    // Reset output pin
-    gpio_put(config.output_pin, 0);
+    // Output pins controlled by PIO, no GPIO reset needed
 }
 
 uint32_t glitch_get_count(void) {

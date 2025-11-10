@@ -57,37 +57,40 @@ bitloop:
 ; Pulse generator with IRQ trigger and COUNT loop
 ; Waits for IRQ 0, then pulls: PAUSE, COUNT, WIDTH, GAP
 ; Loops COUNT times emitting WIDTH (HIGH) and GAP (LOW) pulses
+; SET pins controls PIN_GLITCH_OUT (GP2)
+; SIDE pins controls PIN_GLITCH_OUT_INV (GP11) - inverted in hardware
 .program pulse_generator
+.side_set 1
 .wrap_target
 start:
-    wait 1 irq 0        ; Wait for IRQ 0 (auto-clears)
-    pull block          ; Get PAUSE value
-    out x, 32           ; Move to X
+    wait 1 irq 0        side 0  ; Wait for IRQ 0, both pins idle LOW (side inverted to HIGH)
+    pull block          side 0  ; Get PAUSE value
+    out x, 32           side 0  ; Move to X
 pause_loop:
-    jmp x-- pause_loop  ; Wait for PAUSE cycles
+    jmp x-- pause_loop  side 0  ; Wait for PAUSE cycles
 
-    pull block          ; Get COUNT value
-    out y, 32           ; COUNT in Y (outer loop counter)
-    pull block          ; Get WIDTH value
-    mov isr, osr        ; Save WIDTH to ISR (preserved across loop)
-    pull block          ; Get GAP value
-                        ; GAP stays in OSR (preserved across loop)
+    pull block          side 0  ; Get COUNT value
+    out y, 32           side 0  ; COUNT in Y (outer loop counter)
+    pull block          side 0  ; Get WIDTH value
+    mov isr, osr        side 0  ; Save WIDTH to ISR (preserved across loop)
+    pull block          side 0  ; Get GAP value
+                                ; GAP stays in OSR (preserved across loop)
 
 pulse_loop:
-    ; Emit WIDTH pulse (HIGH)
-    mov x, isr          ; Load WIDTH from ISR
-    set pins, 1         ; Set output HIGH
+    ; Emit WIDTH pulse (HIGH on both pins, hardware inverts one)
+    mov x, isr          side 1  ; Load WIDTH from ISR
+    set pins, 1         side 1  ; Set output HIGH on both (hardware inverts side pin)
 width_loop:
-    jmp x-- width_loop  ; Wait for WIDTH cycles
+    jmp x-- width_loop  side 1  ; Wait for WIDTH cycles
 
-    ; Emit GAP (LOW)
-    mov x, osr          ; Load GAP from OSR
-    set pins, 0         ; Set output LOW
+    ; Emit GAP (LOW on both pins, hardware inverts one)
+    mov x, osr          side 0  ; Load GAP from OSR
+    set pins, 0         side 0  ; Set output LOW on both (hardware inverts side pin)
 gap_loop:
-    jmp x-- gap_loop    ; Wait for GAP cycles
+    jmp x-- gap_loop    side 0  ; Wait for GAP cycles
 
-    jmp y-- pulse_loop  ; Loop COUNT times
-.wrap                   ; Wrap back to start to wait for next trigger
+    jmp y-- pulse_loop  side 0  ; Loop COUNT times
+.wrap                           ; Wrap back to start to wait for next trigger
 
 ; Flag output - outputs 4-bit flags to GPIO
 .program flag_output

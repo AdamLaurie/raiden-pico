@@ -152,11 +152,11 @@ void command_parser_execute(cmd_parts_t *parts) {
 
     // Match primary command
     const char *primary_commands[] = {
-        "SET", "GET", "TRIGGER", "OUT", "PINS",
+        "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
         "HELP", "REBOOT", "DEBUG", "API", "ERROR"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 18, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 17, "command")) {
         goto api_response;
     }
 
@@ -249,12 +249,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("Non-ambiguous shortcuts supported for commands, sub-commands, and arguments.\r\n");
         uart_cli_send("Examples:\r\n");
         uart_cli_send("  STAT → STATUS       GL → GLITCH         P → PINS\r\n");
-        uart_cli_send("  TARG B → TARGET BOOTLOADER              O 5 → OUT 5\r\n");
+        uart_cli_send("  TARG B → TARGET BOOTLOADER\r\n");
         uart_cli_send("  SET P 1000 → SET PAUSE 1000             TRIG G R → TRIGGER GPIO RISING\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Configuration ==\r\n");
         uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT] - Get current glitch parameter(s)\r\n");
-        uart_cli_send("OUT [<pin>]            - Set/get glitch output pin\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
         uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns @ 150MHz)\r\n");
         uart_cli_send("\r\n");
@@ -364,7 +363,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Width:        %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
         uart_cli_printf("Gap:          %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
         uart_cli_printf("Count:        %u\r\n", cfg->count);
-        uart_cli_printf("Output Pin:   GP%u\r\n", cfg->output_pin);
+        uart_cli_printf("Output Pins:  GP%u (normal), GP%u (inverted)\r\n", PIN_GLITCH_OUT, PIN_GLITCH_OUT_INV);
         uart_cli_send("\r\n");
 
         // Trigger configuration
@@ -614,7 +613,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP8  - Clock Output\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
-        uart_cli_printf("GP%u  - Glitch Output\r\n", cfg->output_pin);
+        uart_cli_printf("GP%u  - Glitch Output (normal)\r\n", PIN_GLITCH_OUT);
+        uart_cli_printf("GP%u  - Glitch Output (inverted)\r\n", PIN_GLITCH_OUT_INV);
         uart_cli_printf("GP%u  - Trigger Input\r\n", cfg->trigger_pin);
         uart_cli_send("\r\n");
         uart_cli_send("== Platform Control ==\r\n");
@@ -682,21 +682,6 @@ void command_parser_execute(cmd_parts_t *parts) {
             glitch_set_trigger_byte(byte);
             glitch_set_trigger_type(TRIGGER_UART);
             uart_cli_printf("OK: UART trigger on byte 0x%02X (%u)\r\n", byte, byte);
-        }
-
-    } else if (strcmp(parts->parts[0], "OUT") == 0) {
-        glitch_config_t *cfg = glitch_get_config();
-
-        if (parts->count == 1) {
-            // Show current output pin
-            uart_cli_printf("Output pin: GP%u\r\n", cfg->output_pin);
-        } else if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: OUT <pin>\r\n");
-            goto api_response;
-        } else {
-            uint8_t pin = atoi(parts->parts[1]);
-            glitch_set_output_pin(pin);
-            uart_cli_printf("OK: Glitch output set to pin %u\r\n", pin);
         }
 
     } else if (strcmp(parts->parts[0], "TARGET") == 0) {
@@ -1107,7 +1092,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("ChipSHOUTER: Sent set trigger hw command (");
                 uart_cli_send(active_high ? "active high)\r\n" : "active low)\r\n");
                 uart_cli_printf("Configured GPIO%u with %s\r\n",
-                    glitch_get_config()->output_pin,
+                    PIN_GLITCH_OUT,
                     active_high ? "pull-down" : "pull-up");
 
             } else if (strcmp(parts->parts[2], "SW") == 0) {

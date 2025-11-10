@@ -15,11 +15,12 @@
 
 // Reserved GPIO Pins
 // GP0/GP1 used for ChipSHOUTER UART0
-#define PIN_FLAG_ERROR 2
+#define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
 #define PIN_FLAG_RUNNING 3
 #define PIN_FLAG_TRIGGERED 4
 #define PIN_FLAG_FINISHED 5
 #define PIN_CLOCK 8
+#define PIN_GLITCH_OUT_INV 11  // Glitch pulse output (inverted)
 
 // PIO State Machine Allocation
 #define SM_TRIGGER 0
@@ -93,7 +94,7 @@ typedef struct {
     uint8_t trigger_pin;
     edge_type_t trigger_edge;
     uint8_t trigger_byte;
-    uint8_t output_pin;
+    // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP6)
 } glitch_config_t;
 
 // Platform Configuration
