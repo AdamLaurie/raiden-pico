@@ -156,7 +156,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
         "HELP", "REBOOT", "DEBUG", "API", "ERROR"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 17, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 16, "command")) {
         goto api_response;
     }
 
