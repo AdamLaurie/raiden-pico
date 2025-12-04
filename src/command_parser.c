@@ -4,6 +4,8 @@
 #include "target_uart.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
+#include "hardware/pio.h"
+#include "hardware/clocks.h"
 #include "pico/bootrom.h"
 #include "hardware/regs/sysinfo.h"
 #include "hardware/structs/sysinfo.h"
@@ -294,6 +296,13 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
         uart_cli_send("TRIGGER UART <byte>    - UART byte trigger\r\n");
         uart_cli_send("\r\n");
+        uart_cli_send("== XY Platform (Grbl) ==\r\n");
+        uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
+        uart_cli_send("GRBL HOME              - Home the XY platform\r\n");
+        uart_cli_send("GRBL MOVE <X> <Y> [F]  - Move to absolute position (mm, feedrate mm/min)\r\n");
+        uart_cli_send("GRBL STEP <DX> <DY> [F]- Move relative distance (mm, feedrate mm/min)\r\n");
+        uart_cli_send("GRBL POS               - Get current XYZ position\r\n");
+        uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
         uart_cli_printf("Raiden Pico Glitcher v0.3\r\n");
@@ -412,7 +421,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else {
             uart_cli_printf("Frequency:    %u Hz\r\n", clock_freq);
             uart_cli_printf("Status:       %s\r\n", clock_enabled ? "ON" : "OFF");
-            uart_cli_send("Pin:          GP8\r\n");
+            uart_cli_send("Pin:          GP6\r\n");
         }
 
     } else if (strcmp(parts->parts[0], "SET") == 0) {
@@ -610,16 +619,21 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP5  - Target UART RX (UART1, also PIO monitored)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
-        uart_cli_send("GP8  - Clock Output\r\n");
+        uart_cli_send("GP6  - Clock Output\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_printf("GP%u  - Glitch Output (normal)\r\n", PIN_GLITCH_OUT);
         uart_cli_printf("GP%u  - Glitch Output (inverted)\r\n", PIN_GLITCH_OUT_INV);
         uart_cli_printf("GP%u  - Trigger Input\r\n", cfg->trigger_pin);
         uart_cli_send("\r\n");
+        uart_cli_send("== XY Platform (Grbl) ==\r\n");
+        uart_cli_send("GP8  - Grbl UART TX (UART1 alternate, 115200 baud)\r\n");
+        uart_cli_send("GP9  - Grbl UART RX (UART1 alternate, 115200 baud)\r\n");
+        uart_cli_send("\r\n");
         uart_cli_send("== Platform Control ==\r\n");
-        uart_cli_send("GP6  - HV Enable (default)\r\n");
-        uart_cli_send("GP7  - Voltage PWM (default)\r\n");
+        uart_cli_send("GP6  - HV Enable (default, configurable via PLATFORM HVPIN)\r\n");
+        uart_cli_send("GP7  - Voltage PWM (default, configurable via PLATFORM VPIN)\r\n");
+        uart_cli_send("GP11 - Armed Status Monitor (default)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("GP10 - Target Power (default ON)\r\n");
@@ -1123,6 +1137,84 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("OK: API mode disabled\r\n");
         } else {
             api_error("ERROR: Usage: API [ON|OFF]\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "GRBL") == 0) {
+        extern void grbl_init(void);
+        extern bool grbl_is_active(void);
+        extern void grbl_send(const char *gcode);
+        extern void grbl_home(void);
+        extern void grbl_move_absolute(float x, float y, float feedrate);
+        extern void grbl_move_relative(float dx, float dy, float feedrate);
+        extern bool grbl_get_position(float *x, float *y, float *z);
+
+        if (parts->count < 2) {
+            uart_cli_send("ERROR: Usage: GRBL <SEND|HOME|MOVE|STEP|POS|TEST>\r\n");
+            goto api_response;
+        }
+
+        // Auto-initialize Grbl UART if not already active (will auto-deinit target if needed)
+        if (!grbl_is_active()) {
+            grbl_init();
+        }
+
+        if (strcmp(parts->parts[1], "SEND") == 0) {
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: GRBL SEND <gcode>\r\n");
+                goto api_response;
+            }
+            // Reconstruct G-code from remaining parts
+            char gcode[128] = {0};
+            for (int i = 2; i < parts->count; i++) {
+                if (i > 2) strcat(gcode, " ");
+                strcat(gcode, parts->parts[i]);
+            }
+            grbl_send(gcode);
+        } else if (strcmp(parts->parts[1], "HOME") == 0) {
+            grbl_home();
+        } else if (strcmp(parts->parts[1], "MOVE") == 0) {
+            if (parts->count < 4) {
+                uart_cli_send("ERROR: Usage: GRBL MOVE <X> <Y> [FEEDRATE]\r\n");
+                goto api_response;
+            }
+
+            float x = atof(parts->parts[2]);
+            float y = atof(parts->parts[3]);
+            float feedrate = 1000.0f;  // Default 1000 mm/min
+            if (parts->count >= 5) {
+                feedrate = atof(parts->parts[4]);
+            }
+
+            grbl_move_absolute(x, y, feedrate);
+            uart_cli_printf("OK: Moving to X=%.3f Y=%.3f F=%.0f\r\n", x, y, feedrate);
+        } else if (strcmp(parts->parts[1], "STEP") == 0) {
+            if (parts->count < 4) {
+                uart_cli_send("ERROR: Usage: GRBL STEP <DX> <DY> [FEEDRATE]\r\n");
+                goto api_response;
+            }
+
+            float dx = atof(parts->parts[2]);
+            float dy = atof(parts->parts[3]);
+            float feedrate = 1000.0f;  // Default 1000 mm/min
+            if (parts->count >= 5) {
+                feedrate = atof(parts->parts[4]);
+            }
+
+            grbl_move_relative(dx, dy, feedrate);
+            uart_cli_printf("OK: Stepping by DX=%.3f DY=%.3f F=%.0f\r\n", dx, dy, feedrate);
+        } else if (strcmp(parts->parts[1], "POS") == 0) {
+            float x, y, z;
+            if (grbl_get_position(&x, &y, &z)) {
+                uart_cli_printf("Position: X=%.3f Y=%.3f Z=%.3f\r\n", x, y, z);
+            } else {
+                api_error("ERROR: Failed to get position\r\n");
+            }
+        } else if (strcmp(parts->parts[1], "TEST") == 0) {
+            // Test hardware UART loopback
+            extern bool grbl_test_loopback(void);
+            grbl_test_loopback();
+        } else {
+            api_error("ERROR: Unknown GRBL command\r\n");
         }
 
     } else if (strcmp(parts->parts[0], "ERROR") == 0) {

@@ -263,6 +263,14 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     target_baud = baud;
 
+    // If Grbl UART is active, deinitialize it first
+    // Grbl uses UART1 on GP8/GP9, we need UART1 on GP4/GP5
+    extern bool grbl_is_active(void);
+    extern void grbl_deinit(void);
+    if (grbl_is_active()) {
+        grbl_deinit();
+    }
+
     // Always deinitialize first to ensure clean state
     // After Pico boot, UART peripheral and GPIO may be in undefined state
     if (target_initialized) {
@@ -276,13 +284,17 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     gpio_deinit(tx_pin);
     gpio_deinit(rx_pin);
 
+    // Initialize GPIO pins before UART (like SDK examples)
+    gpio_init(tx_pin);
+    gpio_init(rx_pin);
+
     // Initialize UART1
     uart_init(TARGET_UART_ID, baud);
 
     // Set UART format explicitly (8 data bits, 1 stop bit, no parity)
     uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
 
-    // Set TX and RX pins for UART1
+    // Set TX and RX pins for UART1 (GP4/GP5 are default UART1 pins)
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
     gpio_set_function(rx_pin, GPIO_FUNC_UART);
 
