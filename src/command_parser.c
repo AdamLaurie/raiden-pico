@@ -2,6 +2,7 @@
 #include "uart_cli.h"
 #include "glitch.h"
 #include "target_uart.h"
+#include "grbl.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/pio.h"
@@ -298,6 +299,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
+        uart_cli_send("GRBL UNLOCK            - Unlock alarm (enable movement without homing)\r\n");
+        uart_cli_send("GRBL SET HOME          - Set current position as home (0,0,0)\r\n");
         uart_cli_send("GRBL HOME              - Home the XY platform\r\n");
         uart_cli_send("GRBL MOVE <X> <Y> [F]  - Move to absolute position (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL STEP <DX> <DY> [F]- Move relative distance (mm, feedrate mm/min)\r\n");
@@ -1149,7 +1152,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern bool grbl_get_position(float *x, float *y, float *z);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: GRBL <SEND|HOME|MOVE|STEP|POS|TEST>\r\n");
+            uart_cli_send("ERROR: Usage: GRBL <SEND|UNLOCK|SET|HOME|MOVE|STEP|POS|TEST|DEBUG>\r\n");
             goto api_response;
         }
 
@@ -1163,45 +1166,86 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: Usage: GRBL SEND <gcode>\r\n");
                 goto api_response;
             }
-            // Reconstruct G-code from remaining parts
+            // Reconstruct G-code from remaining parts, stripping quotes if present
             char gcode[128] = {0};
             for (int i = 2; i < parts->count; i++) {
+                const char *part = parts->parts[i];
+                // Strip leading quote from first part
+                if (i == 2 && part[0] == '"') {
+                    part++;
+                }
                 if (i > 2) strcat(gcode, " ");
-                strcat(gcode, parts->parts[i]);
+                strcat(gcode, part);
+            }
+            // Strip trailing quote from final string
+            size_t len = strlen(gcode);
+            if (len > 0 && gcode[len-1] == '"') {
+                gcode[len-1] = '\0';
             }
             grbl_send(gcode);
         } else if (strcmp(parts->parts[1], "HOME") == 0) {
             grbl_home();
+        } else if (strcmp(parts->parts[1], "RESET") == 0) {
+            grbl_reset();
+            uart_cli_send("OK: Grbl soft reset sent\r\n");
+        } else if (strcmp(parts->parts[1], "AUTOHOME") == 0) {
+            // Synchronous homing - waits for completion
+            uint32_t timeout_ms = 60000;  // Default 60 second timeout
+            if (parts->count >= 3) {
+                timeout_ms = atoi(parts->parts[2]);
+            }
+
+            if (grbl_home_sync(timeout_ms)) {
+                uart_cli_send("OK: Homing complete\r\n");
+            } else {
+                api_error("ERROR: Homing failed or timeout\r\n");
+            }
         } else if (strcmp(parts->parts[1], "MOVE") == 0) {
+            // Synchronous move - waits for ack and idle before returning
             if (parts->count < 4) {
-                uart_cli_send("ERROR: Usage: GRBL MOVE <X> <Y> [FEEDRATE]\r\n");
+                uart_cli_send("ERROR: Usage: GRBL MOVE <X> <Y> [FEEDRATE] [TIMEOUT_MS]\r\n");
                 goto api_response;
             }
 
             float x = atof(parts->parts[2]);
             float y = atof(parts->parts[3]);
-            float feedrate = 1000.0f;  // Default 1000 mm/min
+            float feedrate = 300.0f;  // Default 300 mm/min (5mm/sec)
+            uint32_t timeout_ms = 30000;  // Default 30 second timeout
             if (parts->count >= 5) {
                 feedrate = atof(parts->parts[4]);
             }
+            if (parts->count >= 6) {
+                timeout_ms = atoi(parts->parts[5]);
+            }
 
-            grbl_move_absolute(x, y, feedrate);
-            uart_cli_printf("OK: Moving to X=%.3f Y=%.3f F=%.0f\r\n", x, y, feedrate);
+            if (grbl_move_absolute_sync(x, y, feedrate, timeout_ms)) {
+                uart_cli_printf("OK: Move to X=%.3f Y=%.3f complete\r\n", x, y);
+            } else {
+                api_error("ERROR: Move failed or timeout\r\n");
+            }
         } else if (strcmp(parts->parts[1], "STEP") == 0) {
+            // Synchronous step - waits for ack and idle before returning
             if (parts->count < 4) {
-                uart_cli_send("ERROR: Usage: GRBL STEP <DX> <DY> [FEEDRATE]\r\n");
+                uart_cli_send("ERROR: Usage: GRBL STEP <DX> <DY> [FEEDRATE] [TIMEOUT_MS]\r\n");
                 goto api_response;
             }
 
             float dx = atof(parts->parts[2]);
             float dy = atof(parts->parts[3]);
-            float feedrate = 1000.0f;  // Default 1000 mm/min
+            float feedrate = 300.0f;  // Default 300 mm/min (5mm/sec)
+            uint32_t timeout_ms = 30000;  // Default 30 second timeout
             if (parts->count >= 5) {
                 feedrate = atof(parts->parts[4]);
             }
+            if (parts->count >= 6) {
+                timeout_ms = atoi(parts->parts[5]);
+            }
 
-            grbl_move_relative(dx, dy, feedrate);
-            uart_cli_printf("OK: Stepping by DX=%.3f DY=%.3f F=%.0f\r\n", dx, dy, feedrate);
+            if (grbl_move_relative_sync(dx, dy, feedrate, timeout_ms)) {
+                uart_cli_printf("OK: Step DX=%.3f DY=%.3f complete\r\n", dx, dy);
+            } else {
+                api_error("ERROR: Step failed or timeout\r\n");
+            }
         } else if (strcmp(parts->parts[1], "POS") == 0) {
             float x, y, z;
             if (grbl_get_position(&x, &y, &z)) {
@@ -1209,10 +1253,36 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else {
                 api_error("ERROR: Failed to get position\r\n");
             }
+        } else if (strcmp(parts->parts[1], "UNLOCK") == 0) {
+            // Unlock alarm state (kill alarm lock) to allow movement without homing
+            grbl_send("$X");
+            uart_cli_send("OK: Alarm unlocked (movement enabled without homing)\r\n");
+        } else if (strcmp(parts->parts[1], "SET") == 0) {
+            if (parts->count < 3 || strcmp(parts->parts[2], "HOME") != 0) {
+                api_error("ERROR: Usage: GRBL SET HOME\r\n");
+                goto api_response;
+            }
+            // Set current position as home (0,0,0) using G92
+            grbl_send("G92 X0 Y0 Z0");
+            uart_cli_send("OK: Current position set as home (0,0,0)\r\n");
         } else if (strcmp(parts->parts[1], "TEST") == 0) {
             // Test hardware UART loopback
             extern bool grbl_test_loopback(void);
             grbl_test_loopback();
+        } else if (strcmp(parts->parts[1], "DEBUG") == 0) {
+            // Debug: Check RX FIFO and report status
+            extern int grbl_debug_rx_fifo(char *buffer, int max_len);
+            char debug_buf[256];
+            int count = grbl_debug_rx_fifo(debug_buf, sizeof(debug_buf));
+            if (count > 0) {
+                uart_cli_printf("RX FIFO has %d bytes:\r\n", count);
+                for (int i = 0; i < count; i++) {
+                    uart_cli_printf("  [%d] 0x%02X '%c'\r\n", i, debug_buf[i],
+                                    (debug_buf[i] >= 32 && debug_buf[i] < 127) ? debug_buf[i] : '.');
+                }
+            } else {
+                uart_cli_send("RX FIFO is empty\r\n");
+            }
         } else {
             api_error("ERROR: Unknown GRBL command\r\n");
         }

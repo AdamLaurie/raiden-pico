@@ -10,17 +10,35 @@ void grbl_init(void);
 // Deinitialize Grbl UART (for switching to target)
 void grbl_deinit(void);
 
-// Send G-code command
+// Send G-code command (async - returns immediately)
 void grbl_send(const char *gcode);
 
-// Move to absolute position (mm)
+// Wait for "ok" or "error" response from Grbl
+bool grbl_wait_ack(uint32_t timeout_ms);
+
+// Send command and wait for ok + idle state (synchronous)
+bool grbl_send_sync(const char *gcode, uint32_t timeout_ms);
+
+// Move to absolute position (mm) - async
 void grbl_move_absolute(float x, float y, float feedrate);
 
-// Move relative (mm)
+// Move relative (mm) - async
 void grbl_move_relative(float dx, float dy, float feedrate);
 
-// Home the machine
+// Move to absolute position and wait for completion (synchronous)
+bool grbl_move_absolute_sync(float x, float y, float feedrate, uint32_t timeout_ms);
+
+// Move relative and wait for completion (synchronous)
+bool grbl_move_relative_sync(float dx, float dy, float feedrate, uint32_t timeout_ms);
+
+// Home the machine (async)
 void grbl_home(void);
+
+// Home the machine and wait for completion (synchronous)
+bool grbl_home_sync(uint32_t timeout_ms);
+
+// Soft reset the Grbl controller (sends Ctrl+X, 0x18)
+void grbl_reset(void);
 
 // Get current position
 bool grbl_get_position(float *x, float *y, float *z);

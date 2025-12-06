@@ -100,22 +100,149 @@ void grbl_send(const char *gcode) {
     uart_cli_printf("[Grbl TX] %s\r\n", gcode);
 }
 
+// Wait for "ok" or "error" response from Grbl
+// Returns true if "ok" received, false if "error", alarm, or timeout
+bool grbl_wait_ack(uint32_t timeout_ms) {
+    if (!grbl_uart_active) {
+        return false;
+    }
+
+    grbl_clear_response();
+
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+
+    while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+        // Poll for incoming data
+        while (uart_is_readable(GRBL_UART_ID) && grbl_resp_len < GRBL_RESP_SIZE - 1) {
+            char c = uart_getc(GRBL_UART_ID);
+            grbl_response[grbl_resp_len++] = c;
+            grbl_response[grbl_resp_len] = '\0';
+
+            // Check for complete response
+            if (c == '\n' || c == '\r' || c == '>') {
+                // Check if we got "ok"
+                if (strstr(grbl_response, "ok") != NULL) {
+                    uart_cli_printf("[Grbl RX] ok\r\n");
+                    grbl_clear_response();
+                    return true;
+                }
+                // Check for error conditions
+                if (strstr(grbl_response, "error") != NULL) {
+                    uart_cli_printf("[Grbl RX] %s", grbl_response);
+                    grbl_clear_response();
+                    return false;
+                }
+                if (strstr(grbl_response, "ALARM") != NULL) {
+                    uart_cli_printf("[Grbl RX] %s", grbl_response);
+                    grbl_clear_response();
+                    return false;
+                }
+                if (strstr(grbl_response, "[MSG:") != NULL) {
+                    uart_cli_printf("[Grbl RX] %s", grbl_response);
+                    // Check if it's a reset message
+                    if (strstr(grbl_response, "Reset") != NULL) {
+                        grbl_clear_response();
+                        return false;
+                    }
+                }
+                // Reset buffer for next line
+                grbl_resp_len = 0;
+                grbl_response[0] = '\0';
+            }
+        }
+        sleep_us(100);
+    }
+
+    uart_cli_send("[Grbl] Timeout waiting for ack\r\n");
+    return false;
+}
+
+// Send command and wait for ok + idle state
+// This is the safe way to send movement commands
+bool grbl_send_sync(const char *gcode, uint32_t timeout_ms) {
+    if (!grbl_uart_active) {
+        uart_cli_send("ERROR: Grbl UART not initialized\r\n");
+        return false;
+    }
+
+    // Send the command
+    grbl_send(gcode);
+
+    // Wait for "ok" acknowledgment (command accepted into buffer)
+    if (!grbl_wait_ack(timeout_ms)) {
+        uart_cli_send("ERROR: No ack from Grbl\r\n");
+        return false;
+    }
+
+    // Now wait for controller to become idle (movement complete)
+    return grbl_wait_idle(timeout_ms);
+}
+
 void grbl_move_absolute(float x, float y, float feedrate) {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "G90 G0 X%.3f Y%.3f F%.0f", x, y, feedrate);
+    snprintf(cmd, sizeof(cmd), "G90 G1 X%.3f Y%.3f F%.0f", x, y, feedrate);
     grbl_send(cmd);
 }
 
 void grbl_move_relative(float dx, float dy, float feedrate) {
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "G91 G0 X%.3f Y%.3f F%.0f", dx, dy, feedrate);
+    snprintf(cmd, sizeof(cmd), "G91 G1 X%.3f Y%.3f F%.0f", dx, dy, feedrate);
     grbl_send(cmd);
+}
+
+// Synchronous move - waits for ack and idle before returning
+bool grbl_move_absolute_sync(float x, float y, float feedrate, uint32_t timeout_ms) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "G90 G1 X%.3f Y%.3f F%.0f", x, y, feedrate);
+    return grbl_send_sync(cmd, timeout_ms);
+}
+
+// Synchronous relative move - waits for ack and idle before returning
+bool grbl_move_relative_sync(float dx, float dy, float feedrate, uint32_t timeout_ms) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "G91 G1 X%.3f Y%.3f F%.0f", dx, dy, feedrate);
+    return grbl_send_sync(cmd, timeout_ms);
 }
 
 void grbl_home(void) {
     uart_cli_send("[Grbl] Homing...\r\n");
     grbl_send("$H");
-    grbl_wait_idle(60000);  // 60 second timeout for homing
+}
+
+void grbl_reset(void) {
+    if (!grbl_uart_active) {
+        uart_cli_send("ERROR: Grbl UART not initialized\r\n");
+        return;
+    }
+
+    uart_cli_send("[Grbl] Soft reset (Ctrl+X)...\r\n");
+
+    // Send Ctrl+X (0x18) soft reset character
+    uart_putc(GRBL_UART_ID, 0x18);
+    uart_tx_wait_blocking(GRBL_UART_ID);
+
+    // Clear response buffer
+    grbl_clear_response();
+}
+
+// Synchronous home - waits for ack and idle
+bool grbl_home_sync(uint32_t timeout_ms) {
+    if (!grbl_uart_active) {
+        uart_cli_send("ERROR: Grbl UART not initialized\r\n");
+        return false;
+    }
+
+    uart_cli_send("[Grbl] Auto-homing...\r\n");
+    grbl_send("$H");
+
+    // Wait for "ok" acknowledgment
+    if (!grbl_wait_ack(timeout_ms)) {
+        uart_cli_send("[Grbl] Homing not acknowledged\r\n");
+        return false;
+    }
+
+    // Wait for homing to complete (idle state)
+    return grbl_wait_idle(timeout_ms);
 }
 
 bool grbl_get_position(float *x, float *y, float *z) {
@@ -123,15 +250,18 @@ bool grbl_get_position(float *x, float *y, float *z) {
         return false;
     }
 
+    // Clear any old data first
+    grbl_clear_response();
+
     // Request position report
     grbl_send("?");
 
-    // Wait for response
+    // Wait for response (poll frequently to avoid FIFO overflow)
     uint32_t start = to_ms_since_boot(get_absolute_time());
     while (to_ms_since_boot(get_absolute_time()) - start < 1000) {
         if (grbl_response_ready()) {
             const char *resp = grbl_get_response();
-            // Parse status report: <Idle|MPos:0.000,0.000,0.000|...>
+            // Parse status report: <Idle|MPos:0.000,0.000,0.000|...> or <Alarm|...>
             if (resp[0] == '<') {
                 const char *mpos = strstr(resp, "MPos:");
                 if (mpos) {
@@ -146,7 +276,7 @@ bool grbl_get_position(float *x, float *y, float *z) {
             }
             grbl_clear_response();
         }
-        sleep_ms(10);
+        sleep_us(100);  // Poll every 100us instead of 10ms to avoid FIFO overflow
     }
     return false;
 }
@@ -159,17 +289,50 @@ bool grbl_wait_idle(uint32_t timeout_ms) {
     uint32_t start = to_ms_since_boot(get_absolute_time());
 
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+        grbl_clear_response();
         grbl_send("?");
-        sleep_ms(100);
 
-        if (grbl_response_ready()) {
-            const char *resp = grbl_get_response();
-            if (strstr(resp, "<Idle") || strstr(resp, "<Check")) {
+        // Poll for response (frequently to avoid FIFO overflow)
+        uint32_t poll_start = to_ms_since_boot(get_absolute_time());
+        while (to_ms_since_boot(get_absolute_time()) - poll_start < 500) {
+            if (grbl_response_ready()) {
+                const char *resp = grbl_get_response();
+
+                // Check for idle state - success
+                if (strstr(resp, "<Idle") || strstr(resp, "<Check")) {
+                    grbl_clear_response();
+                    return true;
+                }
+
+                // Check for alarm state - fail
+                if (strstr(resp, "<Alarm") || strstr(resp, "ALARM")) {
+                    uart_cli_printf("[Grbl] Alarm detected: %s\r\n", resp);
+                    grbl_clear_response();
+                    return false;
+                }
+
+                // Check for error messages
+                if (strstr(resp, "error")) {
+                    uart_cli_printf("[Grbl] Error: %s\r\n", resp);
+                    grbl_clear_response();
+                    return false;
+                }
+
+                // Check for reset message
+                if (strstr(resp, "[MSG:") && strstr(resp, "Reset")) {
+                    uart_cli_printf("[Grbl] Reset required: %s\r\n", resp);
+                    grbl_clear_response();
+                    return false;
+                }
+
+                // Still running or other state, continue polling
                 grbl_clear_response();
-                return true;
+                break;
             }
-            grbl_clear_response();
+            sleep_us(100);
         }
+
+        sleep_ms(50);  // Poll status every 50ms
     }
 
     uart_cli_send("[Grbl] Timeout waiting for idle\r\n");
