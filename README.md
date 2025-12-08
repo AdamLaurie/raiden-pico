@@ -1,16 +1,18 @@
 # Raiden Pico
 
-A versatile voltage and clock glitching platform built on the Raspberry Pi Pico 2 (RP2350), designed for hardware security research and fault injection experiments, written entirely by AI.
+A versatile glitching control platform built on the Raspberry Pi Pico 2 (RP2350), designed for hardware security research and fault injection experiments, written entirely by AI.
 
 ## Overview
 
 Raiden Pico is a high-precision glitching tool that leverages the RP2350's PIO (Programmable I/O) state machines to generate precise glitch pulses for fault injection attacks. It supports multiple glitching methodologies including direct voltage glitching, ChipSHOUTER electromagnetic fault injection (EMFI), and clock glitching.
 
-It was created as an experiment to see how useful AI could be in hardware hacking. All the code and test scripts in this project were written and tested by [Claude](https://www.claude.com/product/claude-code)*.
+It was originally created as an experiment to see how useful AI could be in hardware hacking, but the goal has since evolved into making it the cheapest and most efficient glitching controller in order that it can be hardwired into test platforms to allow more reliable setups without having to waste or duplicate more expensive FPGA based controllers. 
+
+All the code and test scripts in this project were written and tested by [Claude](https://www.claude.com/product/claude-code)*
 
 The inspiration for the project came from discussions here: [Prompt||GTFO](https://www.knostic.ai/blog/prompt-gtfo-season-1).
 
-\* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope.
+\* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope. I have not read a single line of code produced, only ran and tested it, so I cannot speak for the quality of the coding! YMMV!
 
 ### Key Features
 
@@ -19,6 +21,7 @@ The inspiration for the project came from discussions here: [Prompt||GTFO](https
 - **Platform support**: Manual, ChipSHOUTER EMFI, generic EMFI, and crowbar voltage glitching
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
+- **GRBL XYZ support**: Direct UART control of GRBL CNC platform
 - **Real-time monitoring**: UART snooping for target debugging
 
 ## Hardware Requirements
@@ -260,6 +263,50 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 - Clears errors and reinitializes ChipSHOUTER
 - Verifies error state is cleared
 
+#### GRBL XY Platform Control
+
+Built-in UART control for GRBL-based XY positioning platforms (CNC routers, laser cutters, etc.) useful for automated EMFI probe positioning.
+
+**Note**: The system uses UART1 for both Target (GP4/GP5) and GRBL (GP8/GP9). Only one can be active at a time - switching between them reconfigures the UART automatically.
+
+**`GRBL SEND <gcode>`** - Send raw G-code command
+- Send any G-code directly to GRBL controller
+- Example: `GRBL SEND G0 X10 Y10`
+
+**`GRBL UNLOCK`** - Unlock alarm state
+- Sends `$X` to clear GRBL alarm
+- Required after homing errors or emergency stops
+
+**`GRBL SET HOME`** - Set current position as home
+- Sets current XY position as origin (0,0,0)
+- Sends `G92 X0 Y0 Z0`
+
+**`GRBL HOME`** - Move to home position
+- Rapid move to (0,0) coordinates
+- Example: `GRBL HOME`
+
+**`GRBL AUTOHOME`** - Auto-home with limit switches
+- Sends `$H` to trigger GRBL's homing cycle
+- Requires limit switches configured on GRBL controller
+
+**`GRBL MOVE <X> <Y> [F]`** - Move to absolute position
+- Move to specified XY coordinates
+- Optional feed rate in mm/min (default: 300)
+- Example: `GRBL MOVE 15 20` or `GRBL MOVE 15 20 500`
+
+**`GRBL STEP <DX> <DY> [F]`** - Move relative distance
+- Move by specified offset from current position
+- Optional feed rate in mm/min (default: 300)
+- Example: `GRBL STEP 5 -3` (move +5mm X, -3mm Y)
+
+**`GRBL POS`** - Get current position
+- Query current XYZ coordinates from GRBL
+- Returns position in machine coordinates
+
+**`GRBL RESET`** - Soft reset GRBL
+- Sends Ctrl-X (0x18) to reset GRBL controller
+- Use to recover from error states
+
 ## Typical Workflow
 
 ### 1. Basic Voltage Glitching
@@ -338,6 +385,13 @@ ARM ON
 - **GPIO 1** - ChipSHOUTER UART RX
 - **GPIO 2** - Hardware trigger output (connects to ChipSHOUTER trigger input)
 
+### GRBL XY Platform Connection
+
+- **GPIO 8** - GRBL UART TX (UART1 alternate function)
+- **GPIO 9** - GRBL UART RX (UART1 alternate function)
+
+**Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
+
 ## Architecture
 
 ### PIO State Machines
@@ -351,10 +405,12 @@ Raiden Pico uses the RP2350's PIO for precise timing-critical operations only:
 
 ### Hardware Peripherals
 
-Non-timing-critical communications use standard hardware peripherals:
+Non-timing-critical communications use standard hardware peripherals which can be shared by using alternate pin configs, 
+effictively increasing the hardware UART capability from 2 to 8:
 
 - **UART0** (GP0/GP1) - ChipSHOUTER communication (115200 baud)
 - **UART1** (GP4/GP5) - Target device communication (configurable baud)
+- **UART1** (GP8/GP9) - GRBL XYZ platform control
 
 ### Interrupt-Driven Design
 
