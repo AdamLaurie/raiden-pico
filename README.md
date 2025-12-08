@@ -17,6 +17,7 @@ The inspiration for the project came from discussions here: [Prompt||GTFO](https
 ### Key Features
 
 - **Precise timing control**: PIO-based glitch generation with 6.67ns resolution (150 MHz system clock)
+- **8 x Hardware UART**: Alternate configs are leveraged to share UART0/1 across multiple pinouts
 - **Multiple trigger modes**: GPIO, UART byte matching, or software triggers
 - **Platform support**: Manual, ChipSHOUTER EMFI, generic EMFI, and crowbar voltage glitching
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
@@ -140,10 +141,11 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `TRIGGER GPIO 10 RISING`
 - Use case: Trigger from external signal or target GPIO
 
-**`TRIGGER UART <byte>`** - Configure UART byte trigger
+**`TRIGGER UART <byte>`** - Configure UART byte trigger (on TARGET UART)
 - Trigger when specific byte is received from target UART
 - Byte value in decimal (0-255)
-- Example: `TRIGGER UART 65` (trigger on 'A')
+- Example: `TRIGGER UART 0D` (trigger on '\r')
+  - `TARGET SEND "R 0 4"`
 - Use case: Trigger at specific point in target's execution
 
 #### Platform Control
