@@ -1,5 +1,6 @@
 ; GPIO RISING edge detection (0->1) - ONE-SHOT trigger with debouncing
 ; Debounce: wait for LOW, add delay, verify LOW, then wait for HIGH
+; SET pin pulses GP12 (GLITCH_FIRED) to signal PIO1 clock boost
 .program gpio_edge_detect_rising
 start:
     wait 0 pin 0        ; Wait for trigger pin to be LOW
@@ -9,12 +10,14 @@ start:
     wait 0 pin 0        ; Verify pin is still LOW (stable)
     wait 1 pin 0        ; Wait for RISING edge (LOW->HIGH)
     irq set 0           ; Trigger glitch via IRQ
+    set pins, 1         ; Pulse GP12 HIGH (GLITCH_FIRED signal for clock boost)
 .wrap_target
     jmp 0               ; Halt: infinite loop, one-shot trigger
 .wrap
 
 ; GPIO FALLING edge detection (1->0) - ONE-SHOT trigger with debouncing
 ; Debounce: wait for HIGH, add delay, verify HIGH, then wait for LOW
+; SET pin pulses GP12 (GLITCH_FIRED) to signal PIO1 clock boost
 .program gpio_edge_detect_falling
 start:
     wait 1 pin 0        ; Wait for trigger pin to be HIGH
@@ -24,6 +27,7 @@ start:
     wait 1 pin 0        ; Verify pin is still HIGH (stable)
     wait 0 pin 0        ; Wait for FALLING edge (HIGH->LOW)
     irq set 0           ; Trigger glitch via IRQ
+    set pins, 1         ; Pulse GP12 HIGH (GLITCH_FIRED signal for clock boost)
 .wrap_target
     jmp 0               ; Halt: infinite loop, one-shot trigger
 .wrap
@@ -32,6 +36,7 @@ start:
 ; SM clock = 8× baud rate, IN pin 0 = GP28 (jumpered from GP5)
 ; RP2350B BUG: PIO and UART peripheral cannot share GPIO - requires GP5→GP28 jumper
 ; Shift right to receive LSB-first UART data
+; SET pin pulses GP9 (boost semaphore) to signal PIO1 clock boost
 .program uart_rx_decoder
     pull block          ; Get trigger byte from FIFO
     mov y, osr          ; Store trigger byte in Y
@@ -51,7 +56,12 @@ bitloop:
     jmp x!=y start      ; If not equal to trigger byte, loop back
 
     ; Match! Trigger the glitch
-    irq set 0
+    irq set 0           ; Trigger glitch via IRQ
+    set pins, 1         ; Pulse GP9 HIGH
+    nop [31]            ; Hold for 32 cycles
+    nop [31]            ; Hold for 32 cycles
+    nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
+    set pins, 0         ; Return GP9 LOW
 .wrap
 
 ; Pulse generator with IRQ trigger and COUNT loop
@@ -114,53 +124,54 @@ low:
     jmp x-- low         ; Delay for half period
 .wrap
 
-; Clock generator with glitch boost
+; Clock generator with GLITCH_FIRED boost
 ; Y = normal_half_period, ISR = fast_half_period (set by C via pio_sm_exec)
-; For boost: C pushes [count, normal_period] and triggers via IRQ or special mechanism
+; JMP pin = GP12 (GLITCH_FIRED from PIO0 - set HIGH on glitch, cleared on next ARM)
+; Note: GLITCH_FIRED can only be HIGH when armed, so no need to check ARMED separately
 .program clock_generator_with_boost
 .wrap_target
-clock_loop:
-    ; Normal clock cycle (Y = half_period, ISR = fast_half_period)
-    set pins, 1
+normal_clock:
+    ; Normal clock cycle (Y = normal_half_period)
+    set pins, 1             ; HIGH
     mov x, y
-h:
-    jmp x-- h
-    set pins, 0
-    mov x, y
-l:
-    jmp x-- l
-.wrap
+high_normal:
+    jmp x-- high_normal
 
-; Boost section - entered by jumping here from C using pio_sm_exec
-; Not used in normal wrap loop to avoid FIFO polling issues
-public entry_boost:
-    ; OSR already has count (loaded by C)
-    mov x, osr
+    set pins, 0             ; LOW
+    mov x, y
+low_normal:
+    jmp x-- low_normal
+
+    ; Check if GLITCH_FIRED (GP12 HIGH via JMP pin)
+    jmp pin boost_entry     ; If glitch fired, trigger boost
+    jmp normal_clock        ; Otherwise, continue normal clock
+
+boost_entry:
+    ; Pull boost count from FIFO (pre-loaded by CPU during clock setup)
+    pull noblock            ; Non-blocking pull - if empty, OSR unchanged
+    mov x, osr              ; X = boost count (outer loop)
 
 boost_loop:
-    ; Fast HIGH
+    ; Fast HIGH (ISR = fast_half_period)
     set pins, 1
-    mov osr, isr
-    mov y, osr
-fh:
-    jmp y-- fh
+    mov osr, isr            ; Copy fast period from ISR to OSR
+    mov y, osr              ; Move to Y for countdown
+high_boost:
+    jmp y-- high_boost
 
     ; Fast LOW
     set pins, 0
     mov osr, isr
     mov y, osr
-fl:
-    jmp y-- fl
+low_boost:
+    jmp y-- low_boost
 
-    jmp x-- boost_loop
+    jmp x-- boost_loop      ; Repeat COUNT times
 
-    ; Restore Y = normal_period (pushed by C) and return to normal clock
-    pull block
-    mov y, osr
-public entry_return:
-    ; Jump back to start of normal clock loop
-    ; Need to use a fixed offset - wrap_target is at offset 0 of this program
-    jmp clock_loop
+    ; Restore normal period to Y
+    pull noblock
+    mov y, osr              ; Restore normal_half_period
+.wrap                       ; Resume normal clock
 
 ; Simple clock generator
 .program clock_generator
@@ -169,9 +180,15 @@ public entry_return:
     set pins, 0         ; Set output LOW
 .wrap
 
-; IRQ trigger helper - single instruction that sets IRQ 0 and wraps
+; IRQ trigger helper - sets IRQ 0 and pulses GP9 for clock boost
 ; This allows CPU to trigger via pio_sm_exec without instruction overhead
+; SET pin should be configured to GP9 (boost semaphore)
 .program irq_trigger
 .wrap_target
-    irq set 0           ; Set IRQ 0 and immediately wrap
+    irq set 0           ; Trigger glitch via IRQ
+    set pins, 1         ; Pulse GP9 HIGH
+    nop [31]            ; Hold for 32 cycles
+    nop [31]            ; Hold for 32 cycles
+    nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
+    set pins, 0         ; Return GP9 LOW
 .wrap

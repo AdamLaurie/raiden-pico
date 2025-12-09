@@ -18,6 +18,8 @@
 #define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
 #define PIN_GLITCH_OUT_INV 11  // Glitch pulse output (inverted)
 #define PIN_CLOCK 8            // Clock generator output
+#define PIN_ARMED 9            // ARMED status (CPU-controlled, HIGH when armed)
+#define PIN_GLITCH_FIRED 12    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
 
 // Platform Types
 typedef enum {

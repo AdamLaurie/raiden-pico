@@ -1,10 +1,10 @@
 the target is a pico2 not a pico so ensure all code is for the RP2350
 
+always use "make flash" to write firmware
+
 use /dev/ttyACM0 to do your own debugging
 
 always close the tty when finished and never open it unless it is for flashing or testing
-
-use the command "REBOOT BL" to put the pico2 into bootloader mode for flashing new code
 
 the SDK path is PICO_SDK_PATH=/home/software/unpacked/pico-sdk
 

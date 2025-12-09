@@ -45,6 +45,7 @@ static uint offset_clock_gen_boost;  // Clock generator with glitch boost
 static uint offset_uart_match;
 static uint offset_irq_trigger;
 
+
 void glitch_init(void) {
     // Initialize configuration with defaults
     memset(&config, 0, sizeof(config));
@@ -66,6 +67,17 @@ void glitch_init(void) {
     clock_config.pin = PIN_CLOCK;  // GP6
     clock_config.frequency = 0;
     clock_config.enabled = false;
+
+    // Initialize semaphore pins for clock boost coordination
+    // GP9 (ARMED): CPU-controlled, HIGH when armed, LOW when disarmed
+    gpio_init(PIN_ARMED);
+    gpio_set_dir(PIN_ARMED, GPIO_OUT);
+    gpio_put(PIN_ARMED, 0);  // Start disarmed
+
+    // GP12 (GLITCH_FIRED): PIO0 sets HIGH when glitch fires, CPU clears LOW on next ARM
+    gpio_init(PIN_GLITCH_FIRED);
+    gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
+    gpio_put(PIN_GLITCH_FIRED, 0);  // Start LOW
 
     // Reset glitch count
     glitch_count = 0;
@@ -90,28 +102,6 @@ void glitch_init(void) {
     // Output pin is configured for PIO control in glitch_arm()
 }
 
-// Helper function to trigger clock boost when glitch fires
-static void clock_trigger_boost(void) {
-    if (!clock_boost_enabled || !clock_config.enabled) {
-        return;
-    }
-
-    // Calculate normal period for restoration
-    uint32_t system_clock = clock_get_hz(clk_sys);
-    uint32_t normal_half_period = (system_clock / 2) / clock_config.frequency;
-
-    // Trigger boost by:
-    // 1. Loading count into OSR
-    // 2. Pushing normal_period to FIFO (for restoration after boost)
-    // 3. Jumping to entry_boost label
-    pio_sm_put(clock_pio, sm_clock_gen, config.count);
-    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_pull(false, false));  // pull block -> OSR
-    pio_sm_put(clock_pio, sm_clock_gen, normal_half_period - 1);
-
-    // Jump to boost entry point
-    uint boost_offset = offset_clock_gen_boost + clock_generator_with_boost_offset_entry_boost;
-    pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_jmp(boost_offset));
-}
 
 glitch_config_t* glitch_get_config(void) {
     return &config;
@@ -156,6 +146,9 @@ bool glitch_arm(void) {
     if (flags.armed) {
         return false;  // Already armed
     }
+
+    // Clear GLITCH_FIRED from previous trigger (if any)
+    gpio_put(PIN_GLITCH_FIRED, 0);
 
     // Disable all trigger state machines first to ensure clean state
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
@@ -207,6 +200,11 @@ bool glitch_arm(void) {
                                 gpio_edge_detect_rising_program_get_default_config(program_offset) :
                                 gpio_edge_detect_falling_program_get_default_config(program_offset);
         sm_config_set_in_pins(&c_edge, config.trigger_pin);   // IN pins for 'wait' instruction
+        sm_config_set_set_pins(&c_edge, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+
+        // Initialize GP12 as output for PIO0 (will set HIGH when trigger fires)
+        pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        pio_sm_set_consecutive_pindirs(glitch_pio, sm_edge_detect, PIN_GLITCH_FIRED, 1, true);
 
         // Clear and initialize edge detect SM
         pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
@@ -295,6 +293,11 @@ bool glitch_arm(void) {
         sm_config_set_jmp_pin(&c_uart, 5);  // JMP pin = GP5 (for 'wait pin 0')
         sm_config_set_in_shift(&c_uart, true, false, 32);  // Shift RIGHT, NO autopush
         // Note: Using ISR directly for comparison, no autopush needed
+        sm_config_set_set_pins(&c_uart, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+
+        // Initialize GP12 as output for PIO0 (will set HIGH when trigger fires)
+        pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        pio_sm_set_consecutive_pindirs(glitch_pio, sm_uart_trigger, PIN_GLITCH_FIRED, 1, true);
 
         // Clock at 8× baud rate for proper UART sampling
         // System clock: 150 MHz, Target: 8 × 115200 = 921600 Hz
@@ -319,6 +322,23 @@ bool glitch_arm(void) {
         pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
     }
 
+    // Load clock boost FIFO parameters during ARM transition (DISARM→ARM)
+    // This prevents boost from triggering immediately on clock enable
+    if (clock_boost_enabled && clock_config.enabled) {
+        // Calculate normal half-period from clock frequency
+        uint32_t system_clock = clock_get_hz(clk_sys);
+        uint32_t target_half_period = (system_clock / 2) / clock_config.frequency;
+
+        // Load FIFO with boost parameters (pulled when GLITCH_FIRED goes HIGH)
+        // First push: boost count (pulled at boost_entry)
+        // Second push: normal period (pulled after boost completes to restore Y)
+        pio_sm_put_blocking(clock_pio, sm_clock_gen, config.count);
+        pio_sm_put_blocking(clock_pio, sm_clock_gen, target_half_period - 1);
+    }
+
+    // Set ARMED status HIGH (GP9)
+    gpio_put(PIN_ARMED, 1);
+
     flags.armed = true;
     return true;
 }
@@ -327,6 +347,9 @@ void glitch_disarm(void) {
     if (!flags.armed) {
         return;
     }
+
+    // Clear ARMED status LOW (GP9)
+    gpio_put(PIN_ARMED, 0);
 
     // Disable PIO state machines
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
@@ -356,12 +379,16 @@ bool glitch_execute(void) {
         return false;
     }
 
-    // Trigger clock boost if enabled
-    clock_trigger_boost();
-
-    // Use sm_flag_output (SM2) to trigger IRQ 0 via irq_trigger program
+    // Trigger IRQ 0 (glitch) via irq_trigger program, pulse GP9 for clock boost
+    // Use sm_flag_output (SM2) to trigger
     // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
     pio_sm_config c_irq = irq_trigger_program_get_default_config(offset_irq_trigger);
+    sm_config_set_set_pins(&c_irq, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+
+    // Initialize GP12 as output for PIO0 (will set HIGH when GLITCH command fires)
+    pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+    pio_sm_set_consecutive_pindirs(glitch_pio, sm_flag_output, PIN_GLITCH_FIRED, 1, true);
+
     pio_sm_init(glitch_pio, sm_flag_output, offset_irq_trigger, &c_irq);
     pio_sm_set_enabled(glitch_pio, sm_flag_output, true);
 
@@ -497,8 +524,14 @@ void clock_enable(void) {
 
     // Configure boost-capable clock generator
     pio_sm_config c = clock_generator_with_boost_program_get_default_config(offset_clock_gen_boost);
-    sm_config_set_set_pins(&c, clock_config.pin, 1);
+    sm_config_set_set_pins(&c, clock_config.pin, 1);  // SET pins for clock output
+    sm_config_set_jmp_pin(&c, PIN_GLITCH_FIRED);      // JMP pin = GP12 (GLITCH_FIRED signal)
+    sm_config_set_in_pins(&c, PIN_GLITCH_FIRED);      // IN pins for WAIT instruction on GP12
     sm_config_set_clkdiv(&c, 1.0);  // Full speed
+
+    // Clear ISO bit so PIO1 can read GP12 (set by PIO0, but readable by PIO1)
+    hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
+
     pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_boost, &c);
 
     // Initialize Y (normal period) and ISR (fast period) registers manually
@@ -510,6 +543,8 @@ void clock_enable(void) {
     pio_sm_put_blocking(clock_pio, sm_clock_gen, fast_half_period - 1);
     pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_pull(false, false));
     pio_sm_exec(clock_pio, sm_clock_gen, pio_encode_mov(pio_isr, pio_osr));
+
+    // FIFO loading moved to glitch_arm() to ensure it only loads during DISARM→ARM transition
 
     // Enable the state machine
     pio_sm_set_enabled(clock_pio, sm_clock_gen, true);

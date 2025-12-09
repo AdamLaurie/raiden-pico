@@ -23,9 +23,9 @@ void platform_init(void) {
     // Initialize configuration with defaults
     memset(&config, 0, sizeof(config));
     config.type = PLATFORM_MANUAL;
-    config.hv_pin = 8;           // Default HV enable pin (was GP4, conflicts with Target UART TX)
-    config.voltage_pin = 9;      // Default voltage control pin (was GP5, conflicts with Target UART RX)
-    config.armed_pin = 6;        // Default armed status pin
+    config.hv_pin = 6;           // Default HV enable pin (moved from GP8 for Grbl UART)
+    config.voltage_pin = 7;      // Default voltage control pin (moved from GP9 for Grbl UART)
+    config.armed_pin = 11;       // Default armed status pin
     config.voltage = 3300;       // Default 3.3V (in mV)
     config.charge_time_us = 100000;  // Default 100ms charge time (in us)
 

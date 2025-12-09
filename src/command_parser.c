@@ -301,7 +301,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
         uart_cli_send("GRBL UNLOCK            - Unlock alarm (enable movement without homing)\r\n");
         uart_cli_send("GRBL SET HOME          - Set current position as home (0,0,0)\r\n");
-        uart_cli_send("GRBL HOME              - Home the XY platform\r\n");
+        uart_cli_send("GRBL HOME              - Move to home position (0,0)\r\n");
+        uart_cli_send("GRBL AUTOHOME          - Auto-home the XY platform (limit switches)\r\n");
         uart_cli_send("GRBL MOVE <X> <Y> [F]  - Move to absolute position (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL STEP <DX> <DY> [F]- Move relative distance (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL POS               - Get current XYZ position\r\n");
@@ -1184,7 +1185,16 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
             grbl_send(gcode);
         } else if (strcmp(parts->parts[1], "HOME") == 0) {
-            grbl_home();
+            // Move to home position (0,0) - synchronous
+            uint32_t timeout_ms = 30000;  // Default 30 second timeout
+            if (parts->count >= 3) {
+                timeout_ms = atoi(parts->parts[2]);
+            }
+            if (grbl_move_absolute_sync(0.0f, 0.0f, 300.0f, timeout_ms)) {
+                uart_cli_send("OK: Moved to home position (0,0)\r\n");
+            } else {
+                api_error("ERROR: Move to home failed or timeout\r\n");
+            }
         } else if (strcmp(parts->parts[1], "RESET") == 0) {
             grbl_reset();
             uart_cli_send("OK: Grbl soft reset sent\r\n");
