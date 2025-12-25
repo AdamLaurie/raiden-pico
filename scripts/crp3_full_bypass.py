@@ -15,12 +15,73 @@ This script automatically performs both stages:
 import serial
 import time
 import csv
+import os
 from datetime import datetime
 import sys
 
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 TIMEOUT = 2.0
+
+def uu_decode_line(line):
+    """Decode a single UUEncoded line to bytes"""
+    if not line or line[0] == '`' or line[0] == ' ':
+        return b''
+    length = (ord(line[0]) - 32) & 63
+    if length == 0:
+        return b''
+
+    data = b''
+    line = line[1:]  # Skip length byte
+
+    i = 0
+    while len(data) < length and i < len(line):
+        chunk = line[i:i+4]
+        if len(chunk) < 4:
+            chunk = chunk + ' ' * (4 - len(chunk))
+        vals = [(ord(c) - 32) & 63 for c in chunk]
+        b1 = (vals[0] << 2) | (vals[1] >> 4)
+        b2 = ((vals[1] & 0xF) << 4) | (vals[2] >> 2)
+        b3 = ((vals[2] & 0x3) << 6) | vals[3]
+        data += bytes([b1, b2, b3])
+        i += 4
+
+    return data[:length]
+
+def decode_uue_data(uue_lines):
+    """Decode UUEncoded lines to binary data"""
+    binary_data = bytearray()
+    for line in uue_lines:
+        line = line.strip()
+        if not line or line.isdigit():  # Skip empty lines and checksums
+            continue
+        decoded = uu_decode_line(line)
+        binary_data.extend(decoded)
+    return bytes(binary_data)
+
+def save_flash_dump(uue_data, timestamp):
+    """Save flash dump as both .uue and .bin files"""
+    uue_file = f"crp3_flash_dump_{timestamp}.uue"
+    bin_file = f"crp3_flash_dump_{timestamp}.bin"
+
+    # Parse UUE lines from data string
+    uue_lines = uue_data.split('\n')
+
+    # Save .uue file
+    with open(uue_file, 'w') as f:
+        f.write(f"begin 644 {bin_file}\n")
+        for line in uue_lines:
+            line = line.strip()
+            if line and not line.isdigit():  # Skip checksums
+                f.write(line + '\n')
+        f.write("`\nend\n")
+
+    # Decode and save .bin file
+    binary_data = decode_uue_data(uue_lines)
+    with open(bin_file, 'wb') as f:
+        f.write(binary_data)
+
+    return uue_file, bin_file, len(binary_data)
 
 def send_command(ser, cmd, wait_time=0.2):
     """Send command to Raiden Pico"""
@@ -286,8 +347,12 @@ def main():
                     stage2_success = True
                     print(f"\n[{stage2_attempts}] ✓✓✓ STAGE 2 SUCCESS! ✓✓✓")
                     print(f"  Memory read bypass successful!")
-                    print(f"  Got memory data despite CRP2 protection:")
-                    print(f"  {data[:200]}...")
+
+                    # Save the flash dump
+                    uue_file, bin_file, num_bytes = save_flash_dump(data, timestamp)
+                    print(f"  Flash dump saved:")
+                    print(f"    UUE: {uue_file}")
+                    print(f"    BIN: {bin_file} ({num_bytes} bytes)")
                 elif result == "ERROR19":
                     if stage2_attempts % 10 == 0:
                         print(f"  [{stage2_attempts}] Still protected (error 19)...")
@@ -315,6 +380,9 @@ def main():
                 print(f"Parameters:")
                 print(f"  Stage 1: V={voltage} P={pause_gpio} W={width_gpio}")
                 print(f"  Stage 2: V={voltage} P={pause_uart} W={width_uart} Trigger=0x{trigger_byte:02x}")
+                print(f"Flash dump:")
+                print(f"  crp3_flash_dump_{timestamp}.bin")
+                print(f"  crp3_flash_dump_{timestamp}.uue")
                 return_code = 0
             elif stage1_success:
                 print("⚠ PARTIAL SUCCESS")
