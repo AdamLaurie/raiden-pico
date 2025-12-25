@@ -112,29 +112,57 @@ def stage2_memory_read_bypass(ser):
             if "> " in chunk:
                 break
 
-    # Parse result
-    if "Response (" in response:
-        # Target responded - check what it sent
-        if "31 39 0D 0A" in response or "| 19.." in response:
-            # Hex bytes 31 39 = ASCII "19" = error code 19 (command not allowed in CRP2)
-            return "ERROR19", ""
-        elif "30 0D 0A" in response or ("30 " in response and "| 0" in response):
-            # Hex byte 30 = ASCII "0" = success! Memory read worked!
-            # Extract hex data
-            hex_lines = []
-            for line in response.split('\n'):
-                if "Response (" in line or ">" in line or "OK:" in line or "TARGET" in line:
-                    continue
-                if any(c in line for c in '0123456789ABCDEF') and len(line) > 10:
-                    hex_lines.append(line.strip())
-            return "SUCCESS", "\n".join(hex_lines)
-        else:
-            # Unexpected response
-            return "GARBAGE", response[:200]
-    elif "No response data" in response:
+    # Parse result - LPC ISP returns: command echo, return code, data (if success), checksum
+    # Example success: "R 0 32\r0\r\n<uuencoded data>\r\n<checksum>\r\n"
+    # Example error:   "R 0 32\r19\r\n"
+
+    lines = response.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+    # Find the return code line (first line that is just a number after command echo)
+    return_code = None
+    data_lines = []
+    found_echo = False
+
+    for i, line in enumerate(lines):
+        line = line.strip()
+
+        # Skip empty lines and prompts
+        if not line or line == '>' or line.startswith('TARGET SEND'):
+            continue
+
+        # Look for command echo (starts with "R ")
+        if line.startswith('R ') and not found_echo:
+            found_echo = True
+            continue
+
+        # After echo, first number is the return code
+        if found_echo and return_code is None:
+            if line == '0':
+                return_code = 0
+            elif line == '19':
+                return_code = 19
+            elif line.isdigit():
+                return_code = int(line)
+            continue
+
+        # After return code, collect data lines (UUEncoded or checksum)
+        if return_code == 0 and line and not line == '>':
+            data_lines.append(line)
+
+    if return_code == 0:
+        # Success! Got data
+        return "SUCCESS", "\n".join(data_lines)
+    elif return_code == 19:
+        # Error 19 = command not allowed (CRP protection active)
+        return "ERROR19", ""
+    elif return_code is not None:
+        # Some other error code
+        return "GARBAGE", f"Error code: {return_code}"
+    elif "No response data" in response or not response.strip():
         return "NO_RESPONSE", ""
     else:
-        return "NO_RESPONSE", ""
+        # Got something but couldn't parse it
+        return "GARBAGE", response[:200]
 
 def main():
     if len(sys.argv) < 8:
