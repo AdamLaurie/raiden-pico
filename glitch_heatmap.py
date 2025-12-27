@@ -58,8 +58,8 @@ CRYSTAL_KHZ = 8000
 RESET_DELAY = 300
 
 # ChipSHOUTER parameters
-CS_VOLTAGE = 500  # Starting voltage in V
-CS_VOLTAGE_MIN = 100  # Minimum voltage
+CS_VOLTAGE = 500  # Starting voltage in V (ChipSHOUTER max: 500V)
+CS_VOLTAGE_MIN = 150  # Minimum voltage (ChipSHOUTER range: 150-500V)
 CS_VOLTAGE_STEP = 50  # Voltage reduction step
 CS_PULSE_WIDTH = 50  # Pulse width in us
 
