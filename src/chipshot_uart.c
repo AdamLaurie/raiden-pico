@@ -221,6 +221,14 @@ void chipshot_get_status(void) {
     chipshot_uart_send("get state\n");
 }
 
+void chipshot_get_hv_out(void) {
+    chipshot_uart_send("help\n");
+}
+
+void chipshot_get_faults(void) {
+    chipshot_uart_send("get faults_current\n");
+}
+
 bool chipshot_is_armed(void) {
     return chipshot_armed;
 }
@@ -237,11 +245,11 @@ void chipshot_set_trigger_hw(bool active_high) {
     if (active_high) {
         // Active high: configure pull-down so pin idles low
         gpio_pull_down(PIN_GLITCH_OUT);
-        chipshot_uart_send("set hwtrig_mode 1\n");
+        chipshot_uart_send("set hwtrig_mode 1\r\n");
     } else {
         // Active low: configure pull-up so pin idles high
         gpio_pull_up(PIN_GLITCH_OUT);
-        chipshot_uart_send("set hwtrig_mode 0\n");
+        chipshot_uart_send("set hwtrig_mode 0\r\n");
     }
 }
 

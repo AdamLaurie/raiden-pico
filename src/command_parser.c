@@ -171,8 +171,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "CS") == 0) {
-            const char *chipshot_subcmds[] = {"ARM", "DISARM", "FIRE", "STATUS", "VOLTAGE", "PULSE", "RESET", "TRIGGER"};
-            if (!match_and_replace(&parts->parts[1], chipshot_subcmds, 8, "CS sub-command")) {
+            const char *chipshot_subcmds[] = {"ARM", "DISARM", "FIRE", "STATUS", "VOLTAGE", "PULSE", "RESET", "TRIGGER", "HVOUT", "FAULTS"};
+            if (!match_and_replace(&parts->parts[1], chipshot_subcmds, 10, "CS sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
@@ -243,6 +243,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
         uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
         uart_cli_send("CS VOLTAGE [<V>]          - Set/get ChipSHOUTER voltage\r\n");
+        uart_cli_send("CS FAULTS                 - Get ChipSHOUTER fault status\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
         uart_cli_send("CLOCK [<freq>] [ON|OFF]   - Set/get clock frequency and enable/disable\r\n");
@@ -1122,6 +1123,34 @@ void command_parser_execute(cmd_parts_t *parts) {
             const char* response = chipshot_uart_read_response_blocking(2000);
             if (response) {
                 uart_cli_send("ChipSHOUTER response:\r\n");
+                send_multiline_response(response);
+                uart_cli_send("\r\n");
+            } else {
+                uart_cli_send("No response from ChipSHOUTER\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "HVOUT") == 0) {
+            extern void chipshot_get_hv_out(void);
+            chipshot_get_hv_out();
+            uart_cli_send("ChipSHOUTER: Querying HV output status...\r\n");
+
+            const char* response = chipshot_uart_read_response_blocking(2000);
+            if (response) {
+                uart_cli_send("ChipSHOUTER HV status:\r\n");
+                send_multiline_response(response);
+                uart_cli_send("\r\n");
+            } else {
+                uart_cli_send("No response from ChipSHOUTER\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "FAULTS") == 0) {
+            extern void chipshot_get_faults(void);
+            chipshot_get_faults();
+            uart_cli_send("ChipSHOUTER: Querying faults...\r\n");
+
+            const char* response = chipshot_uart_read_response_blocking(2000);
+            if (response) {
+                uart_cli_send("ChipSHOUTER faults:\r\n");
                 send_multiline_response(response);
                 uart_cli_send("\r\n");
             } else {
