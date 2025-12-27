@@ -79,7 +79,16 @@ minicom -D /dev/ttyACM0 -b 115200
 
 ### Command Reference
 
-All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` for `GLITCH`).
+All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` for `GLITCH`, `TARG B` for `TARGET BOOTLOADER`).
+
+#### API Mode (for scripting)
+
+**`API [ON|OFF]`** - Enable/disable/show API mode
+- Minimal output for script-friendly parsing
+- Response format: `.` = received, `+` = success, `!` = failed
+
+**`ERROR`** - Get last error message
+- Returns the last error when a command fails in API mode
 
 #### System Commands
 
@@ -99,53 +108,37 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - `REBOOT` - Soft reboot (restart firmware)
 - `REBOOT BL` - Reboot to bootloader mode for firmware updates
 
-**`DEBUG [ON|OFF]`** - Toggle target UART debug display
+**`DEBUG [ON|OFF]`** - Toggle/show target UART debug display
 - When enabled, displays all data received from target UART in real-time
 - Useful for monitoring target behavior during glitching
 
 #### Glitch Configuration
 
-**`SET PAUSE <cycles>`** - Set glitch pause time
-- Delay before glitch pulse in system clock cycles @ 150MHz
-- Each cycle = 6.67ns
-- Example: `SET PAUSE 1000` = 6.67µs delay
-
-**`SET WIDTH <cycles>`** - Set glitch pulse width
-- Duration of glitch pulse in clock cycles
+**`SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>]`** - Set/show glitch parameters
+- Values in system clock cycles @ 150MHz (6.67ns per cycle)
 - Example: `SET WIDTH 150` = 1µs pulse
+- With no value, shows current settings
 
-**`SET GAP <cycles>`** - Set gap between glitches
-- Delay between pulses when COUNT > 1
-- Example: `SET GAP 100` = 667ns gap
-
-**`SET COUNT <n>`** - Set number of glitches per trigger
-- How many pulses to generate on each trigger event
-- Useful for multi-pulse fault injection
-
-**`GET PAUSE|WIDTH|GAP|COUNT`** - Read current parameter values
-- Query individual glitch parameters
+**`GET [PAUSE|WIDTH|GAP|COUNT]`** - Read current parameter values
+- Query individual or all glitch parameters
 - Example: `GET WIDTH`
 
-**`OUT <pin>`** - Set glitch output pin
-- Configure which GPIO pin outputs the glitch pulse
-- Default: GPIO 2
-- Example: `OUT 5`
-
 #### Trigger Configuration
+
+**`TRIGGER [NONE|GPIO|UART]`** - Configure/show trigger
 
 **`TRIGGER NONE`** - Disable all triggers
 - Glitches can only be manually fired with `GLITCH` command
 
-**`TRIGGER GPIO <pin> <RISING|FALLING>`** - Configure GPIO trigger
-- Trigger on edge detection of specified pin
-- Example: `TRIGGER GPIO 10 RISING`
+**`TRIGGER GPIO <RISING|FALLING>`** - Configure GPIO trigger on GP3
+- Trigger on edge detection of GP3 (fixed pin)
+- Example: `TRIGGER GPIO RISING`
 - Use case: Trigger from external signal or target GPIO
 
-**`TRIGGER UART <byte>`** - Configure UART byte trigger (on TARGET UART)
+**`TRIGGER UART <byte>`** - Configure UART byte trigger
 - Trigger when specific byte is received from target UART
-- Byte value in decimal (0-255)
+- Byte value in hex (0-FF)
 - Example: `TRIGGER UART 0D` (trigger on '\r')
-  - `TARGET SEND "R 0 4"`
 - Use case: Trigger at specific point in target's execution
 
 #### Platform Control
@@ -178,7 +171,7 @@ Raiden Pico supports multiple glitching platforms with different control require
 
 #### Glitch Execution
 
-**`ARM ON|OFF`** - Arm/disarm glitch system
+**`ARM [ON|OFF]`** - Arm/disarm/show glitch system
 - Must be armed before glitches will fire on triggers
 - Safety feature to prevent accidental glitching
 - Example: `ARM ON`
@@ -187,6 +180,13 @@ Raiden Pico supports multiple glitching platforms with different control require
 - Immediately generates glitch pulse(s)
 - Works regardless of trigger configuration
 - Useful for testing glitch parameters
+
+#### Clock Generator
+
+**`CLOCK [<freq>] [ON|OFF]`** - Set/get clock frequency and enable/disable
+- Generates clock signal on GP6
+- Example: `CLOCK 12000000 ON` (12MHz clock)
+- Example: `CLOCK OFF` (disable clock)
 
 #### Target Control
 
@@ -197,17 +197,17 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - `LPC` - NXP LPC series (ISP protocol)
 - `STM32` - STMicroelectronics STM32 series
 
-**`TARGET BOOTLOADER [baud] [crystal_khz]`** - Enter bootloader (alias: `TARGET BOOT`)
+**`TARGET BOOTLOADER [baud] [crystal_khz]`** - Enter bootloader
 - Initialize target UART and enter bootloader mode
 - Defaults: 115200 baud, 12000 kHz crystal
-- LPC example: `TARGET BOOT 115200 12000`
-- STM32 example: `TARGET BOOT 115200`
+- LPC example: `TARGET BOOTLOADER 115200 12000`
+- STM32 example: `TARGET BOOTLOADER 115200`
 
-**`TARGET SYNC [baud] [crystal_khz] [reset_delay_ms]`** - Reset and enter bootloader
+**`TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries]`** - Reset and enter bootloader
 - Performs target reset, waits, then enters bootloader
 - Includes automatic retry logic for reliability
-- Defaults: 115200 baud, 12000 kHz crystal, 300ms reset delay
-- Example: `TARGET SYNC 115200 12000 500`
+- Defaults: 115200 baud, 12000 kHz crystal, 10ms reset delay, 5 retries
+- Example: `TARGET SYNC 115200 12000 10 5`
 
 **`TARGET SEND <hex|"text">`** - Send data to target
 - Send hex bytes or quoted text to target UART
@@ -222,6 +222,14 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Pulses reset pin to restart target
 - Defaults: 300ms pulse, GPIO 15, active low
 - Example: `TARGET RESET PERIOD 500 PIN 16 HIGH`
+
+**`TARGET POWER [ON|OFF|CYCLE] [ms]`** - Control/show target power on GP10
+- `ON` - Enable power
+- `OFF` - Disable power
+- `CYCLE` - Power cycle with optional duration (default: 300ms)
+
+**`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
+- Default: 50ms
 
 #### ChipSHOUTER Control
 
@@ -243,12 +251,12 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 - Queries voltage, armed state, and configuration
 - Returns UART response from ChipSHOUTER
 
-**`CS VOLTAGE <V>`** - Set ChipSHOUTER voltage
+**`CS VOLTAGE [<V>]`** - Set/get ChipSHOUTER voltage
 - Configure pulse voltage (device-specific range)
 - Example: `CS VOLTAGE 250`
 
-**`CS PULSE <us>`** - Set ChipSHOUTER pulse width
-- Configure pulse duration in microseconds
+**`CS PULSE [<ns>]`** - Set/get ChipSHOUTER pulse width
+- Configure pulse duration in nanoseconds
 - Example: `CS PULSE 50`
 
 **`CS TRIGGER HW <HIGH|LOW>`** - Set hardware trigger mode
@@ -265,6 +273,12 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 - Clears errors and reinitializes ChipSHOUTER
 - Verifies error state is cleared
 
+**`CS FAULTS`** - Get ChipSHOUTER fault status
+- Query current fault conditions
+
+**`CS HVOUT`** - Get ChipSHOUTER HV output status
+- Query high voltage output state
+
 #### GRBL XY Platform Control
 
 Built-in UART control for GRBL-based XY positioning platforms (CNC routers, laser cutters, etc.) useful for automated EMFI probe positioning.
@@ -277,27 +291,28 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 
 **`GRBL UNLOCK`** - Unlock alarm state
 - Sends `$X` to clear GRBL alarm
-- Required after homing errors or emergency stops
+- Enables movement without requiring homing
 
 **`GRBL SET HOME`** - Set current position as home
 - Sets current XY position as origin (0,0,0)
 - Sends `G92 X0 Y0 Z0`
 
-**`GRBL HOME`** - Move to home position
-- Rapid move to (0,0) coordinates
-- Example: `GRBL HOME`
+**`GRBL HOME [timeout_ms]`** - Move to home position
+- Synchronous move to (0,0) coordinates
+- Default timeout: 30000ms
 
-**`GRBL AUTOHOME`** - Auto-home with limit switches
+**`GRBL AUTOHOME [timeout_ms]`** - Auto-home with limit switches
 - Sends `$H` to trigger GRBL's homing cycle
 - Requires limit switches configured on GRBL controller
+- Default timeout: 60000ms
 
-**`GRBL MOVE <X> <Y> [F]`** - Move to absolute position
-- Move to specified XY coordinates
+**`GRBL MOVE <X> <Y> [F] [timeout_ms]`** - Move to absolute position
+- Synchronous move to specified XY coordinates
 - Optional feed rate in mm/min (default: 300)
 - Example: `GRBL MOVE 15 20` or `GRBL MOVE 15 20 500`
 
-**`GRBL STEP <DX> <DY> [F]`** - Move relative distance
-- Move by specified offset from current position
+**`GRBL STEP <DX> <DY> [F] [timeout_ms]`** - Move relative distance
+- Synchronous move by specified offset from current position
 - Optional feed rate in mm/min (default: 300)
 - Example: `GRBL STEP 5 -3` (move +5mm X, -3mm Y)
 
@@ -317,11 +332,10 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 # Configure glitch parameters
 SET PAUSE 1000      # 6.67µs before glitch
 SET WIDTH 150       # 1µs glitch pulse
-SET COUNT 1         # Single pulse
-OUT 2               # Output on GPIO 2
+SET COUNT 1         # Single pulse (output on GP2/GP7)
 
-# Set up trigger
-TRIGGER GPIO 10 RISING
+# Set up trigger on GP3
+TRIGGER GPIO RISING
 
 # Configure platform
 PLATFORM SET CROWBAR
@@ -362,12 +376,11 @@ CS ARM
 # Set up hardware trigger
 CS TRIGGER HW HIGH
 
-# Configure Raiden timing
+# Configure Raiden timing (output on GP2)
 SET PAUSE 2000
 SET WIDTH 200
-OUT 2
 
-# Trigger from GPIO
+# Trigger from GP3
 TRIGGER GPIO RISING
 ARM ON
 ```
