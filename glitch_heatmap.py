@@ -37,13 +37,19 @@ parser.add_argument('--reverse', '-r', action='store_true',
                     help='Reverse spiral: start from center, end at (0,0)')
 parser.add_argument('--forward', '-f', action='store_true',
                     help='Forward spiral: start from (0,0), end at center (default)')
+parser.add_argument('--start-x', type=int, default=None,
+                    help='Starting X position (overrides default)')
+parser.add_argument('--start-y', type=int, default=None,
+                    help='Starting Y position (overrides default)')
 args = parser.parse_args()
 
 # Determine direction (default is forward)
 REVERSE_SPIRAL = args.reverse and not args.forward
+START_X = args.start_x
+START_Y = args.start_y
 
 # Grid size
-SIZE = 23  # 24x24 grid (0-23)
+SIZE = 24  # 25x25 grid (0-24)
 
 # Glitch test parameters
 SHOTS_PER_POSITION = 15  # Number of glitch attempts per position
@@ -154,17 +160,16 @@ HTML_PAGE = '''<!DOCTYPE html>
     <h1>Glitch Heat Map</h1>
     <div id="status">Connecting...</div>
     <div id="container">
-        <canvas id="grid" width="360" height="360"></canvas>
+        <canvas id="grid" width="375" height="375"></canvas>
         <div id="tooltip"></div>
     </div>
     <div id="legend">
         <span>0% (normal)</span>
         <div id="gradient"></div>
         <span>100% (effect)</span>
-        <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH</span>
-        <span style="margin-left: 10px; color: #aa00ff;">&#9632; Threshold</span>
+        <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH (CRP bypass)</span>
     </div>
-    <div id="info">24x24mm grid (15px/cell). Spiral scan pattern. Hover for details. Blue=successful glitch, Purple=voltage threshold found.</div>
+    <div id="info">25x25mm grid (15px/cell). Spiral scan pattern. Hover for details including voltage threshold.</div>
 
     <script>
         const canvas = document.getElementById('grid');
@@ -172,7 +177,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         const status = document.getElementById('status');
         const tooltip = document.getElementById('tooltip');
         const CELL_SIZE = 15;
-        const GRID_SIZE = 24;
+        const GRID_SIZE = 25;
         let prevPos = null;
 
         // Store cell data for tooltips
@@ -238,10 +243,9 @@ HTML_PAGE = '''<!DOCTYPE html>
                     var specialText = '';
                     if (cellInfo.special === 'glitch') {
                         specialText = '<br><span style="color:#0088ff">GLITCH!</span>';
-                    } else if (cellInfo.special === 'threshold') {
-                        specialText = '<br><span style="color:#aa00ff">Threshold</span>';
                     }
-                    tooltipHtml = '<b>(' + cellX + ', ' + cellY + ')</b><br>Hit: ' + pct + '%<br>Voltage: ' + cellInfo.voltage + 'V' + specialText;
+                    var thresholdText = cellInfo.threshold ? '<br>Threshold: ' + cellInfo.threshold + 'V' : '';
+                    tooltipHtml = '<b>(' + cellX + ', ' + cellY + ')</b><br>Hit: ' + pct + '%<br>Voltage: ' + cellInfo.voltage + 'V' + thresholdText + specialText;
                 } else {
                     tooltipHtml = '<b>(' + cellX + ', ' + cellY + ')</b><br>Not tested';
                 }
@@ -279,7 +283,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 if (data.current) {
                     drawCurrent(data.current[0], data.current[1]);
                 }
-                status.textContent = `Tested: ${Object.keys(data.visited).length} / 576 positions`;
+                status.textContent = `Tested: ${Object.keys(data.visited).length} / 625 positions`;
             }
             else if (data.type === 'move') {
                 if (prevPos) {
@@ -290,18 +294,18 @@ HTML_PAGE = '''<!DOCTYPE html>
                 }
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
-                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V - ${data.count} / 576 positions`;
+                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V - ${data.count} / 625 positions`;
             }
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
-                cellData[key] = {hitRate: data.hitRate, voltage: data.voltage, special: data.special};
+                cellData[key] = {hitRate: data.hitRate, voltage: data.voltage, special: data.special, threshold: data.threshold};
                 drawCell(data.x, data.y, data.hitRate, data.special);
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
                 const pct = (data.hitRate * 100).toFixed(0);
                 let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : (data.special === 'threshold' ? ' [threshold]' : '');
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
-                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 576 positions`;
+                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
             }
             else if (data.type === 'complete') {
                 status.textContent = `Complete! Tested ${data.count} positions. Log: ${data.csvFile}`;
@@ -380,13 +384,14 @@ def broadcast_move(x, y, voltage):
     }
     update_queue.put(update)
 
-def broadcast_result(x, y, hit_rate, voltage, optimized=False, start_voltage=None, special=None):
+def broadcast_result(x, y, hit_rate, voltage, optimized=False, start_voltage=None, special=None, threshold=None):
     """
     Broadcast result to web UI.
-    special: None (normal), 'glitch' (blue), or 'threshold' (purple)
+    special: None (normal) or 'glitch' (blue for CRP bypass)
+    threshold: voltage at which threshold was found (shown in tooltip)
     """
     global current_pos
-    visited[(x, y)] = {'hitRate': hit_rate, 'voltage': voltage, 'special': special}
+    visited[(x, y)] = {'hitRate': hit_rate, 'voltage': voltage, 'special': special, 'threshold': threshold}
     current_pos = (x, y)
     update = {
         'type': 'result',
@@ -397,6 +402,7 @@ def broadcast_result(x, y, hit_rate, voltage, optimized=False, start_voltage=Non
         'optimized': optimized,
         'startVoltage': start_voltage,
         'special': special,
+        'threshold': threshold,
         'count': len(visited)
     }
     update_queue.put(update)
@@ -409,6 +415,81 @@ def broadcast_complete():
     }
     update_queue.put(update)
 
+def save_html_snapshot(filename):
+    """Save current heatmap state as a standalone HTML file"""
+    # Build visited data for embedding in HTML
+    visited_json = json.dumps({f"{x},{y}": info for (x, y), info in visited.items()})
+
+    # Create standalone HTML with embedded data
+    snapshot_html = HTML_PAGE.replace(
+        "const evtSource = new EventSource('/events');",
+        f"// Static snapshot - no live updates\n        const staticData = {visited_json};"
+    ).replace(
+        """evtSource.onopen = function() {
+            status.textContent = 'Connected - waiting for tests...';
+        };
+
+        evtSource.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+
+            if (data.type === 'init') {
+                drawGrid();
+                Object.entries(data.visited).forEach(([key, info]) => {
+                    const [x, y] = key.split(',').map(Number);
+                    cellData[key] = info;
+                    drawCell(x, y, info.hitRate, info.special);
+                });
+                if (data.current) {
+                    drawCurrent(data.current[0], data.current[1]);
+                }
+                status.textContent = `Tested: ${Object.keys(data.visited).length} / 625 positions`;
+            }
+            else if (data.type === 'move') {
+                if (prevPos) {
+                    const key = `${prevPos[0]},${prevPos[1]}`;
+                    if (cellData[key]) {
+                        drawCell(prevPos[0], prevPos[1], cellData[key].hitRate, cellData[key].special);
+                    }
+                }
+                drawCurrent(data.x, data.y);
+                prevPos = [data.x, data.y];
+                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V - ${data.count} / 625 positions`;
+            }
+            else if (data.type === 'result') {
+                const key = `${data.x},${data.y}`;
+                cellData[key] = {hitRate: data.hitRate, voltage: data.voltage, special: data.special, threshold: data.threshold};
+                drawCell(data.x, data.y, data.hitRate, data.special);
+                drawCurrent(data.x, data.y);
+                prevPos = [data.x, data.y];
+                const pct = (data.hitRate * 100).toFixed(0);
+                let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : (data.special === 'threshold' ? ' [threshold]' : '');
+                let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
+                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
+            }
+            else if (data.type === 'complete') {
+                status.textContent = `Complete! Tested ${data.count} positions. Log: ${data.csvFile}`;
+                status.style.color = '#00ff88';
+            }
+        };
+
+        evtSource.onerror = function() {
+            status.textContent = 'Connection lost - refresh to reconnect';
+            status.style.color = '#ff4444';
+        };""",
+        f"""// Load static data
+        Object.entries(staticData).forEach(([key, info]) => {{
+            const [x, y] = key.split(',').map(Number);
+            cellData[key] = info;
+            drawCell(x, y, info.hitRate, info.special);
+        }});
+        status.textContent = 'Snapshot: ' + Object.keys(staticData).length + ' / 625 positions tested';
+        status.style.color = '#00ff88';"""
+    )
+
+    with open(filename, 'w') as f:
+        f.write(snapshot_html)
+    print(f"HTML snapshot saved to: {filename}", flush=True)
+
 # Initialize CSV
 init_csv()
 
@@ -418,7 +499,7 @@ server_thread.start()
 server_ready.wait()
 
 # Serial connection to Raiden
-s = serial.Serial('/dev/ttyACM1', 115200, timeout=5)
+s = serial.Serial('/dev/ttyACM0', 115200, timeout=5)
 time.sleep(1)
 
 def send_cmd(cmd, timeout=5):
@@ -462,38 +543,61 @@ def grbl_move(x, y):
     return True
 
 def set_chipshouter_voltage(voltage):
-    """Set ChipSHOUTER voltage"""
+    """Set ChipSHOUTER voltage and ensure CS is ready"""
     global current_voltage
     send_cmd(f"CS VOLTAGE {voltage}")
     current_voltage = voltage
-    time.sleep(0.2)
+    time.sleep(0.5)  # Wait for voltage to settle
+    ensure_cs_ready()  # Make sure CS is armed and ready
 
-def check_and_reset_chipshouter():
-    """Check ChipSHOUTER status and reset if errored. Returns True if OK."""
-    s.write(('CS STATUS\r\n').encode())
+def get_cs_status():
+    """Get ChipSHOUTER status"""
+    s.read(s.in_waiting)  # Clear buffer
+    s.write(b"CS STATUS\r\n")
     time.sleep(0.2)
-    response = ""
-    start = time.time()
-    while time.time() - start < 2.0:
-        if s.in_waiting:
-            response += s.read(s.in_waiting).decode('utf-8', errors='ignore')
-            if "> " in response:
-                break
-        time.sleep(0.05)
+    response = s.read(s.in_waiting).decode('utf-8', errors='ignore').lower()
+    return response
 
-    # Check for error conditions
-    if "error" in response.lower() or "fault" in response.lower() or "disarmed" in response.lower():
-        print("\n  [CS ERROR - resetting]", end='', flush=True)
-        # Reset ChipSHOUTER
+def ensure_cs_ready():
+    """Ensure CS is armed and ready. Reset if fault, re-arm if disarmed. Returns True if OK."""
+    resp = get_cs_status()
+
+    # Check for fault state - must reset
+    if 'fault' in resp:
+        print(" [FAULT-RESET]", end='', flush=True)
         send_cmd("CS RESET")
         time.sleep(1.0)
+        # Wait for reset to complete (disarmed state)
+        for _ in range(50):
+            resp = get_cs_status()
+            if 'disarmed' in resp and 'fault' not in resp:
+                break
+            time.sleep(0.1)
+        # Set voltage after reset
         send_cmd(f"CS VOLTAGE {current_voltage}")
+        time.sleep(0.2)
         send_cmd(f"CS PULSE {CS_PULSE_WIDTH}")
         send_cmd("CS TRIGGER HW HIGH")
+        resp = get_cs_status()
+
+    # If disarmed, arm it
+    if 'disarmed' in resp:
         send_cmd("CS ARM")
-        time.sleep(0.5)
-        return False
-    return True
+        time.sleep(0.3)
+        # Wait for armed state
+        for _ in range(50):
+            resp = get_cs_status()
+            if 'armed' in resp and 'disarmed' not in resp and 'fault' not in resp:
+                break
+            time.sleep(0.1)
+
+    # Final verify
+    resp = get_cs_status()
+    return 'armed' in resp and 'disarmed' not in resp and 'fault' not in resp
+
+def check_and_reset_chipshouter():
+    """Legacy wrapper - use ensure_cs_ready instead"""
+    return ensure_cs_ready()
 
 def run_glitch_test():
     """
@@ -619,16 +723,16 @@ def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
     Reduce voltage until hit rate drops to ~50%.
     If hit rate drops from high to 0%, fine-tune with binary search.
 
-    Returns: (final_hit_rate, final_voltage, was_optimized, special)
-    special: None, 'glitch', or 'threshold'
+    Returns: (final_hit_rate, final_voltage, was_optimized, special, threshold_voltage)
+    special: None or 'glitch' (for CRP bypass)
+    threshold_voltage: voltage at which threshold was found (or None)
     """
     global current_voltage
 
     if initial_hit_rate <= 0.5:
-        # Already at or below 50% - mark as threshold since we have hits but can't optimize further
-        # (Any hits at all is considered interesting)
-        special = 'glitch' if initial_glitch else 'threshold'
-        return initial_hit_rate, current_voltage, False, special
+        # Already at or below 50% - can't optimize further
+        special = 'glitch' if initial_glitch else None
+        return initial_hit_rate, current_voltage, False, special, None
 
     start_voltage = current_voltage
     prev_voltage = current_voltage
@@ -645,11 +749,6 @@ def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
 
         print(f"    Trying {new_voltage}V: ", end='', flush=True)
         set_chipshouter_voltage(new_voltage)
-        time.sleep(0.3)
-
-        # Re-arm after voltage change
-        send_cmd("CS ARM")
-        time.sleep(0.5)
 
         # Test at new voltage (fewer shots for optimization)
         hit_rate, _, glitch = test_position(x, y, new_voltage, shots=10)
@@ -677,9 +776,6 @@ def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
 
                 print(f"    Binary search {mid_v}V: ", end='', flush=True)
                 set_chipshouter_voltage(mid_v)
-                time.sleep(0.3)
-                send_cmd("CS ARM")
-                time.sleep(0.5)
 
                 mid_rate, _, glitch = test_position(x, y, mid_v, shots=10)
                 if glitch:
@@ -695,16 +791,16 @@ def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
                     # Too low, search higher
                     low_v = mid_v
 
-            # Log and return - mark as threshold (purple)
+            # Log and return with threshold voltage
             log_test(x, y, threshold_voltage, 0, 'threshold', hit_rate=threshold_rate, optimized_voltage=threshold_voltage)
-            special = 'glitch' if glitch_found else 'threshold'
-            return threshold_rate, threshold_voltage, True, special
+            special = 'glitch' if glitch_found else None
+            return threshold_rate, threshold_voltage, True, special, threshold_voltage
 
         # Normal case: found good voltage around 50%
         if hit_rate <= 0.55:
             log_test(x, y, new_voltage, 0, 'optimized', hit_rate=hit_rate, optimized_voltage=new_voltage)
             special = 'glitch' if glitch_found else None
-            return hit_rate, new_voltage, True, special
+            return hit_rate, new_voltage, True, special, new_voltage
 
         prev_voltage = new_voltage
         prev_hit_rate = hit_rate
@@ -714,8 +810,9 @@ def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
 
     # Reached minimum voltage
     log_test(x, y, current_voltage, 0, 'optimized', hit_rate=prev_hit_rate, optimized_voltage=current_voltage)
-    special = 'glitch' if glitch_found else ('threshold' if prev_hit_rate > 0 else None)
-    return prev_hit_rate, current_voltage, True, special
+    special = 'glitch' if glitch_found else None
+    threshold_v = current_voltage if prev_hit_rate > 0 else None
+    return prev_hit_rate, current_voltage, True, special, threshold_v
 
 # Initialize Grbl - move to home position (assumes home was set manually)
 print("=== Initializing Grbl ===", flush=True)
@@ -837,6 +934,16 @@ if REVERSE_SPIRAL:
 else:
     direction_str = f"FORWARD: (0,0) -> center ({spiral_points[-1]})"
 
+# Override start point if specified
+if START_X is not None and START_Y is not None:
+    target = (START_X, START_Y)
+    if target in spiral_points:
+        idx = spiral_points.index(target)
+        spiral_points = spiral_points[idx:] + spiral_points[:idx]
+        direction_str = f"CUSTOM START: ({START_X}, {START_Y})"
+    else:
+        print(f"WARNING: Start position ({START_X}, {START_Y}) not in grid, using default", flush=True)
+
 print(f"Spiral: {len(spiral_points)} points, {direction_str}", flush=True)
 
 # Process each point
@@ -865,14 +972,19 @@ for i, (x, y) in enumerate(spiral_points):
     start_v = current_voltage
     # Optimize voltage if ANY hits were detected (not just >50%)
     if hit_rate > 0:
-        hit_rate, opt_voltage, was_optimized, special = optimize_voltage(x, y, hit_rate, glitch_found)
-        broadcast_result(x, y, hit_rate, opt_voltage, was_optimized, start_v, special=special)
+        hit_rate, opt_voltage, was_optimized, special, threshold_v = optimize_voltage(x, y, hit_rate, glitch_found)
+        broadcast_result(x, y, hit_rate, opt_voltage, was_optimized, start_v, special=special, threshold=threshold_v)
     else:
         broadcast_result(x, y, hit_rate, current_voltage)
 
 print("\n=== Heat Map Complete! ===", flush=True)
 print(f"Total positions tested: {len(visited)}", flush=True)
 print(f"CSV log saved to: {CSV_FILE}", flush=True)
+
+# Save HTML snapshot with matching filename
+HTML_FILE = CSV_FILE.replace('.csv', '.html')
+save_html_snapshot(HTML_FILE)
+
 broadcast_complete()
 
 # Keep server running
