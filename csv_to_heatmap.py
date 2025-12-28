@@ -31,7 +31,23 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             background: #16213e;
             border-radius: 5px;
         }}
-        #container {{
+        .grids-container {{
+            display: flex;
+            gap: 40px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }}
+        .grid-wrapper {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }}
+        .grid-title {{
+            color: #00ff88;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }}
+        .container {{
             position: relative;
             display: inline-block;
         }}
@@ -56,16 +72,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin-top: 10px;
             color: #888;
         }}
-        #legend {{
+        .legend {{
             display: flex;
             align-items: center;
             margin-top: 10px;
             gap: 10px;
         }}
-        #gradient {{
+        .gradient-hitrate {{
             width: 200px;
             height: 20px;
             background: linear-gradient(to right, #00ff00, #ffff00, #ff0000);
+            border-radius: 3px;
+        }}
+        .gradient-voltage {{
+            width: 200px;
+            height: 20px;
+            background: linear-gradient(to right, #000033, #0066ff, #00ffff, #ffff00, #ff0000);
             border-radius: 3px;
         }}
     </style>
@@ -73,29 +95,51 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
     <h1>Glitch Heat Map</h1>
     <div id="status">{status}</div>
-    <div id="container">
-        <canvas id="grid" width="{canvas_width}" height="{canvas_height}"></canvas>
-        <div id="tooltip"></div>
+
+    <div class="grids-container">
+        <div class="grid-wrapper">
+            <div class="grid-title">Hit Rate</div>
+            <div class="container">
+                <canvas id="gridHitRate" width="{canvas_width}" height="{canvas_height}"></canvas>
+            </div>
+            <div class="legend">
+                <span>0%</span>
+                <div class="gradient-hitrate"></div>
+                <span>100%</span>
+                <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH</span>
+            </div>
+        </div>
+
+        <div class="grid-wrapper">
+            <div class="grid-title">Threshold Voltage</div>
+            <div class="container">
+                <canvas id="gridVoltage" width="{canvas_width}" height="{canvas_height}"></canvas>
+            </div>
+            <div class="legend">
+                <span>0V</span>
+                <div class="gradient-voltage"></div>
+                <span>500V</span>
+            </div>
+        </div>
     </div>
-    <div id="legend">
-        <span>0% (normal)</span>
-        <div id="gradient"></div>
-        <span>100% (effect)</span>
-        <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH (CRP bypass)</span>
-    </div>
-    <div id="info">{grid_size}x{grid_size}mm grid (15px/cell). Hover for details including voltage threshold. Generated from: {csv_file}</div>
+
+    <div id="tooltip"></div>
+    <div id="info">{grid_size}x{grid_size}mm grid (15px/cell). Hover for details. Generated from: {csv_file}</div>
 
     <script>
-        const canvas = document.getElementById('grid');
-        const ctx = canvas.getContext('2d');
+        const canvasHitRate = document.getElementById('gridHitRate');
+        const ctxHitRate = canvasHitRate.getContext('2d');
+        const canvasVoltage = document.getElementById('gridVoltage');
+        const ctxVoltage = canvasVoltage.getContext('2d');
         const tooltip = document.getElementById('tooltip');
         const CELL_SIZE = 15;
         const GRID_SIZE = {grid_size};
+        const VOLTAGE_MAX = 500;
 
         // Embedded data from CSV
         const cellData = {cell_data_json};
 
-        function drawGrid() {{
+        function drawGrid(ctx, canvas) {{
             ctx.fillStyle = '#0f0f23';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
         }}
@@ -103,9 +147,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function hitRateToColor(rate, special) {{
             if (special === 'glitch') {{
                 return '#0088ff';
-            }}
-            if (special === 'threshold') {{
-                return '#aa00ff';
             }}
             let r, g, b;
             if (rate <= 0.5) {{
@@ -120,22 +161,70 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             return `rgb(${{r}}, ${{g}}, ${{b}})`;
         }}
 
-        function drawCell(x, y, hitRate, special) {{
-            const canvasY = y * CELL_SIZE;
-            const canvasX = x * CELL_SIZE;
-            ctx.fillStyle = hitRateToColor(hitRate, special);
-            ctx.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+        function voltageToColor(voltage) {{
+            // 0V = dark blue (#000033), 500V = red (#ff0000)
+            // Gradient: dark blue -> blue -> cyan -> yellow -> red
+            if (voltage <= 0) {{
+                return '#000033';  // Dark blue for 0V / not tested
+            }}
+            const ratio = Math.min(voltage / VOLTAGE_MAX, 1.0);
+            let r, g, b;
+            if (ratio <= 0.25) {{
+                // Dark blue to blue (0-125V)
+                const t = ratio / 0.25;
+                r = 0;
+                g = Math.round(102 * t);
+                b = Math.round(51 + 204 * t);
+            }} else if (ratio <= 0.5) {{
+                // Blue to cyan (125-250V)
+                const t = (ratio - 0.25) / 0.25;
+                r = 0;
+                g = Math.round(102 + 153 * t);
+                b = 255;
+            }} else if (ratio <= 0.75) {{
+                // Cyan to yellow (250-375V)
+                const t = (ratio - 0.5) / 0.25;
+                r = Math.round(255 * t);
+                g = 255;
+                b = Math.round(255 * (1 - t));
+            }} else {{
+                // Yellow to red (375-500V)
+                const t = (ratio - 0.75) / 0.25;
+                r = 255;
+                g = Math.round(255 * (1 - t));
+                b = 0;
+            }}
+            return `rgb(${{r}}, ${{g}}, ${{b}})`;
         }}
 
-        // Draw grid and all cells
-        drawGrid();
+        function drawCellHitRate(x, y, hitRate, special) {{
+            const canvasY = y * CELL_SIZE;
+            const canvasX = x * CELL_SIZE;
+            ctxHitRate.fillStyle = hitRateToColor(hitRate, special);
+            ctxHitRate.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+        }}
+
+        function drawCellVoltage(x, y, voltage) {{
+            const canvasY = y * CELL_SIZE;
+            const canvasX = x * CELL_SIZE;
+            ctxVoltage.fillStyle = voltageToColor(voltage);
+            ctxVoltage.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+        }}
+
+        // Draw grids and all cells
+        drawGrid(ctxHitRate, canvasHitRate);
+        drawGrid(ctxVoltage, canvasVoltage);
+
         Object.entries(cellData).forEach(([key, info]) => {{
             const [x, y] = key.split(',').map(Number);
-            drawCell(x, y, info.hitRate, info.special);
+            drawCellHitRate(x, y, info.hitRate, info.special);
+            // Use threshold voltage if available, otherwise 0 for cells with 0% hit rate
+            const displayVoltage = info.hitRate > 0 ? (info.threshold || info.voltage) : 0;
+            drawCellVoltage(x, y, displayVoltage);
         }});
 
-        // Tooltip handling
-        canvas.addEventListener('mousemove', function(e) {{
+        // Tooltip handling for both canvases
+        function handleMouseMove(e, canvas) {{
             var rect = canvas.getBoundingClientRect();
             var mouseX = e.clientX - rect.left;
             var mouseY = e.clientY - rect.top;
@@ -153,8 +242,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     var specialText = '';
                     if (cellInfo.special === 'glitch') {{
                         specialText = '<br><span style="color:#0088ff">GLITCH!</span>';
-                    }} else if (cellInfo.special === 'threshold') {{
-                        specialText = '<br><span style="color:#aa00ff">Threshold</span>';
                     }}
                     var testsText = cellInfo.tests ? '<br>Tests: ' + cellInfo.tests : '';
                     var thresholdText = cellInfo.threshold ? '<br>Threshold: ' + cellInfo.threshold + 'V' : '';
@@ -169,11 +256,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }} else {{
                 tooltip.style.display = 'none';
             }}
-        }});
+        }}
 
-        canvas.addEventListener('mouseleave', function() {{
-            tooltip.style.display = 'none';
-        }});
+        canvasHitRate.addEventListener('mousemove', function(e) {{ handleMouseMove(e, canvasHitRate); }});
+        canvasVoltage.addEventListener('mousemove', function(e) {{ handleMouseMove(e, canvasVoltage); }});
+        canvasHitRate.addEventListener('mouseleave', function() {{ tooltip.style.display = 'none'; }});
+        canvasVoltage.addEventListener('mouseleave', function() {{ tooltip.style.display = 'none'; }});
     </script>
 </body>
 </html>

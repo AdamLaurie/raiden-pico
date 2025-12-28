@@ -385,6 +385,38 @@ TRIGGER GPIO RISING
 ARM ON
 ```
 
+## Heatmap Visualization Tools
+
+The project includes Python scripts for automated XY scanning with real-time heatmap visualization.
+
+### Live Heatmap (`glitch_heatmap.py`)
+
+Run automated scans with live web-based visualization:
+
+```bash
+# Basic scan (25x25 grid, spiral from corner)
+python3 glitch_heatmap.py
+
+# Reverse spiral starting from center
+python3 glitch_heatmap.py --reverse --start-x 12 --start-y 12
+```
+
+Open http://localhost:8080 to view the live dual heatmap showing:
+- **Hit Rate**: Green (0%) to Red (100%), Blue for successful glitches
+- **Threshold Voltage**: Dark blue (0V) to Red (500V)
+
+### CSV to Heatmap (`csv_to_heatmap.py`)
+
+Regenerate heatmaps from CSV log files:
+
+```bash
+python3 csv_to_heatmap.py glitch_log_20251227.csv
+```
+
+### Example Output
+
+See [examples/heatmap_example.html](examples/heatmap_example.html) for an interactive example heatmap with dual grids showing hit rate and threshold voltage across a 25x25mm scan area.
+
 ## Pin Configuration
 
 ### Default Pinout

@@ -117,7 +117,23 @@ HTML_PAGE = '''<!DOCTYPE html>
             background: #16213e;
             border-radius: 5px;
         }
-        #container {
+        .grids-container {
+            display: flex;
+            gap: 40px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .grid-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .grid-title {
+            color: #00ff88;
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+        .container {
             position: relative;
             display: inline-block;
         }
@@ -142,16 +158,22 @@ HTML_PAGE = '''<!DOCTYPE html>
             margin-top: 10px;
             color: #888;
         }
-        #legend {
+        .legend {
             display: flex;
             align-items: center;
             margin-top: 10px;
             gap: 10px;
         }
-        #gradient {
+        .gradient-hitrate {
             width: 200px;
             height: 20px;
             background: linear-gradient(to right, #00ff00, #ffff00, #ff0000);
+            border-radius: 3px;
+        }
+        .gradient-voltage {
+            width: 200px;
+            height: 20px;
+            background: linear-gradient(to right, #000033, #0066ff, #00ffff, #ffff00, #ff0000);
             border-radius: 3px;
         }
     </style>
@@ -159,42 +181,60 @@ HTML_PAGE = '''<!DOCTYPE html>
 <body>
     <h1>Glitch Heat Map</h1>
     <div id="status">Connecting...</div>
-    <div id="container">
-        <canvas id="grid" width="375" height="375"></canvas>
-        <div id="tooltip"></div>
+
+    <div class="grids-container">
+        <div class="grid-wrapper">
+            <div class="grid-title">Hit Rate</div>
+            <div class="container">
+                <canvas id="gridHitRate" width="375" height="375"></canvas>
+            </div>
+            <div class="legend">
+                <span>0%</span>
+                <div class="gradient-hitrate"></div>
+                <span>100%</span>
+                <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH</span>
+            </div>
+        </div>
+
+        <div class="grid-wrapper">
+            <div class="grid-title">Threshold Voltage</div>
+            <div class="container">
+                <canvas id="gridVoltage" width="375" height="375"></canvas>
+            </div>
+            <div class="legend">
+                <span>0V</span>
+                <div class="gradient-voltage"></div>
+                <span>500V</span>
+            </div>
+        </div>
     </div>
-    <div id="legend">
-        <span>0% (normal)</span>
-        <div id="gradient"></div>
-        <span>100% (effect)</span>
-        <span style="margin-left: 20px; color: #0088ff;">&#9632; GLITCH (CRP bypass)</span>
-    </div>
-    <div id="info">25x25mm grid (15px/cell). Spiral scan pattern. Hover for details including voltage threshold.</div>
+
+    <div id="tooltip"></div>
+    <div id="info">25x25mm grid (15px/cell). Spiral scan pattern. Hover for details.</div>
 
     <script>
-        const canvas = document.getElementById('grid');
-        const ctx = canvas.getContext('2d');
+        const canvasHitRate = document.getElementById('gridHitRate');
+        const ctxHitRate = canvasHitRate.getContext('2d');
+        const canvasVoltage = document.getElementById('gridVoltage');
+        const ctxVoltage = canvasVoltage.getContext('2d');
         const status = document.getElementById('status');
         const tooltip = document.getElementById('tooltip');
         const CELL_SIZE = 15;
         const GRID_SIZE = 25;
+        const VOLTAGE_MAX = 500;
         let prevPos = null;
 
         // Store cell data for tooltips
-        let cellData = {};  // "x,y" -> {hitRate, voltage, special}
+        let cellData = {};  // "x,y" -> {hitRate, voltage, special, threshold}
 
-        function drawGrid() {
+        function drawGrid(ctx, canvas) {
             ctx.fillStyle = '#0f0f23';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
         }
 
         function hitRateToColor(rate, special) {
-            // Special colors: 'glitch' = blue, 'threshold' = purple
             if (special === 'glitch') {
-                return '#0088ff';  // Blue for successful glitch
-            }
-            if (special === 'threshold') {
-                return '#aa00ff';  // Purple for threshold hit
+                return '#0088ff';
             }
             let r, g, b;
             if (rate <= 0.5) {
@@ -209,23 +249,71 @@ HTML_PAGE = '''<!DOCTYPE html>
             return `rgb(${r}, ${g}, ${b})`;
         }
 
-        function drawCell(x, y, hitRate, special) {
+        function voltageToColor(voltage) {
+            // 0V = dark blue (#000033), 500V = red (#ff0000)
+            if (voltage <= 0) {
+                return '#000033';
+            }
+            const ratio = Math.min(voltage / VOLTAGE_MAX, 1.0);
+            let r, g, b;
+            if (ratio <= 0.25) {
+                const t = ratio / 0.25;
+                r = 0;
+                g = Math.round(102 * t);
+                b = Math.round(51 + 204 * t);
+            } else if (ratio <= 0.5) {
+                const t = (ratio - 0.25) / 0.25;
+                r = 0;
+                g = Math.round(102 + 153 * t);
+                b = 255;
+            } else if (ratio <= 0.75) {
+                const t = (ratio - 0.5) / 0.25;
+                r = Math.round(255 * t);
+                g = 255;
+                b = Math.round(255 * (1 - t));
+            } else {
+                const t = (ratio - 0.75) / 0.25;
+                r = 255;
+                g = Math.round(255 * (1 - t));
+                b = 0;
+            }
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        function drawCellHitRate(x, y, hitRate, special) {
             const canvasY = y * CELL_SIZE;
             const canvasX = x * CELL_SIZE;
-            ctx.fillStyle = hitRateToColor(hitRate, special);
-            ctx.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+            ctxHitRate.fillStyle = hitRateToColor(hitRate, special);
+            ctxHitRate.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+        }
+
+        function drawCellVoltage(x, y, voltage) {
+            const canvasY = y * CELL_SIZE;
+            const canvasX = x * CELL_SIZE;
+            ctxVoltage.fillStyle = voltageToColor(voltage);
+            ctxVoltage.fillRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+        }
+
+        function drawCell(x, y, hitRate, special, threshold, voltage) {
+            drawCellHitRate(x, y, hitRate, special);
+            const displayVoltage = hitRate > 0 ? (threshold || voltage) : 0;
+            drawCellVoltage(x, y, displayVoltage);
         }
 
         function drawCurrent(x, y) {
             const canvasY = y * CELL_SIZE;
             const canvasX = x * CELL_SIZE;
-            ctx.strokeStyle = '#ffffff';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+            // Draw on both canvases
+            ctxHitRate.strokeStyle = '#ffffff';
+            ctxHitRate.lineWidth = 2;
+            ctxHitRate.strokeRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+            ctxVoltage.strokeStyle = '#ffffff';
+            ctxVoltage.lineWidth = 2;
+            ctxVoltage.strokeRect(canvasX + 1, canvasY + 1, CELL_SIZE - 2, CELL_SIZE - 2);
         }
 
-        // Tooltip handling - use fixed positioning with page coordinates
-        canvas.addEventListener('mousemove', function(e) {
+        // Tooltip handling for both canvases
+        function handleMouseMove(e, canvas) {
             var rect = canvas.getBoundingClientRect();
             var mouseX = e.clientX - rect.left;
             var mouseY = e.clientY - rect.top;
@@ -256,13 +344,15 @@ HTML_PAGE = '''<!DOCTYPE html>
             } else {
                 tooltip.style.display = 'none';
             }
-        });
+        }
 
-        canvas.addEventListener('mouseleave', function() {
-            tooltip.style.display = 'none';
-        });
+        canvasHitRate.addEventListener('mousemove', function(e) { handleMouseMove(e, canvasHitRate); });
+        canvasVoltage.addEventListener('mousemove', function(e) { handleMouseMove(e, canvasVoltage); });
+        canvasHitRate.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
+        canvasVoltage.addEventListener('mouseleave', function() { tooltip.style.display = 'none'; });
 
-        drawGrid();
+        drawGrid(ctxHitRate, canvasHitRate);
+        drawGrid(ctxVoltage, canvasVoltage);
 
         const evtSource = new EventSource('/events');
 
@@ -274,11 +364,12 @@ HTML_PAGE = '''<!DOCTYPE html>
             const data = JSON.parse(event.data);
 
             if (data.type === 'init') {
-                drawGrid();
+                drawGrid(ctxHitRate, canvasHitRate);
+                drawGrid(ctxVoltage, canvasVoltage);
                 Object.entries(data.visited).forEach(([key, info]) => {
                     const [x, y] = key.split(',').map(Number);
                     cellData[key] = info;
-                    drawCell(x, y, info.hitRate, info.special);
+                    drawCell(x, y, info.hitRate, info.special, info.threshold, info.voltage);
                 });
                 if (data.current) {
                     drawCurrent(data.current[0], data.current[1]);
@@ -289,7 +380,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 if (prevPos) {
                     const key = `${prevPos[0]},${prevPos[1]}`;
                     if (cellData[key]) {
-                        drawCell(prevPos[0], prevPos[1], cellData[key].hitRate, cellData[key].special);
+                        drawCell(prevPos[0], prevPos[1], cellData[key].hitRate, cellData[key].special, cellData[key].threshold, cellData[key].voltage);
                     }
                 }
                 drawCurrent(data.x, data.y);
@@ -299,11 +390,11 @@ HTML_PAGE = '''<!DOCTYPE html>
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
                 cellData[key] = {hitRate: data.hitRate, voltage: data.voltage, special: data.special, threshold: data.threshold};
-                drawCell(data.x, data.y, data.hitRate, data.special);
+                drawCell(data.x, data.y, data.hitRate, data.special, data.threshold, data.voltage);
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
                 const pct = (data.hitRate * 100).toFixed(0);
-                let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : (data.special === 'threshold' ? ' [threshold]' : '');
+                let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
                 status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
             }
@@ -433,11 +524,12 @@ def save_html_snapshot(filename):
             const data = JSON.parse(event.data);
 
             if (data.type === 'init') {
-                drawGrid();
+                drawGrid(ctxHitRate, canvasHitRate);
+                drawGrid(ctxVoltage, canvasVoltage);
                 Object.entries(data.visited).forEach(([key, info]) => {
                     const [x, y] = key.split(',').map(Number);
                     cellData[key] = info;
-                    drawCell(x, y, info.hitRate, info.special);
+                    drawCell(x, y, info.hitRate, info.special, info.threshold, info.voltage);
                 });
                 if (data.current) {
                     drawCurrent(data.current[0], data.current[1]);
@@ -448,7 +540,7 @@ def save_html_snapshot(filename):
                 if (prevPos) {
                     const key = `${prevPos[0]},${prevPos[1]}`;
                     if (cellData[key]) {
-                        drawCell(prevPos[0], prevPos[1], cellData[key].hitRate, cellData[key].special);
+                        drawCell(prevPos[0], prevPos[1], cellData[key].hitRate, cellData[key].special, cellData[key].threshold, cellData[key].voltage);
                     }
                 }
                 drawCurrent(data.x, data.y);
@@ -458,11 +550,11 @@ def save_html_snapshot(filename):
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
                 cellData[key] = {hitRate: data.hitRate, voltage: data.voltage, special: data.special, threshold: data.threshold};
-                drawCell(data.x, data.y, data.hitRate, data.special);
+                drawCell(data.x, data.y, data.hitRate, data.special, data.threshold, data.voltage);
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
                 const pct = (data.hitRate * 100).toFixed(0);
-                let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : (data.special === 'threshold' ? ' [threshold]' : '');
+                let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
                 status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
             }
@@ -480,7 +572,7 @@ def save_html_snapshot(filename):
         Object.entries(staticData).forEach(([key, info]) => {{
             const [x, y] = key.split(',').map(Number);
             cellData[key] = info;
-            drawCell(x, y, info.hitRate, info.special);
+            drawCell(x, y, info.hitRate, info.special, info.threshold, info.voltage);
         }});
         status.textContent = 'Snapshot: ' + Object.keys(staticData).length + ' / 625 positions tested';
         status.style.color = '#00ff88';"""
