@@ -389,6 +389,8 @@ ARM ON
 
 The project includes Python scripts for automated XY scanning with real-time heatmap visualization.
 
+![Heatmap Screenshot](examples/heatmap_screenshot.png)
+
 ### Live Heatmap (`glitch_heatmap.py`)
 
 Run automated scans with live web-based visualization:
