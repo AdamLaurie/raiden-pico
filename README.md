@@ -389,7 +389,7 @@ ARM ON
 
 The project includes Python scripts for automated XY scanning with real-time heatmap visualization.
 
-![Heatmap Screenshot](examples/heatmap_screenshot.png)
+[![Heatmap Screenshot](examples/heatmap_screenshot.png)](examples/heatmap_example.html)
 
 ### Live Heatmap (`glitch_heatmap.py`)
 
