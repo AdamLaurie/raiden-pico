@@ -498,7 +498,10 @@ Check the following:
 - **Timing Resolution**: 6.67 ns (1 clock cycle)
 - **UART Baud Rates**: Up to 921600 (configurable)
 - **Glitch Width Range**: 1 cycle to 2^32 cycles (6.67ns to 28.6 seconds)
-- **Trigger Latency**: < 1µs (PIO to glitch output)
+- **Trigger Latency**: ~18 ticks (~120ns) from trigger detection to glitch output
+  - This latency is automatically compensated in the PAUSE command
+  - For PAUSE values >= 18, 18 ticks are subtracted to account for trigger processing
+  - Example: `SET PAUSE 100` results in actual delay of 82 ticks after trigger
 
 ## Safety Considerations
 

@@ -22,6 +22,10 @@ static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
 
+// Trigger latency compensation (~18 ticks / ~120ns from trigger detection to glitch output)
+// This is automatically subtracted from PAUSE values to account for trigger processing overhead
+#define TRIGGER_LATENCY_TICKS 18
+
 // Configuration and state
 static glitch_config_t config;
 static system_flags_t flags;
@@ -247,7 +251,12 @@ bool glitch_arm(void) {
 
     // Use cycle values directly - no conversion needed
     // System runs at 150MHz, so 1 cycle = 6.67ns
-    precalc_pause_cycles = config.pause_cycles;
+    // Compensate PAUSE for trigger latency (~18 ticks / ~120ns)
+    if (config.pause_cycles >= TRIGGER_LATENCY_TICKS) {
+        precalc_pause_cycles = config.pause_cycles - TRIGGER_LATENCY_TICKS;
+    } else {
+        precalc_pause_cycles = 0;
+    }
     precalc_width_cycles = config.width_cycles;
     precalc_gap_cycles = config.gap_cycles;
 
