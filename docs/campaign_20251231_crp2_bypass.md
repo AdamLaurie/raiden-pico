@@ -90,3 +90,40 @@ TARGET_CRASH_RATE = 0.50
 ## CSV Data
 
 Full campaign data saved to `campaign_20251231_123541.csv` (169 test runs logged).
+
+---
+
+## Follow-up Validation Test (January 1, 2026)
+
+After the initial success, validation tests were run to measure the reproducible success rate.
+
+### Test 1: --test-only mode (4-byte read)
+
+| Metric | Value |
+|--------|-------|
+| Attempts | ~1458 (458 + 1000) |
+| SUCCESS | 0 (0.00%) |
+| CRP_BLOCKED | ~94% |
+| CRASH | ~6% |
+
+**Result:** Zero successes. The 4-byte read does not trigger the glitch vulnerability.
+
+### Test 2: --no-save mode (full 516096-byte read request)
+
+| Metric | Value |
+|--------|-------|
+| Attempts | 1000 |
+| SUCCESS | 31 (3.10%) |
+| CRP_BLOCKED | 840 (84.00%) |
+| CRASH | 129 (12.90%) |
+
+**Result:** 31 successes (3.1% rate), confirming the bypass is reproducible.
+
+### Key Finding
+
+The **full 516096-byte read request is required** for the glitch to work. The glitch timing is calibrated for the longer ISP read operation. A minimal 4-byte read completes too quickly and doesn't trigger the vulnerability.
+
+### Script Flags Added
+
+- `--test-only`: Quick 4-byte read, no save, runs all iterations (for testing, but doesn't trigger glitch)
+- `--no-save`: Full 516096-byte read request, no data collection on success, runs all iterations (validates glitch without saving dump)
