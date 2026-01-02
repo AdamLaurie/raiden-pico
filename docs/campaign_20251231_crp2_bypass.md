@@ -127,3 +127,57 @@ The **full 516096-byte read request is required** for the glitch to work. The gl
 
 - `--test-only`: Quick 4-byte read, no save, runs all iterations (for testing, but doesn't trigger glitch)
 - `--no-save`: Full 516096-byte read request, no data collection on success, runs all iterations (validates glitch without saving dump)
+
+---
+
+## Parameter Optimization (January 2, 2026)
+
+Systematic parameter sweeps were run to optimize the success rate.
+
+### Voltage/Width Optimization
+
+Tested 36 combinations: 6 voltages x 6 widths, 200 iterations each.
+
+**Top Results (200 iterations):**
+
+| Voltage | Width | Success Rate | Crashes |
+|---------|-------|--------------|---------|
+| 210V | 90 | 4.5% | 12% |
+| 215V | 60 | 4.5% | 11% |
+| 210V | 80 | 4.0% | 15.5% |
+| 210V | 76 | 3.5% | 16.5% |
+
+**Findings:**
+- 210V is the optimal voltage
+- 220V+ causes too many crashes (0% success)
+- 200-205V is too weak (0.5-1.5% success)
+
+### Timing Optimization
+
+Fine-tuned pause value ±1 to ±10 cycles around base 6273.
+
+**Top Results (200 iterations):**
+
+| Pause | Offset | Success Rate |
+|-------|--------|--------------|
+| 6275 | +2 | 5.5% |
+| 6263 | -10 | 3.0% |
+| 6271 | -2 | 3.0% |
+| 6273 | 0 | 0.0% |
+
+**Finding:** +2 cycles (13.3ns at 150MHz) improved success rate.
+
+### 1000-Iteration Validation
+
+| Parameter Set | Success Rate |
+|---------------|--------------|
+| Original (V=210, P=6273, W=76) | 3.1% (31/1000) |
+| Width-optimized (V=210, P=6273, W=90) | 2.5% (25/1000) |
+| Timing-optimized (V=210, P=6275, W=90) | 2.7% (27/1000) |
+
+### Conclusions
+
+1. **Small sample variance**: 200-iteration tests showed 4.5-5.5% success, but 1000-iteration validation converged to ~2.5-3%
+2. **Optimal parameters**: V=210, pause=6273-6275, width=76-90
+3. **True success rate**: ~2.5-3.1% with current setup
+4. **Original parameters remain competitive**: The campaign-discovered parameters (V=210, P=6273, W=76) at 3.1% are within the optimal range
