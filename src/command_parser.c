@@ -3,6 +3,7 @@
 #include "glitch.h"
 #include "target_uart.h"
 #include "grbl.h"
+#include "stm32_pwner.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/pio.h"
@@ -157,9 +158,9 @@ void command_parser_execute(cmd_parts_t *parts) {
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
-        "HELP", "REBOOT", "DEBUG", "API", "ERROR"
+        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 16, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 17, "command")) {
         goto api_response;
     }
 
@@ -188,6 +189,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[0], "RESPONSE") == 0) {
             const char *response_subcmds[] = {"GET", "CLEAR", "COUNT"};
             if (!match_and_replace(&parts->parts[1], response_subcmds, 3, "RESPONSE sub-command")) {
+                goto api_response;
+            }
+        } else if (strcmp(parts->parts[0], "STM32") == 0) {
+            const char *stm32_subcmds[] = {"INIT", "ATTACK", "BOOT0", "STATUS", "ABORT"};
+            if (!match_and_replace(&parts->parts[1], stm32_subcmds, 5, "STM32 sub-command")) {
                 goto api_response;
             }
         }
@@ -307,6 +313,14 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GRBL MOVE <X> <Y> [F]  - Move to absolute position (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL STEP <DX> <DY> [F]- Move relative distance (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL POS               - Get current XYZ position\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== STM32F1 RDP Bypass ==\r\n");
+        uart_cli_send("STM32 INIT             - Initialize STM32 pwner module\r\n");
+        uart_cli_send("STM32 ATTACK           - Execute RDP bypass power glitch attack\r\n");
+        uart_cli_send("                         (requires exploit firmware in target SRAM)\r\n");
+        uart_cli_send("STM32 BOOT0 [pin]      - Get/set BOOT0 control pin (default GP3)\r\n");
+        uart_cli_send("STM32 STATUS           - Show attack state and bytes received\r\n");
+        uart_cli_send("STM32 ABORT            - Abort current attack operation\r\n");
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
@@ -623,26 +637,28 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP4  - Target UART TX (UART1)\r\n");
         uart_cli_send("GP5  - Target UART RX (UART1, also PIO monitored)\r\n");
         uart_cli_send("\r\n");
-        uart_cli_send("== Clock Generator ==\r\n");
-        uart_cli_send("GP6  - Clock Output\r\n");
-        uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_printf("GP%u  - Glitch Output (normal)\r\n", PIN_GLITCH_OUT);
         uart_cli_printf("GP%u  - Glitch Output (inverted)\r\n", PIN_GLITCH_OUT_INV);
         uart_cli_printf("GP%u  - Trigger Input\r\n", cfg->trigger_pin);
+        uart_cli_printf("GP%u  - Clock Output\r\n", PIN_CLOCK);
+        uart_cli_printf("GP%u  - Armed Status\r\n", PIN_ARMED);
+        uart_cli_printf("GP%u  - Glitch Fired\r\n", PIN_GLITCH_FIRED);
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
-        uart_cli_send("GP8  - Grbl UART TX (UART1 alternate, 115200 baud)\r\n");
-        uart_cli_send("GP9  - Grbl UART RX (UART1 alternate, 115200 baud)\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Platform Control ==\r\n");
-        uart_cli_send("GP6  - HV Enable (default, configurable via PLATFORM HVPIN)\r\n");
-        uart_cli_send("GP7  - Voltage PWM (default, configurable via PLATFORM VPIN)\r\n");
-        uart_cli_send("GP11 - Armed Status Monitor (default)\r\n");
+        uart_cli_send("GP8  - Grbl UART TX (UART1 alternate)\r\n");
+        uart_cli_send("GP9  - Grbl UART RX (UART1 alternate)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("GP10 - Target Power (default ON)\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== STM32 Attack ==\r\n");
+        uart_cli_printf("GP%u - BOOT0 Control\r\n", stm32_pwner_get_boot0_pin());
+        uart_cli_send("\r\n");
+        uart_cli_send("== Platform Control ==\r\n");
+        uart_cli_send("GP6  - HV Enable (default, configurable)\r\n");
+        uart_cli_send("GP7  - Voltage PWM (default, configurable)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
         uart_cli_send("GP25 - Status LED\r\n");
@@ -1324,6 +1340,60 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else {
             api_error("ERROR: Unknown GRBL command\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "STM32") == 0) {
+        // STM32F1 RDP Bypass attack commands
+        if (parts->count < 2) {
+            uart_cli_send("ERROR: Usage: STM32 <INIT|ATTACK|BOOT0|STATUS|ABORT>\r\n");
+            goto api_response;
+        }
+
+        if (strcmp(parts->parts[1], "INIT") == 0) {
+            stm32_pwner_init();
+        } else if (strcmp(parts->parts[1], "ATTACK") == 0) {
+            uart_cli_send("Starting STM32 RDP bypass attack...\r\n");
+            stm32_result_t result = stm32_pwner_attack();
+            if (result == STM32_OK) {
+                uart_cli_send("Attack initiated - now dumping flash\r\n");
+                uart_cli_send("Use STM32 STATUS to check progress\r\n");
+            } else {
+                uart_cli_printf("Attack failed: %s\r\n", stm32_result_str(result));
+            }
+        } else if (strcmp(parts->parts[1], "BOOT0") == 0) {
+            if (parts->count < 3) {
+                uart_cli_printf("BOOT0 pin: GP%u\r\n", stm32_pwner_get_boot0_pin());
+            } else if (strcmp(parts->parts[2], "HIGH") == 0) {
+                stm32_pwner_set_boot0(true);
+            } else if (strcmp(parts->parts[2], "LOW") == 0) {
+                stm32_pwner_set_boot0(false);
+            } else {
+                uint8_t pin = atoi(parts->parts[2]);
+                stm32_pwner_set_boot0_pin(pin);
+            }
+        } else if (strcmp(parts->parts[1], "STATUS") == 0) {
+            stm32_state_t state = stm32_pwner_get_state();
+            uint32_t bytes = stm32_pwner_get_bytes_received();
+
+            uart_cli_send("== STM32 Pwner Status ==\r\n");
+            const char *state_str;
+            switch (state) {
+                case STM32_STATE_IDLE: state_str = "IDLE"; break;
+                case STM32_STATE_ARMED: state_str = "ARMED"; break;
+                case STM32_STATE_GLITCHING: state_str = "GLITCHING"; break;
+                case STM32_STATE_WAITING_MAGIC: state_str = "WAITING_MAGIC"; break;
+                case STM32_STATE_DUMPING: state_str = "DUMPING"; break;
+                case STM32_STATE_COMPLETE: state_str = "COMPLETE"; break;
+                case STM32_STATE_ERROR: state_str = "ERROR"; break;
+                default: state_str = "UNKNOWN"; break;
+            }
+            uart_cli_printf("State:          %s\r\n", state_str);
+            uart_cli_printf("Bytes received: %u\r\n", bytes);
+            uart_cli_printf("BOOT0 pin:      GP%u\r\n", stm32_pwner_get_boot0_pin());
+        } else if (strcmp(parts->parts[1], "ABORT") == 0) {
+            stm32_pwner_abort();
+        } else {
+            api_error("ERROR: Unknown STM32 command\r\n");
         }
 
     } else if (strcmp(parts->parts[0], "ERROR") == 0) {
