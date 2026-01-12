@@ -240,13 +240,46 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
             uart_cli_send("LPC ISP sync complete. Echo mode enabled.\r\n");
             break;
 
-        case TARGET_STM32:
+        case TARGET_STM32: {
             uart_cli_send("Entering STM32 bootloader mode...\r\n");
             uart_cli_send("Sending 0x7F for STM32 sync...\r\n");
             // Send 0x7F for STM32 bootloader sync
             target_uart_send_byte(0x7F);
-            sleep_ms(100);
+
+            // Wait for ACK (0x79) or NACK (0x1F) with timeout
+            uint32_t start = to_ms_since_boot(get_absolute_time());
+            uint32_t timeout_ms = 1000;  // 1 second timeout for bootloader response
+            bool got_response = false;
+
+            while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
+                if (uart_is_readable(TARGET_UART_ID)) {
+                    uint8_t byte = uart_getc(TARGET_UART_ID);
+                    if (debug_mode) {
+                        uart_cli_printf("[RX] %02X", byte);
+                        if (byte >= 32 && byte < 127) {
+                            uart_cli_printf(" '%c'", byte);
+                        }
+                        uart_cli_send("\r\n");
+                    }
+
+                    if (byte == 0x79) {
+                        uart_cli_send("ACK received\r\n");
+                        got_response = true;
+                        break;
+                    } else if (byte == 0x1F) {
+                        uart_cli_send("ERROR: NACK received - bootloader rejected sync\r\n");
+                        return false;
+                    }
+                }
+                tight_loop_contents();
+            }
+
+            if (!got_response) {
+                uart_cli_send("ERROR: No response from bootloader (check BOOT0 pin and connections)\r\n");
+                return false;
+            }
             break;
+        }
 
         default:
             uart_cli_send("ERROR: Unknown target type\r\n");
@@ -291,8 +324,12 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     // Initialize UART1
     uart_init(TARGET_UART_ID, baud);
 
-    // Set UART format explicitly (8 data bits, 1 stop bit, no parity)
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    // Set UART format: STM32 bootloader requires EVEN parity, others use no parity
+    if (current_target_type == TARGET_STM32) {
+        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_EVEN);
+    } else {
+        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    }
 
     // Set TX and RX pins for UART1 (GP4/GP5 are default UART1 pins)
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
@@ -429,6 +466,9 @@ void target_uart_send_hex(const char *hex_str) {
                 byte |= (*p - 'A' + 10);
             }
             uart_putc_raw(TARGET_UART_ID, byte);
+            if (debug_mode) {
+                uart_cli_printf("[TX] %02X\r\n", byte);
+            }
             p++;
         } else if (*p >= 'a' && *p <= 'f') {
             uint8_t byte = (*p - 'a' + 10) << 4;
@@ -441,6 +481,9 @@ void target_uart_send_hex(const char *hex_str) {
                 byte |= (*p - 'A' + 10);
             }
             uart_putc_raw(TARGET_UART_ID, byte);
+            if (debug_mode) {
+                uart_cli_printf("[TX] %02X\r\n", byte);
+            }
             p++;
         } else if (*p >= 'A' && *p <= 'F') {
             uint8_t byte = (*p - 'A' + 10) << 4;
@@ -453,14 +496,16 @@ void target_uart_send_hex(const char *hex_str) {
                 byte |= (*p - 'A' + 10);
             }
             uart_putc_raw(TARGET_UART_ID, byte);
+            if (debug_mode) {
+                uart_cli_printf("[TX] %02X\r\n", byte);
+            }
             p++;
         } else {
             p++;
         }
     }
 
-    // Append \r
-    uart_putc_raw(TARGET_UART_ID, '\r');
+    // Wait for TX to complete (no \r append for raw hex - STM32 bootloader needs exact bytes)
     uart_tx_wait_blocking(TARGET_UART_ID);
 
     // External trigger check function

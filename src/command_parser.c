@@ -753,7 +753,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "SYNC") == 0) {
             uint32_t baud = 115200;       // Default baud
             uint32_t crystal_khz = 12000; // Default 12MHz crystal
-            uint32_t reset_delay_ms = 10; // Default 10ms delay (tested reliable from 1ms-300ms)
+            uint32_t reset_delay_ms = 500; // Default 500ms delay for bootloader to initialize
             uint32_t retries = 5;         // Default 5 retries
             if (parts->count >= 3) {
                 baud = atoi(parts->parts[2]);
@@ -770,6 +770,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                 if (retries < 1) {
                     retries = 1;
                 }
+            }
+
+            // For STM32, set BOOT0 HIGH before reset
+            bool is_stm32 = (target_get_type() == TARGET_STM32);
+            if (is_stm32) {
+                extern void stm32_pwner_set_boot0(bool high);
+                stm32_pwner_set_boot0(true);
             }
 
             // Try up to specified times to sync with target
@@ -1371,6 +1378,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uint8_t pin = atoi(parts->parts[2]);
                 stm32_pwner_set_boot0_pin(pin);
             }
+        } else if (strcmp(parts->parts[1], "BOOT1") == 0) {
+            if (parts->count < 3) {
+                uart_cli_printf("BOOT1 pin: GP%u\r\n", stm32_pwner_get_boot1_pin());
+            } else if (strcmp(parts->parts[2], "HIGH") == 0) {
+                stm32_pwner_set_boot1(true);
+            } else if (strcmp(parts->parts[2], "LOW") == 0) {
+                stm32_pwner_set_boot1(false);
+            } else {
+                uint8_t pin = atoi(parts->parts[2]);
+                stm32_pwner_set_boot1_pin(pin);
+            }
         } else if (strcmp(parts->parts[1], "STATUS") == 0) {
             stm32_state_t state = stm32_pwner_get_state();
             uint32_t bytes = stm32_pwner_get_bytes_received();
@@ -1390,6 +1408,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("State:          %s\r\n", state_str);
             uart_cli_printf("Bytes received: %u\r\n", bytes);
             uart_cli_printf("BOOT0 pin:      GP%u\r\n", stm32_pwner_get_boot0_pin());
+            uart_cli_printf("BOOT1 pin:      GP%u\r\n", stm32_pwner_get_boot1_pin());
         } else if (strcmp(parts->parts[1], "ABORT") == 0) {
             stm32_pwner_abort();
         } else {
