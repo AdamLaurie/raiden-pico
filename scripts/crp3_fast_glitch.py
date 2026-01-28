@@ -66,6 +66,27 @@ def sync_target(ser):
 
     return 'sync complete' in response.lower()
 
+def sync_target_with_glitch(ser):
+    """Sync with target, arming glitch BEFORE reset (for GPIO boot glitching).
+    Returns True if sync successful."""
+    # ARM the glitch FIRST - it will fire on GPIO RISING (reset release)
+    fast_cmd(ser, "ARM ON", check=False)
+
+    ser.write(b"API OFF\r\n")
+    time.sleep(0.03)
+    ser.read(ser.in_waiting)
+
+    # This resets target, which triggers the glitch on reset release
+    ser.write(b"TARGET SYNC 115200 12000 10 1\r\n")
+    time.sleep(1.5)
+    response = ser.read(ser.in_waiting).decode('utf-8', errors='ignore')
+
+    ser.write(b"API ON\r\n")
+    time.sleep(0.03)
+    ser.read(ser.in_waiting)
+
+    return 'sync complete' in response.lower()
+
 def get_cs_status(ser):
     """Query CS STATUS and return response"""
     ser.read(ser.in_waiting)
@@ -108,6 +129,58 @@ def ensure_cs_ready(ser, voltage):
     # Final verify
     resp = get_cs_status(ser)
     return 'armed' in resp and 'disarmed' not in resp and 'fault' not in resp
+
+def test_crp_bypass(ser, test_only=False, no_save=False):
+    """Check if CRP is bypassed (for GPIO boot glitch mode - glitch already fired).
+    Returns result code."""
+    # Don't arm - glitch already fired during boot
+
+    # Send R command for flash - check if CRP was bypassed
+    ser.write(b"API OFF\r\n")
+    time.sleep(0.03)
+    ser.read(ser.in_waiting)
+
+    # Set fast timeout
+    ser.write(b"TARGET TIMEOUT 10\r\n")
+    time.sleep(0.05)
+    ser.read(ser.in_waiting)
+
+    # Read size: 4 bytes for test-only, full flash otherwise
+    num_bytes = 4 if test_only else 516096
+    ser.write(f'TARGET SEND "R 0 {num_bytes}"\r\n'.encode())
+
+    def read_line():
+        line = ser.read_until(b'\r').decode('utf-8', errors='ignore').strip()
+        return line if line else None
+
+    # Read echo lines
+    read_line()  # firmware echo
+    read_line()  # target echo
+    error_line = read_line()
+
+    if not error_line:
+        ser.write(b"API ON\r\n")
+        time.sleep(0.03)
+        ser.read(ser.in_waiting)
+        return 'CRASH'
+
+    if error_line and len(error_line) > 0 and error_line[0] == '0':
+        # SUCCESS! CRP bypassed
+        ser.write(b"API ON\r\n")
+        time.sleep(0.1)
+        ser.read(ser.in_waiting)
+        return 'SUCCESS'
+
+    if error_line and '19' in error_line:
+        ser.write(b"API ON\r\n")
+        time.sleep(0.03)
+        ser.read(ser.in_waiting)
+        return 'CRP_BLOCKED'
+
+    ser.write(b"API ON\r\n")
+    time.sleep(0.03)
+    ser.read(ser.in_waiting)
+    return 'UNKNOWN'
 
 def test_glitch(ser, output_file=None, voltage=200, test_only=False, no_save=False):
     """Run one glitch attempt with flash read, return result code"""
@@ -328,13 +401,17 @@ def main():
     parser.add_argument('iterations', type=int, help='Number of attempts')
     parser.add_argument('--test-only', action='store_true',
                        help='Quick test mode: read 4 bytes, no save, run all iterations')
+    parser.add_argument('--trigger', choices=['uart', 'gpio', 'gpio-fall'], default='uart',
+                       help='Trigger mode: uart (on READ cmd), gpio (on RESET rising), gpio-fall (on RESET falling)')
     parser.add_argument('--no-save', action='store_true',
                        help='Full read but no save, run all iterations')
     args = parser.parse_args()
 
     mode = "TEST-ONLY" if args.test_only else ("NO-SAVE" if args.no_save else "FULL DUMP")
+    trig_modes = {'gpio': 'GPIO-RISING', 'gpio-fall': 'GPIO-FALLING', 'uart': 'UART'}
+    trig_mode = trig_modes.get(args.trigger, 'UART')
     print(f"=== Fast CRP3 Glitch: {args.voltage}V, pause={args.pause}, width={args.width} ({mode}) ===")
-    print(f"Iterations: {args.iterations}")
+    print(f"Iterations: {args.iterations}, Trigger: {trig_mode}")
 
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1.0)
     time.sleep(0.3)
@@ -395,11 +472,16 @@ def main():
         return
     print(" OK", flush=True)
 
-    # Setup UART trigger (done once)
+    # Setup trigger (done once)
     fast_cmd(ser, f"SET PAUSE {args.pause}", check=False)
     fast_cmd(ser, f"SET WIDTH {args.width}", check=False)
     fast_cmd(ser, "SET COUNT 1", check=False)
-    fast_cmd(ser, "TRIGGER UART 0x0D", check=False)
+    if args.trigger == 'gpio':
+        fast_cmd(ser, "TRIGGER GPIO RISING", check=False)
+    elif args.trigger == 'gpio-fall':
+        fast_cmd(ser, "TRIGGER GPIO FALLING", check=False)
+    else:
+        fast_cmd(ser, "TRIGGER UART 0x0D", check=False)
 
     print("Setup complete", flush=True)
 
@@ -432,18 +514,36 @@ def main():
                     print(" OK")
                 last_fault_check = time.time()
 
-            # Sync target
-            print(f"[{i+1}] Syncing...", end='', flush=True)
-            if not sync_target(ser):
-                print(" FAIL", flush=True)
-                results['SYNC_FAIL'] += 1
-                continue
-            print(" OK, testing...", end='', flush=True)
+            # Sync target - GPIO mode arms before reset, UART mode after
+            print(f"[{i+1}] ", end='', flush=True)
 
-            # Test glitch
-            uue_file = None if (args.test_only or args.no_save) else f"crp3_flash_{timestamp}.uue"
-            result = test_glitch(ser, output_file=uue_file, voltage=args.voltage,
-                               test_only=args.test_only, no_save=args.no_save)
+            if args.trigger in ('gpio', 'gpio-fall'):
+                # GPIO mode: ensure CS armed, then sync with glitch armed (fires on reset)
+                if not ensure_cs_ready(ser, args.voltage):
+                    print("[CS NOT READY] CRASH", flush=True)
+                    results['CRASH'] += 1
+                    continue
+                print("Glitch+Sync...", end='', flush=True)
+                if not sync_target_with_glitch(ser):
+                    print(" SYNC_FAIL", flush=True)
+                    results['SYNC_FAIL'] += 1
+                    continue
+                print(" OK, checking...", end='', flush=True)
+                # Check if CRP was bypassed (glitch already fired during boot)
+                result = test_crp_bypass(ser, test_only=args.test_only, no_save=args.no_save)
+            else:
+                # UART mode: sync first, then glitch on READ command
+                print("Syncing...", end='', flush=True)
+                if not sync_target(ser):
+                    print(" FAIL", flush=True)
+                    results['SYNC_FAIL'] += 1
+                    continue
+                print(" OK, testing...", end='', flush=True)
+                # Test glitch
+                uue_file = None if (args.test_only or args.no_save) else f"crp3_flash_{timestamp}.uue"
+                result = test_glitch(ser, output_file=uue_file, voltage=args.voltage,
+                                   test_only=args.test_only, no_save=args.no_save)
+
             print(f" {result}", flush=True)
             results[result] = results.get(result, 0) + 1
 
