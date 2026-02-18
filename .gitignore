@@ -36,3 +36,4 @@ node_modules/
 *.log
 *.csv
 *.uue
+.claude/settings.local.json

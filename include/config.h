@@ -11,7 +11,6 @@
 #define CHIPSHOT_UART_TX_PIN 0
 #define CHIPSHOT_UART_RX_PIN 1
 #define CHIPSHOT_UART_BAUD 115200
-#define CHIPSHOT_TRIGGER_PIN 7  // Hardware trigger output to ChipSHOUTER
 
 // Reserved GPIO Pins
 // GP0/GP1 used for ChipSHOUTER UART0

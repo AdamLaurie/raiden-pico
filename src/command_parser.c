@@ -4,6 +4,8 @@
 #include "target_uart.h"
 #include "grbl.h"
 #include "stm32_pwner.h"
+#include "swd.h"
+#include "jtag.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/pio.h"
@@ -17,7 +19,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#define MAX_CMD_LENGTH 256
+#define MAX_CMD_LENGTH 600
 #define MAX_ERROR_LENGTH 256
 
 // Command parsing buffer
@@ -44,9 +46,9 @@ static void send_multiline_response(const char* response) {
 }
 
 void command_parser_init(void) {
-    // Allocate buffers for command parts
+    // Allocate buffers for command parts (600 bytes to allow 256-byte hex payloads)
     for (int i = 0; i < MAX_CMD_PARTS; i++) {
-        part_buffers[i] = malloc(64);
+        part_buffers[i] = malloc(600);
     }
 }
 
@@ -70,9 +72,9 @@ bool command_parser_parse(const char *cmd, cmd_parts_t *parts) {
             *p = toupper(*p);
         }
 
-        // Store in part buffer
-        strncpy(part_buffers[parts->count], token, 63);
-        part_buffers[parts->count][63] = '\0';
+        // Store in part buffer (599 chars max to leave room for null)
+        strncpy(part_buffers[parts->count], token, 599);
+        part_buffers[parts->count][599] = '\0';
         parts->parts[parts->count] = part_buffers[parts->count];
         parts->count++;
 
@@ -158,9 +160,9 @@ void command_parser_execute(cmd_parts_t *parts) {
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
-        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32"
+        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32", "SWD", "JTAG"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 17, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 19, "command")) {
         goto api_response;
     }
 
@@ -194,6 +196,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[0], "STM32") == 0) {
             const char *stm32_subcmds[] = {"INIT", "ATTACK", "BOOT0", "STATUS", "ABORT"};
             if (!match_and_replace(&parts->parts[1], stm32_subcmds, 5, "STM32 sub-command")) {
+                goto api_response;
+            }
+        } else if (strcmp(parts->parts[0], "SWD") == 0) {
+            const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "INIT", "DEINIT"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 5, "SWD sub-command")) {
+                goto api_response;
+            }
+        } else if (strcmp(parts->parts[0], "JTAG") == 0) {
+            const char *jtag_subcmds[] = {"INIT", "DEINIT", "RESET", "IDCODE", "SCAN", "IR", "DR"};
+            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 7, "JTAG sub-command")) {
                 goto api_response;
             }
         }
@@ -321,6 +333,23 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("STM32 BOOT0 [pin]      - Get/set BOOT0 control pin (default GP3)\r\n");
         uart_cli_send("STM32 STATUS           - Show attack state and bytes received\r\n");
         uart_cli_send("STM32 ABORT            - Abort current attack operation\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== SWD Debug Interface (GP17=SWCLK, GP18=SWDIO) ==\r\n");
+        uart_cli_send("SWD IDCODE             - Read target DPIDR (connect + identify)\r\n");
+        uart_cli_send("SWD CONNECT            - Connect to target (line reset + JTAG-to-SWD)\r\n");
+        uart_cli_send("SWD READ DP <addr>     - Read Debug Port register\r\n");
+        uart_cli_send("SWD READ AP <ap> <addr> - Read Access Port register\r\n");
+        uart_cli_send("SWD READ MEM <addr> [count] - Read target memory\r\n");
+        uart_cli_send("SWD WRITE DP <addr> <value> - Write Debug Port register\r\n");
+        uart_cli_send("SWD WRITE AP <ap> <addr> <value> - Write Access Port register\r\n");
+        uart_cli_send("SWD WRITE MEM <addr> <value> - Write target memory\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== JTAG Debug Interface (TCK=17, TMS=18, TDI=19, TDO=20, RTCK=21, TRST=15) ==\r\n");
+        uart_cli_send("JTAG RESET             - Reset TAP state machine\r\n");
+        uart_cli_send("JTAG IDCODE            - Read device IDCODE\r\n");
+        uart_cli_send("JTAG SCAN              - Scan chain for devices\r\n");
+        uart_cli_send("JTAG IR <value> [bits] - Shift instruction register (default 4 bits)\r\n");
+        uart_cli_send("JTAG DR <value> [bits] - Shift data register (default 32 bits)\r\n");
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
@@ -655,6 +684,14 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== STM32 Attack ==\r\n");
         uart_cli_printf("GP%u - BOOT0 Control\r\n", stm32_pwner_get_boot0_pin());
+        uart_cli_send("\r\n");
+        uart_cli_send("== Debug Interface ==\r\n");
+        uart_cli_send("GP15 - TRST (shared with Target Reset)\r\n");
+        uart_cli_send("GP17 - TCK/SWCLK\r\n");
+        uart_cli_send("GP18 - TMS/SWDIO\r\n");
+        uart_cli_send("GP19 - TDI\r\n");
+        uart_cli_send("GP20 - TDO\r\n");
+        uart_cli_send("GP21 - RTCK (optional, for adaptive clocking)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Platform Control ==\r\n");
         uart_cli_send("GP6  - HV Enable (default, configurable)\r\n");
@@ -1413,6 +1450,224 @@ void command_parser_execute(cmd_parts_t *parts) {
             stm32_pwner_abort();
         } else {
             api_error("ERROR: Unknown STM32 command\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "SWD") == 0) {
+        // SWD debug interface commands
+        if (parts->count < 2) {
+            uart_cli_send("ERROR: Usage: SWD <IDCODE|CONNECT|READ|WRITE>\r\n");
+            uart_cli_send("  SWD IDCODE               - Read target DPIDR\r\n");
+            uart_cli_send("  SWD CONNECT              - Connect to target (line reset + JTAG-to-SWD)\r\n");
+            uart_cli_send("  SWD READ DP <addr>       - Read Debug Port register\r\n");
+            uart_cli_send("  SWD READ AP <addr>       - Read Access Port register\r\n");
+            uart_cli_send("  SWD READ MEM <addr> [n]  - Read n words from memory (default 1)\r\n");
+            uart_cli_send("  SWD WRITE DP <addr> <val>- Write Debug Port register\r\n");
+            uart_cli_send("  SWD WRITE AP <addr> <val>- Write Access Port register\r\n");
+            uart_cli_send("  SWD WRITE MEM <addr> <val> - Write word to memory\r\n");
+            goto api_response;
+        }
+
+        if (strcmp(parts->parts[1], "IDCODE") == 0) {
+            uint32_t dpidr = swd_identify();
+            if (dpidr != 0) {
+                uart_cli_printf("OK: DPIDR = 0x%08X\r\n", dpidr);
+                // Decode DPIDR fields (ARM ADIv5)
+                uint8_t revision = (dpidr >> 28) & 0xF;
+                uint8_t partno = (dpidr >> 20) & 0xFF;
+                uint8_t min = (dpidr >> 16) & 0x1;
+                uint8_t version = (dpidr >> 12) & 0xF;
+                uint16_t designer = ((dpidr >> 1) & 0x7FF);
+                uart_cli_printf("  Revision: %u, PartNo: 0x%02X, Version: %u\r\n",
+                               revision, partno, version);
+                uart_cli_printf("  Designer: 0x%03X%s\r\n", designer,
+                               designer == 0x23B ? " (ARM)" : "");
+            } else {
+                api_error("ERROR: SWD identify failed (no response)\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "CONNECT") == 0) {
+            if (swd_connect()) {
+                uint32_t dpidr;
+                swd_read_dp(DP_DPIDR, &dpidr);
+                uart_cli_printf("OK: Connected, DPIDR=0x%08X\r\n", dpidr);
+            } else {
+                api_error("ERROR: SWD connect failed (check target power and wiring)\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "READ") == 0) {
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: SWD READ <DP|AP|MEM> <addr> [count]\r\n");
+                goto api_response;
+            }
+
+            uint32_t addr = strtoul(parts->parts[3], NULL, 0);
+            uint32_t value;
+
+            if (strcmp(parts->parts[2], "DP") == 0) {
+                if (swd_read_dp(addr & 0xC, &value)) {
+                    uart_cli_printf("OK: DP[0x%X] = 0x%08X\r\n", addr & 0xC, value);
+                } else {
+                    api_error_printf("ERROR: DP read failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else if (strcmp(parts->parts[2], "AP") == 0) {
+                if (swd_read_ap(0, addr, &value)) {
+                    uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
+                } else {
+                    api_error_printf("ERROR: AP read failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else if (strcmp(parts->parts[2], "MEM") == 0) {
+                uint32_t count = 1;
+                if (parts->count >= 5) {
+                    count = strtoul(parts->parts[4], NULL, 0);
+                    if (count > 64) count = 64;  // Limit for safety
+                }
+                uint32_t data[64];
+                uint32_t read = swd_read_mem(addr, data, count);
+                if (read > 0) {
+                    uart_cli_printf("OK: Read %u words from 0x%08X:\r\n", read, addr);
+                    for (uint32_t i = 0; i < read; i++) {
+                        uart_cli_printf("  0x%08X: 0x%08X\r\n", addr + i*4, data[i]);
+                    }
+                } else {
+                    api_error_printf("ERROR: Memory read failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else {
+                api_error("ERROR: Unknown read target. Use DP, AP, or MEM\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "WRITE") == 0) {
+            if (parts->count < 5) {
+                api_error("ERROR: Usage: SWD WRITE <DP|AP|MEM> <addr> <value>\r\n");
+                goto api_response;
+            }
+
+            uint32_t addr = strtoul(parts->parts[3], NULL, 0);
+            uint32_t value = strtoul(parts->parts[4], NULL, 0);
+
+            if (strcmp(parts->parts[2], "DP") == 0) {
+                if (swd_write_dp(addr & 0xC, value)) {
+                    uart_cli_printf("OK: DP[0x%X] = 0x%08X\r\n", addr & 0xC, value);
+                } else {
+                    api_error_printf("ERROR: DP write failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else if (strcmp(parts->parts[2], "AP") == 0) {
+                if (swd_write_ap(0, addr, value)) {
+                    uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
+                } else {
+                    api_error_printf("ERROR: AP write failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else if (strcmp(parts->parts[2], "MEM") == 0) {
+                uint32_t written = swd_write_mem(addr, &value, 1);
+                if (written > 0) {
+                    uart_cli_printf("OK: Wrote 0x%08X to 0x%08X\r\n", value, addr);
+                } else {
+                    api_error_printf("ERROR: Memory write failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
+
+            } else {
+                api_error("ERROR: Unknown write target. Use DP, AP, or MEM\r\n");
+            }
+
+        } else {
+            api_error("ERROR: Unknown SWD command\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "JTAG") == 0) {
+        // JTAG debug interface commands
+        if (parts->count < 2) {
+            uart_cli_send("ERROR: Usage: JTAG <RESET|IDCODE|SCAN|IR|DR|TEST>\r\n");
+            uart_cli_send("  JTAG RESET             - Reset TAP state machine\r\n");
+            uart_cli_send("  JTAG IDCODE            - Read device IDCODE\r\n");
+            uart_cli_send("  JTAG SCAN              - Scan chain for devices\r\n");
+            uart_cli_send("  JTAG IR <value> [bits] - Shift IR (default 4 bits)\r\n");
+            uart_cli_send("  JTAG DR <value> [bits] - Shift DR (default 32 bits)\r\n");
+            uart_cli_send("  JTAG TEST              - Test pin connections and RTCK\r\n");
+            goto api_response;
+        }
+
+        if (strcmp(parts->parts[1], "RESET") == 0) {
+            jtag_reset();
+            uart_cli_send("OK: TAP reset to Test-Logic-Reset state\r\n");
+
+        } else if (strcmp(parts->parts[1], "TEST") == 0) {
+            // Debug: test JTAG connection
+            uart_cli_send("JTAG pins: TRST=GP15, TCK=GP17, TMS=GP18, TDI=GP19, TDO=GP20, RTCK=GP21\r\n");
+            uart_cli_printf("Adaptive clocking: %s\r\n",
+                           jtag_rtck_available() ? "enabled" : "disabled");
+            uart_cli_printf("Current pin states: TDO=%d RTCK=%d\r\n",
+                           gpio_get(JTAG_TDO_PIN), gpio_get(JTAG_RTCK_PIN));
+
+            // Use the actual jtag functions to test
+            uart_cli_send("Testing IR shift (4 bits, sending IDCODE=0xE)...\r\n");
+            uint32_t ir_out = jtag_ir_shift(0xE, 4);  // IDCODE instruction
+            uart_cli_printf("IR out: 0x%X\r\n", ir_out);
+
+            uart_cli_send("Testing DR shift (32 bits, sending 0)...\r\n");
+            uint32_t dr_out = jtag_dr_shift(0, 32);
+            uart_cli_printf("DR out: 0x%08X\r\n", dr_out);
+            uart_cli_send("OK\r\n");
+
+        } else if (strcmp(parts->parts[1], "IDCODE") == 0) {
+            uint32_t idcode = jtag_read_idcode();
+            if (idcode != 0 && idcode != 0xFFFFFFFF) {
+                uart_cli_printf("OK: IDCODE = 0x%08X\r\n", idcode);
+                // Decode IDCODE fields
+                uint8_t version = (idcode >> 28) & 0xF;
+                uint16_t part = (idcode >> 12) & 0xFFFF;
+                uint16_t manuf = (idcode >> 1) & 0x7FF;
+                uart_cli_printf("  Version: %u, Part: 0x%04X, Manufacturer: 0x%03X\r\n",
+                               version, part, manuf);
+            } else {
+                api_error_printf("ERROR: No IDCODE (got 0x%08X)\r\n", idcode);
+            }
+
+        } else if (strcmp(parts->parts[1], "SCAN") == 0) {
+            uint32_t idcodes[8];
+            uint8_t count = jtag_scan_chain(idcodes, 8);
+            if (count > 0) {
+                uart_cli_printf("OK: Found %u device(s):\r\n", count);
+                for (uint8_t i = 0; i < count; i++) {
+                    uart_cli_printf("  [%u] IDCODE = 0x%08X\r\n", i, idcodes[i]);
+                }
+            } else {
+                api_error("ERROR: No devices found in JTAG chain\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "IR") == 0) {
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: JTAG IR <value> [bits]\r\n");
+                goto api_response;
+            }
+            uint32_t value = strtoul(parts->parts[2], NULL, 0);
+            uint8_t bits = 4;  // Default for ARM7
+            if (parts->count >= 4)
+                bits = atoi(parts->parts[3]);
+            if (bits > 32) bits = 32;
+
+            uint32_t result = jtag_ir_shift(value, bits);
+            uart_cli_printf("OK: IR shift: in=0x%X, out=0x%X (%u bits)\r\n", value, result, bits);
+
+        } else if (strcmp(parts->parts[1], "DR") == 0) {
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: JTAG DR <value> [bits]\r\n");
+                goto api_response;
+            }
+            uint32_t value = strtoul(parts->parts[2], NULL, 0);
+            uint8_t bits = 32;  // Default
+            if (parts->count >= 4)
+                bits = atoi(parts->parts[3]);
+            if (bits > 32) bits = 32;
+
+            uint32_t result = jtag_dr_shift(value, bits);
+            uart_cli_printf("OK: DR shift: in=0x%08X, out=0x%08X (%u bits)\r\n", value, result, bits);
+
+        } else {
+            api_error("ERROR: Unknown JTAG command\r\n");
         }
 
     } else if (strcmp(parts->parts[0], "ERROR") == 0) {
