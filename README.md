@@ -39,6 +39,9 @@ The inspiration for the project came from discussions here: [Prompt||GTFO](https
 # Set Pico SDK path
 export PICO_SDK_PATH=/path/to/pico-sdk
 
+# Ensure pico-sdk submodules are initialized
+cd $PICO_SDK_PATH && git submodule update --init --recursive && cd -
+
 # Build
 ./build.sh
 
@@ -491,6 +494,17 @@ Check the following:
 2. Check baud rate (should be 115200)
 3. Use `CS RESET` to reinitialize
 4. Check with `CS STATUS`
+
+### Serial device doesn't appear after flashing
+
+If `/dev/ttyACM0` (or similar) doesn't appear after flashing, the pico-sdk may not have been installed correctly. This typically happens when git submodules weren't initialized after cloning:
+
+```bash
+cd /path/to/pico-sdk
+git submodule update --init --recursive
+```
+
+Then rebuild and reflash the firmware.
 
 ## Technical Details
 
