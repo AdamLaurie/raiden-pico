@@ -179,8 +179,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
-            const char *target_subcmds[] = {"LPC", "STM32", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 9, "TARGET sub-command")) {
+            const char *target_subcmds[] = {"LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
+                                              "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 12, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
@@ -199,8 +200,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
-            const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "INIT", "DEINIT"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 5, "SWD sub-command")) {
+            const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "IDCODE", "DETECT",
+                                          "HALT", "RESUME", "REGS", "DUMP", "RDP", "OPT", "FLASH", "TEST"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 13, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -296,7 +298,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("PLATFORM VPIN <pin>    - Set voltage control pin\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("TARGET <LPC|STM32>     - Set target type\r\n");
+        uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE] [ms] - Control/show target power on GP10\r\n");
@@ -451,8 +453,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         const char* target_type_str = "NONE";
         if (target_type == TARGET_LPC) {
             target_type_str = "LPC";
-        } else if (target_type == TARGET_STM32) {
-            target_type_str = "STM32";
+        } else if (target_is_stm32(target_type)) {
+            const stm32_target_info_t *info = stm32_get_target_info(target_type);
+            target_type_str = info ? info->name : "STM32";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
         uart_cli_printf("Power (GP10): %s\r\n", target_power_get_state() ? "ON" : "OFF");
@@ -767,16 +770,25 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|STM32|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
             goto api_response;
         }
 
         if (strcmp(parts->parts[1], "LPC") == 0) {
             target_set_type(TARGET_LPC);
             uart_cli_send("OK: Target type set to LPC (NXP ISP protocol)\r\n");
-        } else if (strcmp(parts->parts[1], "STM32") == 0) {
-            target_set_type(TARGET_STM32);
-            uart_cli_send("OK: Target type set to STM32\r\n");
+        } else if (strcmp(parts->parts[1], "STM32F1") == 0) {
+            target_set_type(TARGET_STM32F1);
+            uart_cli_send("OK: Target type set to STM32F1 (Cortex-M3, 128KB flash)\r\n");
+        } else if (strcmp(parts->parts[1], "STM32F3") == 0) {
+            target_set_type(TARGET_STM32F3);
+            uart_cli_send("OK: Target type set to STM32F3 (Cortex-M4, 64KB flash)\r\n");
+        } else if (strcmp(parts->parts[1], "STM32F4") == 0) {
+            target_set_type(TARGET_STM32F4);
+            uart_cli_send("OK: Target type set to STM32F4 (Cortex-M4, 512KB flash)\r\n");
+        } else if (strcmp(parts->parts[1], "STM32L4") == 0) {
+            target_set_type(TARGET_STM32L4);
+            uart_cli_send("OK: Target type set to STM32L4 (Cortex-M4, 256KB flash)\r\n");
         } else if (strcmp(parts->parts[1], "BOOTLOADER") == 0) {
             uint32_t baud = 115200;      // Default baud
             uint32_t crystal_khz = 12000; // Default 12MHz crystal
@@ -810,7 +822,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
 
             // For STM32, set BOOT0 HIGH before reset
-            bool is_stm32 = (target_get_type() == TARGET_STM32);
+            bool is_stm32 = target_is_stm32(target_get_type());
             if (is_stm32) {
                 extern void stm32_pwner_set_boot0(bool high);
                 stm32_pwner_set_boot0(true);
@@ -1455,15 +1467,25 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "SWD") == 0) {
         // SWD debug interface commands
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: SWD <IDCODE|CONNECT|READ|WRITE>\r\n");
+            uart_cli_send("SWD commands:\r\n");
             uart_cli_send("  SWD IDCODE               - Read target DPIDR\r\n");
-            uart_cli_send("  SWD CONNECT              - Connect to target (line reset + JTAG-to-SWD)\r\n");
+            uart_cli_send("  SWD CONNECT              - Connect (line reset + JTAG-to-SWD)\r\n");
+            uart_cli_send("  SWD DETECT               - Identify chip (CPUID + debug ID)\r\n");
+            uart_cli_send("  SWD HALT                 - Halt target core\r\n");
+            uart_cli_send("  SWD RESUME               - Resume target core\r\n");
+            uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
             uart_cli_send("  SWD READ DP <addr>       - Read Debug Port register\r\n");
             uart_cli_send("  SWD READ AP <addr>       - Read Access Port register\r\n");
-            uart_cli_send("  SWD READ MEM <addr> [n]  - Read n words from memory (default 1)\r\n");
-            uart_cli_send("  SWD WRITE DP <addr> <val>- Write Debug Port register\r\n");
-            uart_cli_send("  SWD WRITE AP <addr> <val>- Write Access Port register\r\n");
-            uart_cli_send("  SWD WRITE MEM <addr> <val> - Write word to memory\r\n");
+            uart_cli_send("  SWD READ MEM <addr> [n]  - Read n words (default 1, max 256)\r\n");
+            uart_cli_send("  SWD WRITE DP <addr> <val>\r\n");
+            uart_cli_send("  SWD WRITE AP <addr> <val>\r\n");
+            uart_cli_send("  SWD WRITE MEM <addr> <val>\r\n");
+            uart_cli_send("  SWD DUMP <addr> <bytes>  - Hex dump memory region\r\n");
+            uart_cli_send("  SWD RDP                  - Read RDP level (needs TARGET set)\r\n");
+            uart_cli_send("  SWD RDP SET <0|1>        - Set RDP level (0 = mass erase!)\r\n");
+            uart_cli_send("  SWD OPT                  - Read option bytes\r\n");
+            uart_cli_send("  SWD FLASH ERASE <page>   - Erase flash page\r\n");
+            uart_cli_send("  SWD FLASH TEST           - Write/verify test pattern\r\n");
             goto api_response;
         }
 
@@ -1471,10 +1493,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uint32_t dpidr = swd_identify();
             if (dpidr != 0) {
                 uart_cli_printf("OK: DPIDR = 0x%08X\r\n", dpidr);
-                // Decode DPIDR fields (ARM ADIv5)
                 uint8_t revision = (dpidr >> 28) & 0xF;
                 uint8_t partno = (dpidr >> 20) & 0xFF;
-                uint8_t min = (dpidr >> 16) & 0x1;
                 uint8_t version = (dpidr >> 12) & 0xF;
                 uint16_t designer = ((dpidr >> 1) & 0x7FF);
                 uart_cli_printf("  Revision: %u, PartNo: 0x%02X, Version: %u\r\n",
@@ -1494,13 +1514,106 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: SWD connect failed (check target power and wiring)\r\n");
             }
 
+        } else if (strcmp(parts->parts[1], "DETECT") == 0) {
+            uint32_t dpidr = swd_identify();
+            if (dpidr == 0) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("DPIDR:    0x%08X\r\n", dpidr);
+
+            uint32_t cpuid = 0, dbg_id = 0;
+            if (swd_detect(&cpuid, &dbg_id)) {
+                uart_cli_printf("CPUID:    0x%08X\r\n", cpuid);
+                uint8_t impl = (cpuid >> 24) & 0xFF;
+                uint8_t var = (cpuid >> 20) & 0xF;
+                uint16_t part = (cpuid >> 4) & 0xFFF;
+                uint8_t rev = cpuid & 0xF;
+                uart_cli_printf("  Implementer: 0x%02X%s\r\n", impl,
+                               impl == 0x41 ? " (ARM)" : "");
+                const char *core = "Unknown";
+                if (part == 0xC23) core = "Cortex-M3";
+                else if (part == 0xC24) core = "Cortex-M4";
+                else if (part == 0xC27) core = "Cortex-M7";
+                else if (part == 0xC60) core = "Cortex-M0+";
+                uart_cli_printf("  Core: %s r%up%u\r\n", core, var, rev);
+
+                uart_cli_printf("DBG_ID:   0x%08X\r\n", dbg_id);
+                uint16_t dev_id = dbg_id & 0xFFF;
+                uint16_t rev_id = (dbg_id >> 16) & 0xFFFF;
+                uart_cli_printf("  DEV_ID: 0x%03X, REV_ID: 0x%04X\r\n", dev_id, rev_id);
+
+                // Try to identify known STM32 devices
+                const char *chip = "Unknown";
+                switch (dev_id) {
+                    case 0x410: chip = "STM32F1 Medium-density"; break;
+                    case 0x412: chip = "STM32F1 Low-density"; break;
+                    case 0x414: chip = "STM32F1 High-density"; break;
+                    case 0x430: chip = "STM32F1 XL-density"; break;
+                    case 0x438: chip = "STM32F334"; break;
+                    case 0x413: chip = "STM32F405/F407/F415/F417"; break;
+                    case 0x419: chip = "STM32F42x/F43x"; break;
+                    case 0x421: chip = "STM32F446"; break;
+                    case 0x423: chip = "STM32F401xB/C"; break;
+                    case 0x433: chip = "STM32F401xD/E"; break;
+                    case 0x415: chip = "STM32L47x/L48x"; break;
+                    case 0x435: chip = "STM32L43x/L44x"; break;
+                    case 0x462: chip = "STM32L45x/L46x"; break;
+                    case 0x464: chip = "STM32L41x/L42x"; break;
+                    case 0x461: chip = "STM32L496/L4A6"; break;
+                }
+                uart_cli_printf("  Chip: %s\r\n", chip);
+            } else {
+                api_error("ERROR: Could not read CPUID/debug registers\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "HALT") == 0) {
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            if (swd_halt()) {
+                uart_cli_send("OK: Target halted\r\n");
+            } else {
+                api_error("ERROR: Halt failed\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "RESUME") == 0) {
+            if (swd_resume()) {
+                uart_cli_send("OK: Target resumed\r\n");
+            } else {
+                api_error("ERROR: Resume failed\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "REGS") == 0) {
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            // Must halt to read registers
+            swd_halt();
+            sleep_ms(10);
+            const char *reg_names[] = {
+                "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
+                "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc",
+                "xPSR", "MSP", "PSP"
+            };
+            for (int i = 0; i <= 18; i++) {
+                uint32_t val;
+                if (swd_read_core_reg(i, &val)) {
+                    uart_cli_printf("  %-5s = 0x%08X\r\n", reg_names[i], val);
+                } else {
+                    uart_cli_printf("  %-5s = <read failed>\r\n", reg_names[i]);
+                }
+            }
+
         } else if (strcmp(parts->parts[1], "READ") == 0) {
             if (parts->count < 4) {
                 api_error("ERROR: Usage: SWD READ <DP|AP|MEM> <addr> [count]\r\n");
                 goto api_response;
             }
 
-            uint32_t addr = strtoul(parts->parts[3], NULL, 0);
+            uint32_t addr = strtoul(parts->parts[3], NULL, 16);
             uint32_t value;
 
             if (strcmp(parts->parts[2], "DP") == 0) {
@@ -1521,9 +1634,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uint32_t count = 1;
                 if (parts->count >= 5) {
                     count = strtoul(parts->parts[4], NULL, 0);
-                    if (count > 64) count = 64;  // Limit for safety
+                    if (count > 256) count = 256;
                 }
-                uint32_t data[64];
+                uint32_t data[256];
                 uint32_t read = swd_read_mem(addr, data, count);
                 if (read > 0) {
                     uart_cli_printf("OK: Read %u words from 0x%08X:\r\n", read, addr);
@@ -1544,8 +1657,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
 
-            uint32_t addr = strtoul(parts->parts[3], NULL, 0);
-            uint32_t value = strtoul(parts->parts[4], NULL, 0);
+            uint32_t addr = strtoul(parts->parts[3], NULL, 16);
+            uint32_t value = strtoul(parts->parts[4], NULL, 16);
 
             if (strcmp(parts->parts[2], "DP") == 0) {
                 if (swd_write_dp(addr & 0xC, value)) {
@@ -1573,6 +1686,195 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: Unknown write target. Use DP, AP, or MEM\r\n");
             }
 
+        } else if (strcmp(parts->parts[1], "DUMP") == 0) {
+            // SWD DUMP <addr> <bytes>
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: SWD DUMP <addr> <bytes>\r\n");
+                goto api_response;
+            }
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            uint32_t addr = strtoul(parts->parts[2], NULL, 16);
+            uint32_t bytes = strtoul(parts->parts[3], NULL, 0);
+            if (bytes > 65536) bytes = 65536;  // 64KB max
+            uint32_t words = (bytes + 3) / 4;
+
+            uart_cli_printf("Dumping %u bytes from 0x%08X:\r\n", bytes, addr);
+            uint32_t buf[64];
+            for (uint32_t offset = 0; offset < words; offset += 64) {
+                uint32_t chunk = words - offset;
+                if (chunk > 64) chunk = 64;
+                uint32_t read = swd_read_mem(addr + offset * 4, buf, chunk);
+                if (read == 0) {
+                    api_error_printf("ERROR: Read failed at 0x%08X\r\n", addr + offset * 4);
+                    break;
+                }
+                // Print as hex dump (16 bytes per line)
+                uint8_t *p = (uint8_t *)buf;
+                for (uint32_t i = 0; i < read * 4 && (offset * 4 + i) < bytes; i += 16) {
+                    uint32_t line_addr = addr + offset * 4 + i;
+                    uart_cli_printf("%08X:", line_addr);
+                    uint32_t line_end = i + 16;
+                    if (offset * 4 + line_end > bytes) line_end = bytes - offset * 4;
+                    for (uint32_t j = i; j < i + 16 && (offset * 4 + j) < bytes; j++) {
+                        if (j < read * 4)
+                            uart_cli_printf(" %02X", p[j]);
+                        else
+                            uart_cli_send("   ");
+                    }
+                    uart_cli_send("  ");
+                    for (uint32_t j = i; j < i + 16 && (offset * 4 + j) < bytes; j++) {
+                        char c = (j < read * 4) ? p[j] : '.';
+                        if (c < 32 || c > 126) c = '.';
+                        uart_cli_printf("%c", c);
+                    }
+                    uart_cli_send("\r\n");
+                }
+            }
+            uart_cli_send("OK: Dump complete\r\n");
+
+        } else if (strcmp(parts->parts[1], "RDP") == 0) {
+            // SWD RDP [SET <0|1>]
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                api_error("ERROR: Set TARGET to an STM32 family first (e.g. TARGET STM32L4)\r\n");
+                goto api_response;
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+
+            if (parts->count >= 4 && strcmp(parts->parts[2], "SET") == 0) {
+                uint8_t level = atoi(parts->parts[3]);
+                if (level > 2) {
+                    api_error("ERROR: RDP level must be 0, 1, or 2\r\n");
+                    goto api_response;
+                }
+                if (level == 2) {
+                    api_error("ERROR: RDP Level 2 is PERMANENT and irreversible. Refusing.\r\n");
+                    goto api_response;
+                }
+                if (level == 0) {
+                    uart_cli_send("WARNING: Setting RDP to 0 triggers MASS ERASE of all flash!\r\n");
+                }
+                uart_cli_printf("Setting RDP to Level %u on %s...\r\n", level, info->name);
+                if (swd_stm32_set_rdp(info, level)) {
+                    uart_cli_printf("OK: RDP set to Level %u (power cycle target to apply)\r\n", level);
+                } else {
+                    api_error("ERROR: Failed to set RDP\r\n");
+                }
+            } else {
+                int rdp = swd_stm32_read_rdp(info);
+                if (rdp >= 0) {
+                    uart_cli_printf("OK: RDP Level %d on %s\r\n", rdp, info->name);
+                } else {
+                    api_error("ERROR: Could not read RDP status\r\n");
+                }
+            }
+
+        } else if (strcmp(parts->parts[1], "OPT") == 0) {
+            // SWD OPT - read option bytes
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                api_error("ERROR: Set TARGET to an STM32 family first\r\n");
+                goto api_response;
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            if (!swd_stm32_read_options(info)) {
+                api_error("ERROR: Could not read option bytes\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "FLASH") == 0) {
+            // SWD FLASH <ERASE|TEST>
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                api_error("ERROR: Set TARGET to an STM32 family first\r\n");
+                goto api_response;
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: SWD FLASH <ERASE <page>|TEST>\r\n");
+                goto api_response;
+            }
+
+            if (strcmp(parts->parts[2], "ERASE") == 0) {
+                if (parts->count < 4) {
+                    api_error("ERROR: Usage: SWD FLASH ERASE <page>\r\n");
+                    goto api_response;
+                }
+                uint32_t page = strtoul(parts->parts[3], NULL, 0);
+                uart_cli_printf("Erasing page %u on %s...\r\n", page, info->name);
+                if (swd_stm32_flash_erase_page(info, page)) {
+                    uart_cli_printf("OK: Page %u erased\r\n", page);
+                } else {
+                    api_error("ERROR: Page erase failed\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "TEST") == 0) {
+                // Write test pattern to page 1, then read back
+                uint32_t page = 1;
+                uint32_t test_addr = 0x08000000 + page * info->page_size;
+
+                uart_cli_printf("Erasing page %u @ 0x%08X...\r\n", page, test_addr);
+                swd_halt();
+                if (!swd_stm32_flash_erase_page(info, page)) {
+                    api_error("ERROR: Erase failed\r\n");
+                    goto api_response;
+                }
+
+                // Build test pattern
+                uint8_t pattern[64];
+                for (int i = 0; i < 64; i += 4) {
+                    uint32_t val = 0xAA550000 | (i / 4);
+                    pattern[i] = val & 0xFF;
+                    pattern[i+1] = (val >> 8) & 0xFF;
+                    pattern[i+2] = (val >> 16) & 0xFF;
+                    pattern[i+3] = (val >> 24) & 0xFF;
+                }
+
+                uart_cli_printf("Writing 64 bytes to 0x%08X...\r\n", test_addr);
+                uint32_t written = swd_stm32_flash_write(info, test_addr, pattern, 64);
+                uart_cli_printf("Wrote %u bytes\r\n", written);
+
+                // Read back and verify
+                uint32_t readback[16];
+                uint32_t read = swd_read_mem(test_addr, readback, 16);
+                if (read == 16) {
+                    bool ok = true;
+                    for (int i = 0; i < 16; i++) {
+                        uint32_t expected = 0xAA550000 | i;
+                        if (readback[i] != expected) {
+                            uart_cli_printf("MISMATCH @ +0x%02X: got 0x%08X expected 0x%08X\r\n",
+                                           i * 4, readback[i], expected);
+                            ok = false;
+                        }
+                    }
+                    if (ok)
+                        uart_cli_send("OK: Test pattern verified\r\n");
+                } else {
+                    api_error("ERROR: Readback failed\r\n");
+                }
+            } else {
+                api_error("ERROR: Unknown FLASH subcommand. Use ERASE or TEST\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "TEST") == 0) {
+            swd_bus_test();
         } else {
             api_error("ERROR: Unknown SWD command\r\n");
         }

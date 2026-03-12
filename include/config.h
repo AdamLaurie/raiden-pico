@@ -47,8 +47,44 @@ typedef enum {
 typedef enum {
     TARGET_NONE = 0,
     TARGET_LPC,
-    TARGET_STM32
+    TARGET_STM32F1,     // STM32F103 etc (Cortex-M3)
+    TARGET_STM32F3,     // STM32F334 etc (Cortex-M4)
+    TARGET_STM32F4,     // STM32F401/F429 etc (Cortex-M4)
+    TARGET_STM32L4,     // STM32L451/L452 etc (Cortex-M4)
 } target_type_t;
+
+// Helper to check if any STM32 family is selected
+static inline bool target_is_stm32(target_type_t t) {
+    return t >= TARGET_STM32F1 && t <= TARGET_STM32L4;
+}
+
+// STM32 flash controller register map (varies by family)
+typedef struct {
+    const char *name;           // e.g. "STM32L4"
+    uint32_t flash_base;        // Flash controller base
+    uint32_t flash_keyr;        // Flash key register
+    uint32_t flash_optkeyr;     // Option key register
+    uint32_t flash_sr;          // Status register
+    uint32_t flash_cr;          // Control register
+    uint32_t flash_optr;        // Option register (shadow)
+    uint32_t opt_base;          // Raw option byte base in flash
+    uint32_t flash_key1;        // Flash unlock key 1
+    uint32_t flash_key2;        // Flash unlock key 2
+    uint32_t opt_key1;          // Option byte unlock key 1
+    uint32_t opt_key2;          // Option byte unlock key 2
+    uint8_t  rdp_level0;        // RDP value for Level 0
+    uint8_t  rdp_level1;        // RDP value for Level 1
+    uint8_t  rdp_level2;        // RDP value for Level 2 (permanent)
+    uint32_t flash_size;        // Flash size in bytes
+    uint32_t page_size;         // Flash page/sector size
+    uint32_t sram_base;         // SRAM base address
+    uint32_t sram_size;         // SRAM size in bytes
+    uint32_t bootrom_base;      // System bootloader ROM base
+    uint32_t bootrom_size;      // Bootloader ROM size
+} stm32_target_info_t;
+
+// Get target info for the currently selected STM32 family
+const stm32_target_info_t *stm32_get_target_info(target_type_t type);
 
 // System State Flags
 typedef struct {

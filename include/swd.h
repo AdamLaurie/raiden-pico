@@ -81,4 +81,66 @@ bool swd_clear_errors(void);
 // Returns DPIDR on success, 0 on failure
 uint32_t swd_identify(void);
 
+// --- Cortex-M debug registers ---
+#define DHCSR       0xE000EDF0  // Debug Halting Control/Status
+#define DCRSR       0xE000EDF4  // Debug Core Register Selector
+#define DCRDR       0xE000EDF8  // Debug Core Register Data
+#define DEMCR       0xE000EDFC  // Debug Exception/Monitor Control
+#define CPUID       0xE000ED00  // CPUID Base Register
+#define AIRCR       0xE000ED0C  // Application Interrupt/Reset Control
+#define CFSR        0xE000ED28  // Configurable Fault Status
+#define HFSR        0xE000ED2C  // HardFault Status
+
+// DHCSR key for writes
+#define DBGKEY      0xA05F0000
+
+// Cortex-M debug ID register (STM32-specific)
+#define DBG_IDCODE  0xE0042000
+
+// Bus connectivity test - toggles pins and reads back
+void swd_bus_test(void);
+
+// Halt target core
+bool swd_halt(void);
+
+// Resume target core
+bool swd_resume(void);
+
+// Read a CPU register (r0-r15, xPSR etc) while halted
+// reg: 0-15 = r0-r15, 16 = xPSR, 17 = MSP, 18 = PSP
+bool swd_read_core_reg(uint8_t reg, uint32_t *value);
+
+// Detect target: read CPUID and STM32 debug ID code
+// Fills cpuid and dbg_idcode, returns true on success
+bool swd_detect(uint32_t *cpuid, uint32_t *dbg_idcode);
+
+// --- STM32 high-level operations (require target type set) ---
+
+#include "config.h"
+
+// Read RDP level from flash option register
+// Returns 0, 1, or 2 for the level, or -1 on error
+int swd_stm32_read_rdp(const stm32_target_info_t *info);
+
+// Read option bytes (prints all relevant option registers)
+bool swd_stm32_read_options(const stm32_target_info_t *info);
+
+// Set RDP level (0 = unprotect + mass erase, 1 = protect)
+// WARNING: Setting RDP to 0 triggers mass erase on most families
+bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level);
+
+// Unlock flash controller
+bool swd_stm32_flash_unlock(const stm32_target_info_t *info);
+
+// Erase a flash page (page number, not address)
+bool swd_stm32_flash_erase_page(const stm32_target_info_t *info, uint32_t page);
+
+// Write flash (must be erased first, handles family-specific write size)
+// Returns number of bytes written
+uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
+                                const uint8_t *data, uint32_t len);
+
+// Wait for flash BSY flag to clear
+bool swd_stm32_flash_wait(const stm32_target_info_t *info, uint32_t timeout_ms);
+
 #endif // SWD_H

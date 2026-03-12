@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.13)
 
 # Set board type before including SDK
-set(PICO_BOARD pico2_w CACHE STRING "Board type")
+set(PICO_BOARD pico2 CACHE STRING "Board type")
 
 # Pull in SDK (must be before project)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
@@ -26,6 +26,7 @@ add_executable(raiden_pico
     src/stm32_pwner.c
     src/swd.c
     src/jtag.c
+    src/stm32_target.c
 )
 
 # Include directories

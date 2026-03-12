@@ -4,7 +4,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define CLI_BUFFER_SIZE 256
+#define CLI_BUFFER_SIZE 600
 #define HISTORY_SIZE 10
 
 static char command_buffer[CLI_BUFFER_SIZE];

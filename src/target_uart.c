@@ -240,7 +240,10 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
             uart_cli_send("LPC ISP sync complete. Echo mode enabled.\r\n");
             break;
 
-        case TARGET_STM32: {
+        case TARGET_STM32F1:
+        case TARGET_STM32F3:
+        case TARGET_STM32F4:
+        case TARGET_STM32L4: {
             uart_cli_send("Entering STM32 bootloader mode...\r\n");
             uart_cli_send("Sending 0x7F for STM32 sync...\r\n");
             // Send 0x7F for STM32 bootloader sync
@@ -325,7 +328,7 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     uart_init(TARGET_UART_ID, baud);
 
     // Set UART format: STM32 bootloader requires EVEN parity, others use no parity
-    if (current_target_type == TARGET_STM32) {
+    if (target_is_stm32(current_target_type)) {
         uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_EVEN);
     } else {
         uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
