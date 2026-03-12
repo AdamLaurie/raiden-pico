@@ -13,6 +13,7 @@
 // SWD Pin Configuration
 #define SWD_SWCLK_PIN   17
 #define SWD_SWDIO_PIN   18
+#define SWD_NRST_PIN    15  // Target nRST (active low, active drive)
 
 // SWD ACK responses
 #define SWD_ACK_OK      0x1
@@ -99,6 +100,15 @@ uint32_t swd_identify(void);
 
 // Bus connectivity test - toggles pins and reads back
 void swd_bus_test(void);
+
+// Assert nRST (hold target in reset)
+void swd_nrst_assert(void);
+
+// Release nRST (let target run)
+void swd_nrst_release(void);
+
+// Pulse nRST low for given duration in ms, then release
+void swd_nrst_pulse(uint32_t ms);
 
 // Halt target core
 bool swd_halt(void);

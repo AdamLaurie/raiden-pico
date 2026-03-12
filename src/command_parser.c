@@ -201,8 +201,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "IDCODE", "DETECT",
-                                          "HALT", "RESUME", "REGS", "DUMP", "RDP", "OPT", "FLASH", "TEST"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 13, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "DUMP", "RDP", "OPT", "FLASH", "RESET", "TEST"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 14, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -1484,6 +1484,9 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD RDP                  - Read RDP level (needs TARGET set)\r\n");
             uart_cli_send("  SWD RDP SET <0|1>        - Set RDP level (0 = mass erase!)\r\n");
             uart_cli_send("  SWD OPT                  - Read option bytes\r\n");
+            uart_cli_send("  SWD RESET                - Pulse nRST (100ms)\r\n");
+            uart_cli_send("  SWD RESET HOLD           - Assert nRST (hold in reset)\r\n");
+            uart_cli_send("  SWD RESET RELEASE        - Release nRST\r\n");
             uart_cli_send("  SWD FLASH ERASE <page>   - Erase flash page\r\n");
             uart_cli_send("  SWD FLASH TEST           - Write/verify test pattern\r\n");
             goto api_response;
@@ -1871,6 +1874,23 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
             } else {
                 api_error("ERROR: Unknown FLASH subcommand. Use ERASE or TEST\r\n");
+            }
+
+        } else if (strcmp(parts->parts[1], "RESET") == 0) {
+            if (parts->count >= 3 && strcmp(parts->parts[2], "HOLD") == 0) {
+                swd_nrst_assert();
+                uart_cli_send("OK: nRST asserted (target held in reset)\r\n");
+            } else if (parts->count >= 3 && strcmp(parts->parts[2], "RELEASE") == 0) {
+                swd_nrst_release();
+                uart_cli_send("OK: nRST released\r\n");
+            } else {
+                uint32_t ms = 100;
+                if (parts->count >= 3)
+                    ms = strtoul(parts->parts[2], NULL, 0);
+                if (ms < 1) ms = 1;
+                if (ms > 10000) ms = 10000;
+                swd_nrst_pulse(ms);
+                uart_cli_printf("OK: nRST pulsed for %u ms\r\n", (unsigned)ms);
             }
 
         } else if (strcmp(parts->parts[1], "TEST") == 0) {

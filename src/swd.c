@@ -298,6 +298,24 @@ void swd_bus_test(void) {
     initialized = true;
 }
 
+void swd_nrst_assert(void) {
+    gpio_init(SWD_NRST_PIN);
+    gpio_set_dir(SWD_NRST_PIN, GPIO_OUT);
+    gpio_put(SWD_NRST_PIN, 0);
+}
+
+void swd_nrst_release(void) {
+    gpio_init(SWD_NRST_PIN);
+    gpio_set_dir(SWD_NRST_PIN, GPIO_IN);  // High-Z, target pull-up
+    gpio_disable_pulls(SWD_NRST_PIN);
+}
+
+void swd_nrst_pulse(uint32_t ms) {
+    swd_nrst_assert();
+    sleep_ms(ms);
+    swd_nrst_release();
+}
+
 bool swd_read_dp(uint8_t addr, uint32_t *value) {
     if (!initialized)
         return false;
