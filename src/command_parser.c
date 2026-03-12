@@ -200,9 +200,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
-            const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "IDCODE", "DETECT",
+            const char *swd_subcmds[] = {"CONNECT", "READ", "WRITE", "IDCODE",
                                           "HALT", "RESUME", "REGS", "DUMP", "RDP", "OPT", "FLASH", "RESET", "TEST"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 14, "SWD sub-command")) {
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 13, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -1469,9 +1469,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         // SWD debug interface commands
         if (parts->count < 2) {
             uart_cli_send("SWD commands:\r\n");
-            uart_cli_send("  SWD IDCODE               - Read target DPIDR\r\n");
             uart_cli_send("  SWD CONNECT              - Connect (line reset + JTAG-to-SWD)\r\n");
-            uart_cli_send("  SWD DETECT               - Identify chip (CPUID + debug ID)\r\n");
+            uart_cli_send("  SWD IDCODE               - Identify chip (DPIDR + CPUID + debug ID)\r\n");
             uart_cli_send("  SWD HALT                 - Halt target core\r\n");
             uart_cli_send("  SWD RESUME               - Resume target core\r\n");
             uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
@@ -1493,23 +1492,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             goto api_response;
         }
 
-        if (strcmp(parts->parts[1], "IDCODE") == 0) {
-            uint32_t dpidr = swd_identify();
-            if (dpidr != 0) {
-                uart_cli_printf("OK: DPIDR = 0x%08X\r\n", dpidr);
-                uint8_t revision = (dpidr >> 28) & 0xF;
-                uint8_t partno = (dpidr >> 20) & 0xFF;
-                uint8_t version = (dpidr >> 12) & 0xF;
-                uint16_t designer = ((dpidr >> 1) & 0x7FF);
-                uart_cli_printf("  Revision: %u, PartNo: 0x%02X, Version: %u\r\n",
-                               revision, partno, version);
-                uart_cli_printf("  Designer: 0x%03X%s\r\n", designer,
-                               designer == 0x23B ? " (ARM)" : "");
-            } else {
-                api_error("ERROR: SWD identify failed (no response)\r\n");
-            }
-
-        } else if (strcmp(parts->parts[1], "CONNECT") == 0) {
+        if (strcmp(parts->parts[1], "CONNECT") == 0) {
             if (swd_connect()) {
                 uint32_t dpidr;
                 swd_read_dp(DP_DPIDR, &dpidr);
@@ -1518,13 +1501,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: SWD connect failed (check target power and wiring)\r\n");
             }
 
-        } else if (strcmp(parts->parts[1], "DETECT") == 0) {
+        } else if (strcmp(parts->parts[1], "IDCODE") == 0) {
             uint32_t dpidr = swd_identify();
             if (dpidr == 0) {
                 api_error("ERROR: SWD connect failed\r\n");
                 goto api_response;
             }
             uart_cli_printf("DPIDR:    0x%08X\r\n", dpidr);
+            uint16_t designer = (dpidr >> 1) & 0x7FF;
+            uart_cli_printf("  Designer: 0x%03X%s, PartNo: 0x%02X, Rev: %u, Ver: %u\r\n",
+                           designer, designer == 0x23B ? " (ARM)" : "",
+                           (dpidr >> 20) & 0xFF, (dpidr >> 28) & 0xF, (dpidr >> 12) & 0xF);
 
             uint32_t cpuid = 0, dbg_id = 0;
             if (swd_detect(&cpuid, &dbg_id)) {
