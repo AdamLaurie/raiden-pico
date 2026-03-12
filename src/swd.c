@@ -642,35 +642,132 @@ int swd_stm32_read_rdp(const stm32_target_info_t *info) {
     return 1;
 }
 
+// Decode STM32L4 FLASH_OPTR register
+static void decode_l4_optr(uint32_t optr) {
+    uint8_t rdp = optr & 0xFF;
+    printf("  RDP        = 0x%02X (Level %s)\r\n", rdp,
+           rdp == 0xAA ? "0" : rdp == 0xCC ? "2 PERMANENT" : "1");
+
+    uint8_t bor = (optr >> 8) & 0x7;
+    const char *bor_str[] = {
+        "~1.7V", "~2.0V", "~2.2V", "~2.5V",
+        "~2.8V", "rsvd", "rsvd", "rsvd"
+    };
+    printf("  BOR_LEV    = %u (%s)\r\n", bor, bor_str[bor]);
+
+    printf("  nRST_STOP  = %u (%s)\r\n", (optr >> 12) & 1,
+           (optr >> 12) & 1 ? "no reset on Stop" : "reset on Stop");
+    printf("  nRST_STDBY = %u (%s)\r\n", (optr >> 13) & 1,
+           (optr >> 13) & 1 ? "no reset on Standby" : "reset on Standby");
+    printf("  nRST_SHDW  = %u (%s)\r\n", (optr >> 14) & 1,
+           (optr >> 14) & 1 ? "no reset on Shutdown" : "reset on Shutdown");
+    printf("  IWDG_SW    = %u (%s)\r\n", (optr >> 16) & 1,
+           (optr >> 16) & 1 ? "software IWDG" : "hardware IWDG");
+    printf("  IWDG_STOP  = %u (%s)\r\n", (optr >> 17) & 1,
+           (optr >> 17) & 1 ? "IWDG runs in Stop" : "IWDG frozen in Stop");
+    printf("  IWDG_STDBY = %u (%s)\r\n", (optr >> 18) & 1,
+           (optr >> 18) & 1 ? "IWDG runs in Standby" : "IWDG frozen in Standby");
+    printf("  WWDG_SW    = %u (%s)\r\n", (optr >> 19) & 1,
+           (optr >> 19) & 1 ? "software WWDG" : "hardware WWDG");
+    printf("  BFB2       = %u (%s)\r\n", (optr >> 20) & 1,
+           (optr >> 20) & 1 ? "boot from bank 2" : "boot from bank 1");
+    printf("  DUALBANK   = %u (%s)\r\n", (optr >> 21) & 1,
+           (optr >> 21) & 1 ? "dual-bank" : "single-bank");
+    printf("  nBOOT1     = %u\r\n", (optr >> 23) & 1);
+    printf("  SRAM2_PE   = %u (%s)\r\n", (optr >> 24) & 1,
+           (optr >> 24) & 1 ? "SRAM2 parity check enabled" : "SRAM2 parity disabled");
+    printf("  SRAM2_RST  = %u (%s)\r\n", (optr >> 25) & 1,
+           (optr >> 25) & 1 ? "SRAM2 not erased on reset" : "SRAM2 erased on reset");
+    printf("  nSWBOOT0   = %u (%s)\r\n", (optr >> 26) & 1,
+           (optr >> 26) & 1 ? "BOOT0 from pin" : "BOOT0 from nBOOT0 bit");
+    printf("  nBOOT0     = %u\r\n", (optr >> 27) & 1);
+}
+
+// Decode STM32F4 FLASH_OPTCR register
+static void decode_f4_optcr(uint32_t optcr) {
+    uint8_t rdp = (optcr >> 8) & 0xFF;
+    printf("  RDP        = 0x%02X (Level %s)\r\n", rdp,
+           rdp == 0xAA ? "0" : rdp == 0xCC ? "2 PERMANENT" : "1");
+
+    uint8_t bor = (optcr >> 2) & 0x3;
+    const char *bor_str[] = {"3 (~2.7V)", "2 (~2.4V)", "1 (~2.1V)", "0 (off)"};
+    printf("  BOR_LEV    = %u (%s)\r\n", bor, bor_str[bor]);
+
+    printf("  WDG_SW     = %u (%s)\r\n", (optcr >> 5) & 1,
+           (optcr >> 5) & 1 ? "software WDG" : "hardware WDG");
+    printf("  nRST_STOP  = %u\r\n", (optcr >> 6) & 1);
+    printf("  nRST_STDBY = %u\r\n", (optcr >> 7) & 1);
+
+    uint16_t nwrp = (optcr >> 16) & 0xFFF;
+    printf("  nWRP       = 0x%03X (%s)\r\n", nwrp,
+           nwrp == 0xFFF ? "no write protect" : "sectors protected");
+}
+
+// Decode STM32F1/F3 option bytes
+static void decode_f1_options(uint32_t obr, uint32_t raw_opt) {
+    uint8_t rdp = raw_opt & 0xFF;
+    printf("  RDP        = 0x%02X (Level %s)\r\n", rdp,
+           rdp == 0xA5 ? "0" : "1");
+    printf("  RDPRT      = %u\r\n", (obr >> 1) & 1);
+    printf("  WDG_SW     = %u (%s)\r\n", (obr >> 2) & 1,
+           (obr >> 2) & 1 ? "software WDG" : "hardware WDG");
+    printf("  nRST_STOP  = %u\r\n", (obr >> 3) & 1);
+    printf("  nRST_STDBY = %u\r\n", (obr >> 4) & 1);
+
+    uint8_t data0 = (raw_opt >> 16) & 0xFF;
+    uint8_t data1 = (raw_opt >> 24) & 0xFF;
+    printf("  Data0      = 0x%02X\r\n", data0);
+    printf("  Data1      = 0x%02X\r\n", data1);
+}
+
+// Decode WRP register (L4)
+static void decode_l4_wrp(const char *name, uint32_t val) {
+    uint8_t start = val & 0xFF;
+    uint8_t end = (val >> 16) & 0xFF;
+    if (start > end)
+        printf("  %s: disabled (start > end)\r\n", name);
+    else
+        printf("  %s: pages %u-%u protected\r\n", name, start, end);
+}
+
 bool swd_stm32_read_options(const stm32_target_info_t *info) {
-    // Read the shadow option register
     uint32_t optr;
     if (!mem_read32(info->flash_optr, &optr))
         return false;
-    printf("FLASH_OPTR (0x%08X) = 0x%08X\r\n", (unsigned)info->flash_optr, (unsigned)optr);
+    printf("FLASH_OPTR (0x%08X) = 0x%08X\r\n",
+           (unsigned)info->flash_optr, (unsigned)optr);
 
-    // Read raw option bytes if available
-    if (info->opt_base != info->flash_optr) {
-        uint32_t raw[4];
-        uint32_t count = swd_read_mem(info->opt_base, raw, 4);
-        if (count > 0) {
-            printf("Raw option bytes @ 0x%08X:\r\n", (unsigned)info->opt_base);
-            for (uint32_t i = 0; i < count; i++)
-                printf("  +0x%02X: 0x%08X\r\n", (unsigned)(i * 4), (unsigned)raw[i]);
-        }
-    }
-
-    // L4-specific: also read PCROP and WRP registers
+    // L4: decode OPTR + WRP/PCROP
     if (info->flash_optr == 0x40022020) {
+        decode_l4_optr(optr);
+
         uint32_t val;
         if (mem_read32(0x40022024, &val))
-            printf("PCROP1SR (0x40022024) = 0x%08X\r\n", (unsigned)val);
-        if (mem_read32(0x40022028, &val))
-            printf("PCROP1ER (0x40022028) = 0x%08X\r\n", (unsigned)val);
-        if (mem_read32(0x4002202C, &val))
-            printf("WRP1AR   (0x4002202C) = 0x%08X\r\n", (unsigned)val);
-        if (mem_read32(0x40022030, &val))
-            printf("WRP1BR   (0x40022030) = 0x%08X\r\n", (unsigned)val);
+            printf("PCROP1SR = 0x%08X (start page %u)\r\n",
+                   (unsigned)val, val & 0xFFFF);
+        if (mem_read32(0x40022028, &val)) {
+            printf("PCROP1ER = 0x%08X (end page %u, PCROP_RDP=%u)\r\n",
+                   (unsigned)val, val & 0xFFFF, (val >> 31) & 1);
+        }
+        if (mem_read32(0x4002202C, &val)) {
+            printf("WRP1AR   = 0x%08X\r\n", (unsigned)val);
+            decode_l4_wrp("WRP1A", val);
+        }
+        if (mem_read32(0x40022030, &val)) {
+            printf("WRP1BR   = 0x%08X\r\n", (unsigned)val);
+            decode_l4_wrp("WRP1B", val);
+        }
+    }
+    // F4: decode OPTCR
+    else if (info->flash_optr == 0x40023C14) {
+        decode_f4_optcr(optr);
+    }
+    // F1/F3: decode OBR + raw option bytes
+    else if (info->flash_optr == 0x4002201C) {
+        uint32_t raw_opt;
+        if (mem_read32(info->opt_base, &raw_opt)) {
+            decode_f1_options(optr, raw_opt);
+        }
     }
 
     return true;
