@@ -337,14 +337,19 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("STM32 ABORT            - Abort current attack operation\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== SWD Debug Interface (GP17=SWCLK, GP18=SWDIO) ==\r\n");
-        uart_cli_send("SWD IDCODE             - Read target DPIDR (connect + identify)\r\n");
+        uart_cli_send("SWD                    - Show SWD command help (full list)\r\n");
         uart_cli_send("SWD CONNECT            - Connect to target (line reset + JTAG-to-SWD)\r\n");
-        uart_cli_send("SWD READ DP <addr>     - Read Debug Port register\r\n");
-        uart_cli_send("SWD READ AP <ap> <addr> - Read Access Port register\r\n");
-        uart_cli_send("SWD READ MEM <addr> [count] - Read target memory\r\n");
-        uart_cli_send("SWD WRITE DP <addr> <value> - Write Debug Port register\r\n");
-        uart_cli_send("SWD WRITE AP <ap> <addr> <value> - Write Access Port register\r\n");
-        uart_cli_send("SWD WRITE MEM <addr> <value> - Write target memory\r\n");
+        uart_cli_send("SWD IDCODE             - Identify chip (DPIDR + CPUID + debug ID)\r\n");
+        uart_cli_send("SWD HALT / RESUME      - Halt / resume target core\r\n");
+        uart_cli_send("SWD REGS               - Read core registers (r0-r15, xPSR)\r\n");
+        uart_cli_send("SWD READ DP|AP|MEM     - Read debug/access port or memory\r\n");
+        uart_cli_send("SWD WRITE DP|AP|MEM    - Write debug/access port or memory\r\n");
+        uart_cli_send("SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes] - Hex dump\r\n");
+        uart_cli_send("SWD RDP [SET <0|1>]    - Read/set RDP level (needs TARGET)\r\n");
+        uart_cli_send("SWD OPT                - Read option bytes (needs TARGET)\r\n");
+        uart_cli_send("SWD RESET [HOLD|RELEASE] - Target reset via nRST\r\n");
+        uart_cli_send("SWD FLASH ERASE|TEST   - Flash erase/test (needs TARGET)\r\n");
+        uart_cli_send("SWD TEST               - Bus connectivity test\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== JTAG Debug Interface (TCK=17, TMS=18, TDI=19, TDO=20, RTCK=21, TRST=15) ==\r\n");
         uart_cli_send("JTAG RESET             - Reset TAP state machine\r\n");
@@ -1480,7 +1485,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD WRITE DP <addr> <val>\r\n");
             uart_cli_send("  SWD WRITE AP <addr> <val>\r\n");
             uart_cli_send("  SWD WRITE MEM <addr> <val>\r\n");
-            uart_cli_send("  SWD DUMP <addr> <bytes>  - Hex dump memory region\r\n");
+            uart_cli_send("  SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes] - Hex dump\r\n");
             uart_cli_send("  SWD RDP                  - Read RDP level (needs TARGET set)\r\n");
             uart_cli_send("  SWD RDP SET <0|1>        - Set RDP level (0 = mass erase!)\r\n");
             uart_cli_send("  SWD OPT                  - Read option bytes\r\n");
@@ -1489,6 +1494,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD RESET RELEASE        - Release nRST\r\n");
             uart_cli_send("  SWD FLASH ERASE <page>   - Erase flash page\r\n");
             uart_cli_send("  SWD FLASH TEST           - Write/verify test pattern\r\n");
+            uart_cli_send("  SWD TEST                 - Bus connectivity test\r\n");
+            uart_cli_send("  Aliases: FLASH/SRAM/BOOTROM use TARGET sizes (needs TARGET set)\r\n");
             goto api_response;
         }
 
@@ -1678,18 +1685,64 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
 
         } else if (strcmp(parts->parts[1], "DUMP") == 0) {
-            // SWD DUMP <addr> <bytes>
-            if (parts->count < 4) {
-                api_error("ERROR: Usage: SWD DUMP <addr> <bytes>\r\n");
+            // SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes]
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes]\r\n");
                 goto api_response;
             }
             if (!swd_connect()) {
                 api_error("ERROR: SWD connect failed\r\n");
                 goto api_response;
             }
-            uint32_t addr = strtoul(parts->parts[2], NULL, 16);
-            uint32_t bytes = strtoul(parts->parts[3], NULL, 0);
-            if (bytes > 65536) bytes = 65536;  // 64KB max
+            uint32_t addr;
+            uint32_t bytes;
+            bool alias_used = false;
+            if (strcmp(parts->parts[2], "FLASH") == 0) {
+                extern target_type_t target_get_type(void);
+                target_type_t tt = target_get_type();
+                if (!target_is_stm32(tt)) {
+                    api_error("ERROR: Set TARGET to an STM32 family first for FLASH alias\r\n");
+                    goto api_response;
+                }
+                const stm32_target_info_t *info = stm32_get_target_info(tt);
+                addr = 0x08000000;
+                bytes = info->flash_size;
+                alias_used = true;
+            } else if (strcmp(parts->parts[2], "SRAM") == 0) {
+                extern target_type_t target_get_type(void);
+                target_type_t tt = target_get_type();
+                if (!target_is_stm32(tt)) {
+                    api_error("ERROR: Set TARGET to an STM32 family first for SRAM alias\r\n");
+                    goto api_response;
+                }
+                const stm32_target_info_t *info = stm32_get_target_info(tt);
+                addr = info->sram_base;
+                bytes = info->sram_size;
+                alias_used = true;
+            } else if (strcmp(parts->parts[2], "BOOTROM") == 0) {
+                extern target_type_t target_get_type(void);
+                target_type_t tt = target_get_type();
+                if (!target_is_stm32(tt)) {
+                    api_error("ERROR: Set TARGET to an STM32 family first for BOOTROM alias\r\n");
+                    goto api_response;
+                }
+                const stm32_target_info_t *info = stm32_get_target_info(tt);
+                addr = info->bootrom_base;
+                bytes = info->bootrom_size;
+                alias_used = true;
+            } else {
+                addr = strtoul(parts->parts[2], NULL, 16);
+                if (parts->count < 4) {
+                    api_error("ERROR: Usage: SWD DUMP <addr> <bytes>\r\n");
+                    goto api_response;
+                }
+                bytes = strtoul(parts->parts[3], NULL, 0);
+            }
+            // Override size if explicitly specified after alias
+            if (alias_used && parts->count >= 4) {
+                bytes = strtoul(parts->parts[3], NULL, 0);
+            }
+            // No cap — dump streams in chunks, user can Ctrl-C
             uint32_t words = (bytes + 3) / 4;
 
             uart_cli_printf("Dumping %u bytes from 0x%08X:\r\n", bytes, addr);

@@ -23,6 +23,7 @@ The inspiration for the project came from discussions here: [Prompt||GTFO](https
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
 - **GRBL XYZ support**: Direct UART control of GRBL CNC platform
+- **SWD/JTAG debug**: Bit-banged SWD and JTAG for ARM target debugging, flash dumping, and RDP inspection
 - **Real-time monitoring**: UART snooping for target debugging
 
 ## Hardware Requirements
@@ -282,6 +283,79 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 **`CS HVOUT`** - Get ChipSHOUTER HV output status
 - Query high voltage output state
 
+#### SWD Debug Interface
+
+Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting, reading/writing registers and memory, dumping flash, and STM32-specific operations like RDP readout and option byte inspection.
+
+**`SWD CONNECT`** - Connect to target via SWD
+- Performs line reset + JTAG-to-SWD switch sequence
+- Reads and displays DPIDR on success
+
+**`SWD IDCODE`** - Identify connected target
+- Reads DPIDR, CPUID, and STM32 debug ID code
+- Decodes ARM part number and STM32 device variant
+
+**`SWD HALT`** / **`SWD RESUME`** - Halt/resume target core
+- Uses DHCSR debug register to control execution
+- Required before register reads or SRAM writes
+
+**`SWD REGS`** - Read core registers
+- Displays r0-r15, xPSR, MSP, PSP while halted
+
+**`SWD READ DP <addr>`** - Read Debug Port register
+**`SWD READ AP <ap> <addr>`** - Read Access Port register
+**`SWD READ MEM <addr> [count]`** - Read target memory (1-256 words)
+**`SWD WRITE DP <addr> <value>`** - Write Debug Port register
+**`SWD WRITE AP <ap> <addr> <value>`** - Write Access Port register
+**`SWD WRITE MEM <addr> <value>`** - Write target memory
+
+**`SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes]`** - Hex dump memory region
+- Address can be a hex address or an alias: `FLASH`, `SRAM`, `BOOTROM`
+- Aliases use the TARGET's configured base address and size
+- Size is optional with aliases (defaults to full region)
+- Examples: `SWD DUMP 08000000 256`, `SWD DUMP FLASH`, `SWD DUMP BOOTROM 64`
+
+**`SWD RDP`** - Read RDP (readout protection) level
+- Requires TARGET set to an STM32 family
+- Returns level 0, 1, or 2
+
+**`SWD RDP SET <0|1>`** - Set RDP level
+- **WARNING**: Setting to 0 triggers mass erase on most families
+- Setting to 2 is permanent and irreversible
+
+**`SWD OPT`** - Read option bytes
+- Displays all option registers for the selected STM32 family
+
+**`SWD RESET`** - Pulse nRST for 100ms
+**`SWD RESET HOLD`** - Assert nRST (hold target in reset)
+**`SWD RESET RELEASE`** - Release nRST
+
+**`SWD FLASH ERASE <page>`** - Erase a flash page
+**`SWD FLASH TEST`** - Write and verify test pattern to flash
+
+**`SWD TEST`** - Bus connectivity test
+- Toggles SWCLK and SWDIO pins and reads back values
+- Useful for verifying wiring before connecting
+
+#### JTAG Debug Interface
+
+Bit-banged JTAG for scanning and identifying devices. Shares clock and data pins with SWD (active one at a time).
+
+**`JTAG RESET`** - Reset TAP state machine
+- Drives TMS high for 5+ clocks to reach Test-Logic-Reset
+
+**`JTAG IDCODE`** - Read device IDCODE
+- Resets TAP and shifts out 32-bit IDCODE from DR
+
+**`JTAG SCAN`** - Scan chain for devices
+- Detects number of devices and reads their IDCODEs
+
+**`JTAG IR <value> [bits]`** - Shift instruction register
+- Default: 4 bits
+
+**`JTAG DR <value> [bits]`** - Shift data register
+- Default: 32 bits
+
 #### GRBL XY Platform Control
 
 Built-in UART control for GRBL-based XY positioning platforms (CNC routers, laser cutters, etc.) useful for automated EMFI probe positioning.
@@ -443,6 +517,17 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 9** - GRBL UART RX (UART1 alternate function)
 
 **Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
+
+### SWD/JTAG Debug Interface
+
+- **GPIO 15** - nRST / TRST (shared with Target Reset)
+- **GPIO 17** - SWCLK / TCK
+- **GPIO 18** - SWDIO / TMS
+- **GPIO 19** - TDI (JTAG only)
+- **GPIO 20** - TDO (JTAG only)
+- **GPIO 21** - RTCK (JTAG adaptive clocking, optional)
+
+**Note**: SWD and JTAG share GP17/GP18. Use one interface at a time.
 
 ## Architecture
 

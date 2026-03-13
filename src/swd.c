@@ -11,7 +11,7 @@
 #include "hardware/timer.h"
 #include <stdio.h>
 
-// Clock half-period in microseconds (5 = ~100kHz, 1 = ~500kHz)
+// Clock half-period in microseconds (5 = ~100kHz, 2 = ~250kHz)
 static uint32_t clk_delay_us = 2;
 
 static bool initialized = false;
@@ -179,10 +179,15 @@ static uint8_t make_request(bool APnDP, bool RnW, uint8_t addr) {
     return request;
 }
 
-// Line reset sequence (56+ cycles with SWDIO HIGH)
+// Line reset sequence (56+ cycles with SWDIO HIGH, no trailing idle)
 static void swd_line_reset(void) {
     swd_seq_out(0xFFFFFFFF, 32);  // 32 HIGH
-    swd_seq_out(0x00FFFFFF, 32);  // 24 HIGH + 8 idle (LOW)
+    swd_seq_out(0x00FFFFFF, 24);  // 24 HIGH (total 56)
+}
+
+// Idle cycles (SWDIO LOW) - call after line reset before first transaction
+static void swd_idle(int cycles) {
+    swd_seq_out(0, cycles);
 }
 
 // --- Public API ---
@@ -222,12 +227,13 @@ bool swd_connect(void) {
     gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
     gpio_put(SWD_SWDIO_PIN, 1);
     swdio_dir = SWDIO_DRIVE;
-    sleep_us(100);  // Let pins settle
+    sleep_ms(1);  // Let pins settle
 
     // === Method 1: Legacy JTAG-to-SWD ===
     swd_line_reset();
     swd_seq_out(JTAG_TO_SWD_SEQUENCE, 16);
     swd_line_reset();
+    swd_idle(4);
 
     uint32_t dpidr;
     if (swd_read_dp(DP_DPIDR, &dpidr)) {
@@ -249,6 +255,7 @@ bool swd_connect(void) {
     swd_seq_out(0, 4);
     swd_seq_out(ACTIVATION_CODE_SWD, 8);
     swd_line_reset();
+    swd_idle(4);
 
     if (swd_read_dp(DP_DPIDR, &dpidr)) {
         swd_write_dp(DP_ABORT, 0x1E);
