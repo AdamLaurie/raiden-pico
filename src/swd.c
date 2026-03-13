@@ -97,6 +97,7 @@ static void swd_turnaround(swdio_dir_t dir) {
 }
 
 // Output bits LSB first
+// Note: leaves SWCLK HIGH after last bit (no trailing clr)
 static void swd_seq_out(uint32_t data, size_t bits) {
     swd_turnaround(SWDIO_DRIVE);
     for (size_t i = 0; i < bits; i++) {
@@ -107,7 +108,6 @@ static void swd_seq_out(uint32_t data, size_t bits) {
         clk_delay();
         data >>= 1;
     }
-    swclk_clr();
 }
 
 // Input bits LSB first
@@ -140,12 +140,12 @@ static bool calc_parity(uint32_t data) {
 // Output 32 bits with parity
 static void swd_seq_out_parity(uint32_t data) {
     swd_seq_out(data, 32);
-    // Parity bit
+    // Parity bit — CLK is HIGH from seq_out, need falling edge first
+    swclk_clr();
     gpio_put(SWD_SWDIO_PIN, calc_parity(data));
     clk_delay();
     swclk_set();
     clk_delay();
-    swclk_clr();
 }
 
 // Input 32 bits with parity check
@@ -214,12 +214,15 @@ bool swd_connect(void) {
     ahb_initialized = false;
     current_select = 0xFFFFFFFF;
 
-    // Force known pin state
+    // Force full pin init (in case another subsystem changed pin function)
+    gpio_init(SWD_SWCLK_PIN);
     gpio_set_dir(SWD_SWCLK_PIN, GPIO_OUT);
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
     gpio_put(SWD_SWCLK_PIN, 0);
+    gpio_init(SWD_SWDIO_PIN);
+    gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
     gpio_put(SWD_SWDIO_PIN, 1);
     swdio_dir = SWDIO_DRIVE;
+    sleep_us(100);  // Let pins settle
 
     // === Method 1: Legacy JTAG-to-SWD ===
     swd_line_reset();
