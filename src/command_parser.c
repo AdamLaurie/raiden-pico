@@ -143,6 +143,31 @@ static bool match_and_replace(char **part, const char **candidates, uint8_t coun
     return true;
 }
 
+// Auto-detect STM32 family from DEV_ID via SWD
+// Requires SWD already connected. Sets TARGET if successful.
+static bool swd_auto_detect_target(void) {
+    extern void target_set_type(target_type_t type);
+    uint32_t cpuid, dbg_id;
+    if (!swd_detect(&cpuid, &dbg_id)) return false;
+    uint16_t dev_id = dbg_id & 0xFFF;
+    target_type_t tt = TARGET_NONE;
+    switch (dev_id) {
+        case 0x410: case 0x412: case 0x414: case 0x430:
+            tt = TARGET_STM32F1; break;
+        case 0x438:
+            tt = TARGET_STM32F3; break;
+        case 0x413: case 0x419: case 0x421: case 0x423: case 0x433:
+            tt = TARGET_STM32F4; break;
+        case 0x415: case 0x435: case 0x462: case 0x464: case 0x461:
+            tt = TARGET_STM32L4; break;
+    }
+    if (tt != TARGET_NONE) {
+        target_set_type(tt);
+        return true;
+    }
+    return false;
+}
+
 void command_parser_execute(cmd_parts_t *parts) {
     if (!parts || parts->count == 0) {
         return;
@@ -1561,6 +1586,25 @@ void command_parser_execute(cmd_parts_t *parts) {
                     case 0x461: chip = "STM32L496/L4A6"; break;
                 }
                 uart_cli_printf("  Chip: %s\r\n", chip);
+
+                // Auto-set TARGET based on DEV_ID
+                extern void target_set_type(target_type_t type);
+                target_type_t auto_tt = TARGET_NONE;
+                switch (dev_id) {
+                    case 0x410: case 0x412: case 0x414: case 0x430:
+                        auto_tt = TARGET_STM32F1; break;
+                    case 0x438:
+                        auto_tt = TARGET_STM32F3; break;
+                    case 0x413: case 0x419: case 0x421: case 0x423: case 0x433:
+                        auto_tt = TARGET_STM32F4; break;
+                    case 0x415: case 0x435: case 0x462: case 0x464: case 0x461:
+                        auto_tt = TARGET_STM32L4; break;
+                }
+                if (auto_tt != TARGET_NONE) {
+                    target_set_type(auto_tt);
+                    const stm32_target_info_t *ai = stm32_get_target_info(auto_tt);
+                    uart_cli_printf("  TARGET auto-set to %s\r\n", ai->name);
+                }
             } else {
                 api_error("ERROR: Could not read CPUID/debug registers\r\n");
             }
@@ -1697,38 +1741,29 @@ void command_parser_execute(cmd_parts_t *parts) {
             uint32_t addr;
             uint32_t bytes;
             bool alias_used = false;
-            if (strcmp(parts->parts[2], "FLASH") == 0) {
+            if (strcmp(parts->parts[2], "FLASH") == 0 ||
+                strcmp(parts->parts[2], "SRAM") == 0 ||
+                strcmp(parts->parts[2], "BOOTROM") == 0) {
                 extern target_type_t target_get_type(void);
                 target_type_t tt = target_get_type();
                 if (!target_is_stm32(tt)) {
-                    api_error("ERROR: Set TARGET to an STM32 family first for FLASH alias\r\n");
-                    goto api_response;
+                    if (!swd_auto_detect_target()) {
+                        api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
+                        goto api_response;
+                    }
+                    tt = target_get_type();
                 }
                 const stm32_target_info_t *info = stm32_get_target_info(tt);
-                addr = 0x08000000;
-                bytes = info->flash_size;
-                alias_used = true;
-            } else if (strcmp(parts->parts[2], "SRAM") == 0) {
-                extern target_type_t target_get_type(void);
-                target_type_t tt = target_get_type();
-                if (!target_is_stm32(tt)) {
-                    api_error("ERROR: Set TARGET to an STM32 family first for SRAM alias\r\n");
-                    goto api_response;
+                if (strcmp(parts->parts[2], "FLASH") == 0) {
+                    addr = 0x08000000;
+                    bytes = info->flash_size;
+                } else if (strcmp(parts->parts[2], "SRAM") == 0) {
+                    addr = info->sram_base;
+                    bytes = info->sram_size;
+                } else {
+                    addr = info->bootrom_base;
+                    bytes = info->bootrom_size;
                 }
-                const stm32_target_info_t *info = stm32_get_target_info(tt);
-                addr = info->sram_base;
-                bytes = info->sram_size;
-                alias_used = true;
-            } else if (strcmp(parts->parts[2], "BOOTROM") == 0) {
-                extern target_type_t target_get_type(void);
-                target_type_t tt = target_get_type();
-                if (!target_is_stm32(tt)) {
-                    api_error("ERROR: Set TARGET to an STM32 family first for BOOTROM alias\r\n");
-                    goto api_response;
-                }
-                const stm32_target_info_t *info = stm32_get_target_info(tt);
-                addr = info->bootrom_base;
-                bytes = info->bootrom_size;
                 alias_used = true;
             } else {
                 addr = strtoul(parts->parts[2], NULL, 16);
@@ -1781,17 +1816,20 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         } else if (strcmp(parts->parts[1], "RDP") == 0) {
             // SWD RDP [SET <0|1>]
-            extern target_type_t target_get_type(void);
-            target_type_t tt = target_get_type();
-            if (!target_is_stm32(tt)) {
-                api_error("ERROR: Set TARGET to an STM32 family first (e.g. TARGET STM32L4)\r\n");
-                goto api_response;
-            }
-            const stm32_target_info_t *info = stm32_get_target_info(tt);
             if (!swd_connect()) {
                 api_error("ERROR: SWD connect failed\r\n");
                 goto api_response;
             }
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                if (!swd_auto_detect_target()) {
+                    api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
+                    goto api_response;
+                }
+                tt = target_get_type();
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
 
             if (parts->count >= 4 && strcmp(parts->parts[2], "SET") == 0) {
                 uint8_t level = atoi(parts->parts[3]);
@@ -1823,34 +1861,40 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         } else if (strcmp(parts->parts[1], "OPT") == 0) {
             // SWD OPT - read option bytes
-            extern target_type_t target_get_type(void);
-            target_type_t tt = target_get_type();
-            if (!target_is_stm32(tt)) {
-                api_error("ERROR: Set TARGET to an STM32 family first\r\n");
-                goto api_response;
-            }
-            const stm32_target_info_t *info = stm32_get_target_info(tt);
             if (!swd_connect()) {
                 api_error("ERROR: SWD connect failed\r\n");
                 goto api_response;
             }
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                if (!swd_auto_detect_target()) {
+                    api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
+                    goto api_response;
+                }
+                tt = target_get_type();
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
             if (!swd_stm32_read_options(info)) {
                 api_error("ERROR: Could not read option bytes\r\n");
             }
 
         } else if (strcmp(parts->parts[1], "FLASH") == 0) {
             // SWD FLASH <ERASE|TEST>
-            extern target_type_t target_get_type(void);
-            target_type_t tt = target_get_type();
-            if (!target_is_stm32(tt)) {
-                api_error("ERROR: Set TARGET to an STM32 family first\r\n");
-                goto api_response;
-            }
-            const stm32_target_info_t *info = stm32_get_target_info(tt);
             if (!swd_connect()) {
                 api_error("ERROR: SWD connect failed\r\n");
                 goto api_response;
             }
+            extern target_type_t target_get_type(void);
+            target_type_t tt = target_get_type();
+            if (!target_is_stm32(tt)) {
+                if (!swd_auto_detect_target()) {
+                    api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
+                    goto api_response;
+                }
+                tt = target_get_type();
+            }
+            const stm32_target_info_t *info = stm32_get_target_info(tt);
 
             if (parts->count < 3) {
                 api_error("ERROR: Usage: SWD FLASH <ERASE <page>|TEST>\r\n");
