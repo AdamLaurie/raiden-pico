@@ -66,5 +66,6 @@ void target_power_on(void);
 void target_power_off(void);
 void target_power_cycle(uint32_t time_ms);
 bool target_power_get_state(void);
+void target_power_sweep(void);
 
 #endif // TARGET_UART_H

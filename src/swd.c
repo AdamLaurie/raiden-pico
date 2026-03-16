@@ -15,6 +15,7 @@
 static uint32_t clk_delay_us = 2;
 
 static bool initialized = false;
+static bool connected = false;
 static bool ahb_initialized = false;
 static uint8_t last_ack = 0;
 static uint32_t current_select = 0xFFFFFFFF;
@@ -72,32 +73,34 @@ static inline void swdio_in(void) {
     gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
 }
 
-// Turnaround - clock one cycle while switching bus direction
+// Turnaround - exact copy of BMP swdptap_turnaround.
+// Does NOT assume a specific SWCLK state on entry.
 static void swd_turnaround(swdio_dir_t dir) {
     if (dir == swdio_dir)
         return;
     swdio_dir = dir;
 
     if (dir == SWDIO_FLOAT) {
-        // Host releases SWDIO, then clock turnaround
+        // BMP: release SWDIO, SWCLK untouched
         swdio_in();
-        swclk_clr();
-        clk_delay();
-        swclk_set();
-        clk_delay();
     } else {
-        // Clock turnaround, then host takes over SWDIO
+        // BMP: ensure SWCLK LOW before turnaround clock
+        // (handles both HIGH from parity read and LOW from seq_out)
         swclk_clr();
-        clk_delay();
-        swclk_set();
-        clk_delay();
+    }
+
+    clk_delay();
+    swclk_set();
+    clk_delay();
+
+    if (dir == SWDIO_DRIVE) {
         swclk_clr();
         swdio_out();
     }
 }
 
-// Output bits LSB first
-// Note: leaves SWCLK HIGH after last bit (no trailing clr)
+// Output bits LSB first (matches BMP swdptap_seq_out_clk_delay)
+// Ends with SWCLK LOW (trailing clr, same as BMP)
 static void swd_seq_out(uint32_t data, size_t bits) {
     swd_turnaround(SWDIO_DRIVE);
     for (size_t i = 0; i < bits; i++) {
@@ -108,18 +111,20 @@ static void swd_seq_out(uint32_t data, size_t bits) {
         clk_delay();
         data >>= 1;
     }
+    swclk_clr();
 }
 
-// Input bits LSB first
-// Target drives data on rising edge; host samples on falling edge
+// Input bits LSB first (matches BMP swdptap_seq_in_clk_delay)
+// Sample immediately after falling edge (same as BMP)
+// Ends with SWCLK LOW (trailing clr)
 static uint32_t swd_seq_in(size_t bits) {
     swd_turnaround(SWDIO_FLOAT);
     uint32_t data = 0;
     for (size_t i = 0; i < bits; i++) {
         swclk_clr();
-        clk_delay();
         if (swdio_get())
             data |= (1U << i);
+        clk_delay();
         swclk_set();
         clk_delay();
     }
@@ -137,28 +142,32 @@ static bool calc_parity(uint32_t data) {
     return data & 1;
 }
 
-// Output 32 bits with parity
+// Output 32 bits with parity (matches BMP swdptap_seq_out_parity)
+// seq_out ends SWCLK LOW. Set parity on SWDIO, then clock it in, end SWCLK LOW.
 static void swd_seq_out_parity(uint32_t data) {
     swd_seq_out(data, 32);
-    // Parity bit — CLK is HIGH from seq_out, need falling edge first
-    swclk_clr();
+    // SWCLK is LOW from seq_out's trailing CLR
     gpio_put(SWD_SWDIO_PIN, calc_parity(data));
     clk_delay();
     swclk_set();
     clk_delay();
+    swclk_clr();
 }
 
-// Input 32 bits with parity check
+// Input 32 bits with parity check (matches BMP swdptap_seq_in_parity)
+// Reads parity bit using same clock pattern as seq_in (CLR/read/delay/SET/delay/CLR).
+// Ends SWCLK LOW, then calls turnaround(DRIVE).
 static bool swd_seq_in_parity(uint32_t *data) {
     *data = swd_seq_in(32);
-    // Read parity bit - same timing as swd_seq_in
-    swclk_clr();
-    clk_delay();
+    // SWCLK is LOW from seq_in's trailing CLR
+    // Read parity bit with same pattern as seq_in_clk_delay(1) in BMP:
+    swclk_clr();  // redundant (already LOW), matches BMP
     bool parity_bit = swdio_get();
+    clk_delay();
     swclk_set();
     clk_delay();
-    swclk_clr();
-    // Verify parity
+    swclk_clr();  // trailing CLR — SWCLK LOW, matches BMP
+    swd_turnaround(SWDIO_DRIVE);
     return calc_parity(*data) == parity_bit;
 }
 
@@ -210,12 +219,14 @@ void swd_deinit(void) {
     gpio_set_dir(SWD_SWCLK_PIN, GPIO_IN);
     gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
     initialized = false;
+    connected = false;
 }
 
 bool swd_connect(void) {
     if (!initialized)
         swd_init();
 
+    connected = false;
     ahb_initialized = false;
     current_select = 0xFFFFFFFF;
 
@@ -239,6 +250,7 @@ bool swd_connect(void) {
     if (swd_read_dp(DP_DPIDR, &dpidr)) {
         swd_write_dp(DP_ABORT, 0x1E);
         printf("[SWD] Connected, DPIDR=0x%08X\r\n", (unsigned)dpidr);
+        connected = true;
         return true;
     }
 
@@ -260,6 +272,7 @@ bool swd_connect(void) {
     if (swd_read_dp(DP_DPIDR, &dpidr)) {
         swd_write_dp(DP_ABORT, 0x1E);
         printf("[SWD] Connected (dormant), DPIDR=0x%08X\r\n", (unsigned)dpidr);
+        connected = true;
         return true;
     }
 
@@ -267,45 +280,96 @@ bool swd_connect(void) {
     return false;
 }
 
-void swd_bus_test(void) {
-    // Quick test: drive SWDIO low/high and read back,
-    // then set as input and see what the target pulls it to
-    gpio_init(SWD_SWCLK_PIN);
-    gpio_init(SWD_SWDIO_PIN);
+bool swd_is_connected(void) {
+    return connected;
+}
 
-    // Test SWDIO output
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
-    gpio_put(SWD_SWDIO_PIN, 0);
-    sleep_us(10);
-    printf("[SWD] SWDIO drive LOW, read=%d\r\n", gpio_get(SWD_SWDIO_PIN));
-    gpio_put(SWD_SWDIO_PIN, 1);
-    sleep_us(10);
-    printf("[SWD] SWDIO drive HIGH, read=%d\r\n", gpio_get(SWD_SWDIO_PIN));
+bool swd_ensure_connected(void) {
+    if (connected)
+        return true;
+    return swd_connect();
+}
 
-    // Test SWDIO as input (what does target pull it to?)
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
-    sleep_us(10);
-    printf("[SWD] SWDIO float (no pull), read=%d\r\n", gpio_get(SWD_SWDIO_PIN));
-    gpio_pull_up(SWD_SWDIO_PIN);
-    sleep_us(10);
-    printf("[SWD] SWDIO float (pull-up), read=%d\r\n", gpio_get(SWD_SWDIO_PIN));
-    gpio_disable_pulls(SWD_SWDIO_PIN);
+// Forward declarations for helpers used in connect_under_reset and set_rdp
+static bool mem_read32(uint32_t addr, uint32_t *val);
+static bool mem_write32(uint32_t addr, uint32_t val);
+static bool swd_init_ahb_ap(void);
 
-    // Test SWCLK output
-    gpio_set_dir(SWD_SWCLK_PIN, GPIO_OUT);
-    gpio_put(SWD_SWCLK_PIN, 0);
-    sleep_us(10);
-    printf("[SWD] SWCLK drive LOW, read=%d\r\n", gpio_get(SWD_SWCLK_PIN));
-    gpio_put(SWD_SWCLK_PIN, 1);
-    sleep_us(10);
-    printf("[SWD] SWCLK drive HIGH, read=%d\r\n", gpio_get(SWD_SWCLK_PIN));
+bool swd_connect_under_reset(void) {
+    // BMP-style connect-under-reset with VC_CORERESET vector catch.
+    // This halts the core at the reset vector BEFORE any firmware runs,
+    // which is critical when the target has a watchdog that would
+    // otherwise reset the core before we can halt it.
 
-    // Leave in known state
-    gpio_put(SWD_SWCLK_PIN, 0);
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
-    gpio_put(SWD_SWDIO_PIN, 1);
-    swdio_dir = SWDIO_DRIVE;
-    initialized = true;
+    // Step 1: Hold target in reset
+    swd_nrst_assert();
+    sleep_ms(10);
+
+    // Step 2: Connect SWD while target is held in reset
+    if (!swd_connect()) {
+        printf("[SWD] CUR: connect failed\r\n");
+        swd_nrst_release();
+        return false;
+    }
+
+    // Step 3: Init AHB-AP (power cycle debug domain)
+    if (!ahb_initialized) {
+        if (!swd_init_ahb_ap()) {
+            printf("[SWD] CUR: AHB-AP init failed\r\n");
+            swd_nrst_release();
+            return false;
+        }
+        ahb_initialized = true;
+    }
+
+    // Step 4: Enable debug (C_DEBUGEN) and request halt (C_HALT)
+    mem_write32(DHCSR, DBGKEY | 0x3);
+
+    // Step 5: Set DEMCR with VC_CORERESET to catch core on reset exit
+    // DEMCR = 0xE000EDFC, VC_CORERESET = bit 0, TRCENA = bit 24
+    #define DEMCR_ADDR       0xE000EDFC
+    #define DEMCR_TRCENA     (1U << 24)
+    #define DEMCR_VC_HARDERR (1U << 10)
+    #define DEMCR_VC_CORERESET (1U << 0)
+    uint32_t demcr = DEMCR_TRCENA | DEMCR_VC_HARDERR | DEMCR_VC_CORERESET;
+    mem_write32(DEMCR_ADDR, demcr);
+
+    // Step 6: Release reset — core will halt at reset vector due to VC_CORERESET
+    swd_nrst_release();
+    sleep_ms(10);
+
+    // Step 7: Wait for halt (S_HALT and S_RESET_ST to clear)
+    uint32_t dhcsr = 0;
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
+        if (!mem_read32(DHCSR, &dhcsr))
+            continue;
+
+        // Filter invalid reads
+        if (dhcsr == 0xFFFFFFFF || (dhcsr & 0xF000FFF0) != 0)
+            continue;
+
+        // Wait for S_RESET_ST to clear (core has exited reset)
+        if (dhcsr & (1U << 25))
+            continue;
+
+        // Check S_HALT and C_DEBUGEN
+        if ((dhcsr & ((1U << 17) | (1U << 0))) == ((1U << 17) | (1U << 0))) {
+            printf("[SWD] CUR: Halted at reset vector, DHCSR=0x%08X\r\n", (unsigned)dhcsr);
+
+            // Freeze IWDG and WWDG in debug mode via DBGMCU_CR
+            #define DBGMCU_CR 0xE0042004
+            uint32_t dbg_cr;
+            mem_read32(DBGMCU_CR, &dbg_cr);
+            dbg_cr |= (1U << 8) | (1U << 9);  // DBG_IWDG_STOP | DBG_WWDG_STOP
+            mem_write32(DBGMCU_CR, dbg_cr);
+
+            return true;
+        }
+    }
+
+    printf("[SWD] CUR: Halt timeout, DHCSR=0x%08X\r\n", (unsigned)dhcsr);
+    return false;
 }
 
 void swd_nrst_assert(void) {
@@ -342,17 +406,13 @@ bool swd_read_dp(uint8_t addr, uint32_t *value) {
         return false;
     }
 
-    // Read data with parity
-    if (!swd_seq_in_parity(value)) {
-        swd_turnaround(SWDIO_DRIVE);
-        return false;
-    }
+    // Read data with parity (seq_in_parity calls turnaround(DRIVE) internally)
+    bool parity_ok = swd_seq_in_parity(value);
 
-    // Turnaround and idle cycles
-    swd_turnaround(SWDIO_DRIVE);
+    // Idle cycles
     swd_seq_out(0, 8);
 
-    return true;
+    return parity_ok;
 }
 
 bool swd_write_dp(uint8_t addr, uint32_t value) {
@@ -366,13 +426,12 @@ bool swd_write_dp(uint8_t addr, uint32_t value) {
     // Read ACK
     last_ack = swd_seq_in(3);
 
-    // Turnaround back to drive
-    swd_turnaround(SWDIO_DRIVE);
-
-    if (last_ack != SWD_ACK_OK)
+    if (last_ack != SWD_ACK_OK) {
+        swd_turnaround(SWDIO_DRIVE);
         return false;
+    }
 
-    // Write data with parity
+    // Write data with parity (seq_out_parity->seq_out handles turnaround internally)
     swd_seq_out_parity(value);
 
     // Idle cycles
@@ -411,7 +470,6 @@ bool swd_read_ap(uint8_t ap, uint8_t addr, uint32_t *value) {
 
     uint32_t dummy;
     swd_seq_in_parity(&dummy);
-    swd_turnaround(SWDIO_DRIVE);
     swd_seq_out(0, 8);
 
     // Read RDBUFF to get actual value
@@ -429,10 +487,11 @@ bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value) {
     swd_seq_out(request, 8);
 
     last_ack = swd_seq_in(3);
-    swd_turnaround(SWDIO_DRIVE);
 
-    if (last_ack != SWD_ACK_OK)
+    if (last_ack != SWD_ACK_OK) {
+        swd_turnaround(SWDIO_DRIVE);
         return false;
+    }
 
     swd_seq_out_parity(value);
     swd_seq_out(0, 8);
@@ -440,27 +499,88 @@ bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value) {
     return true;
 }
 
-// Initialize AHB-AP for memory access
+// Base CSW value — read from AP defaults during init, like BMP's adiv5_new_ap.
+// Only size/addrinc are modified per-operation; all other bits preserved from AP default.
+static uint32_t ap_csw_base = 0;
+
+// CSW bit masks (from BMP adiv5.h)
+#define CSW_SIZE_MASK     (7U << 0)
+#define CSW_ADDRINC_MASK  (3U << 4)
+#define CSW_SIZE_HALFWORD (1U << 0)
+#define CSW_SIZE_WORD     (2U << 0)
+#define CSW_ADDRINC_SINGLE (1U << 4)
+#define CSW_DBGSWENABLE   (1U << 31)
+#define CSW_MTE           (1U << 15)
+#define CSW_HNOSEC        (1U << 30)
+
+// Initialize AHB-AP for memory access.
+// Matches BMP's adiv5_dp_init (power cycle) + adiv5_new_ap (CSW setup).
 static bool swd_init_ahb_ap(void) {
-    // Power up debug domain: CSYSPWRUPREQ | CDBGPWRUPREQ
+    uint32_t stat;
+
+    // Clear sticky errors first (BMP: adiv5_dp_abort before dp_init)
+    swd_write_dp(DP_ABORT, 0x1E);
+
+    // Step 1: Power DOWN debug domain (BMP: adiv5_dp_write(dp, CTRLSTAT, 0))
+    if (!swd_write_dp(DP_CTRL_STAT, 0))
+        return false;
+
+    // Wait for power-down acknowledge (ACK bits clear)
+    for (int i = 0; i < 250; i++) {
+        if (!swd_read_dp(DP_CTRL_STAT, &stat))
+            return false;
+        if (!(stat & 0xA0000000))
+            break;
+        sleep_ms(1);
+    }
+
+    // Step 2: Power UP (BMP: CSYSPWRUPREQ | CDBGPWRUPREQ)
     if (!swd_write_dp(DP_CTRL_STAT, 0x50000000))
         return false;
 
-    // Wait for power-up acknowledge
-    uint32_t stat;
-    for (int i = 0; i < 100; i++) {
+    // Wait for power-up acknowledge (BMP: polls with 10ms delay)
+    for (int i = 0; i < 200; i++) {
+        sleep_ms(1);
         if (!swd_read_dp(DP_CTRL_STAT, &stat))
             return false;
         if ((stat & 0xA0000000) == 0xA0000000)
             break;
-        sleep_us(10);
     }
 
     if ((stat & 0xA0000000) != 0xA0000000)
         return false;
 
-    // Configure CSW: 32-bit access, auto-increment
-    return swd_write_ap(0, AP_CSW, 0x23000012);
+    // Clear sticky errors after power cycle
+    swd_write_dp(DP_ABORT, 0x1E);
+
+    // BMP: adiv5_new_ap reads IDR, BASE, CSW from AP defaults
+    uint32_t ap_idr;
+    swd_read_ap(0, AP_IDR, &ap_idr);
+
+    uint32_t csw_default;
+    swd_read_ap(0, AP_CSW, &csw_default);
+
+    // BMP: csw &= ~(SIZE_MASK | ADDRINC_MASK | MTE | HNOSEC); csw |= DBGSWENABLE
+    ap_csw_base = csw_default;
+    ap_csw_base &= ~(CSW_SIZE_MASK | CSW_ADDRINC_MASK | CSW_MTE | CSW_HNOSEC);
+    ap_csw_base |= CSW_DBGSWENABLE;
+
+    return true;
+}
+
+// BMP: ap_mem_access_setup — writes CSW + TAR before every memory operation
+static bool swd_mem_access_setup(uint32_t addr) {
+    uint32_t csw = ap_csw_base | CSW_SIZE_WORD | CSW_ADDRINC_SINGLE;
+
+    // Write CSW (BMP: adiv5_ap_write(ap, CSW, csw))
+    if (!swd_write_ap(0, AP_CSW, csw))
+        return false;
+
+    // Write TAR (BMP: adiv5_dp_write(dp, TAR, addr) — uses AP write since TAR is in same bank)
+    if (!swd_write_ap(0, AP_TAR, addr))
+        return false;
+
+    return true;
 }
 
 uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count) {
@@ -473,8 +593,8 @@ uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count) {
         ahb_initialized = true;
     }
 
-    // Set TAR
-    if (!swd_write_ap(0, AP_TAR, addr))
+    // BMP: setup CSW + TAR before access
+    if (!swd_mem_access_setup(addr))
         return 0;
 
     // Read words
@@ -498,8 +618,8 @@ uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count) {
         ahb_initialized = true;
     }
 
-    // Set TAR
-    if (!swd_write_ap(0, AP_TAR, addr))
+    // BMP: setup CSW + TAR before access
+    if (!swd_mem_access_setup(addr))
         return 0;
 
     // Write words
@@ -509,6 +629,10 @@ uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count) {
             break;
         written++;
     }
+
+    // BMP: flush write buffer by reading RDBUFF
+    uint32_t dummy;
+    swd_read_dp(DP_RDBUFF, &dummy);
 
     return written;
 }
@@ -545,9 +669,80 @@ static bool mem_write32(uint32_t addr, uint32_t val) {
     return swd_write_mem(addr, &val, 1) == 1;
 }
 
+// Helper: write a 16-bit halfword to target memory (needed for F1 option bytes)
+static bool mem_write16(uint32_t addr, uint16_t val) {
+    if (!ahb_initialized) {
+        if (!swd_init_ahb_ap())
+            return false;
+        ahb_initialized = true;
+    }
+
+    // Set CSW for halfword access
+    uint32_t csw = ap_csw_base | CSW_SIZE_HALFWORD | CSW_ADDRINC_SINGLE;
+    if (!swd_write_ap(0, AP_CSW, csw))
+        return false;
+
+    // Write TAR
+    if (!swd_write_ap(0, AP_TAR, addr))
+        return false;
+
+    // Write DRW — data must be lane-aligned for halfword
+    // For halfword at addr & 2 == 0: data in bits [15:0]
+    // For halfword at addr & 2 == 2: data in bits [31:16]
+    uint32_t drw = (addr & 2) ? ((uint32_t)val << 16) : (uint32_t)val;
+    if (!swd_write_ap(0, AP_DRW, drw))
+        return false;
+
+    // Flush
+    uint32_t dummy;
+    swd_read_dp(DP_RDBUFF, &dummy);
+
+    // Restore word-size CSW
+    csw = ap_csw_base | CSW_SIZE_WORD | CSW_ADDRINC_SINGLE;
+    swd_write_ap(0, AP_CSW, csw);
+
+    return true;
+}
+
 bool swd_halt(void) {
-    // C_DEBUGEN | C_HALT
-    return mem_write32(DHCSR, DBGKEY | 0x3);
+    // BMP-style robust halt: loop until S_HALT is confirmed.
+    // Step 1: Enable debug first (C_DEBUGEN without C_HALT)
+    if (!mem_write32(DHCSR, DBGKEY | 0x1))
+        return false;
+
+    // Step 2: Read back to flush
+    uint32_t dhcsr;
+    mem_read32(DHCSR, &dhcsr);
+
+    // Step 3: Loop - write C_DEBUGEN|C_HALT, read back, check S_HALT
+    bool reset_seen = false;
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
+        // Write halt request
+        if (!mem_write32(DHCSR, DBGKEY | 0x3))
+            return false;
+
+        // Read back DHCSR
+        if (!mem_read32(DHCSR, &dhcsr))
+            return false;
+
+        // Filter invalid reads (errata on some STM32)
+        if (dhcsr == 0xFFFFFFFF || (dhcsr & 0xF000FFF0) != 0)
+            continue;
+
+        // Check for reset - need to see it clear before accepting halt
+        if ((dhcsr & (1 << 25)) && !reset_seen) {  // S_RESET_ST
+            reset_seen = true;
+            continue;
+        }
+
+        // Check if halt succeeded
+        if ((dhcsr & ((1 << 17) | (1 << 0))) == ((1 << 17) | (1 << 0)))  // S_HALT | C_DEBUGEN
+            return true;
+    }
+
+    printf("[SWD] Halt timeout, DHCSR=0x%08X\r\n", (unsigned)dhcsr);
+    return false;
 }
 
 bool swd_resume(void) {
@@ -604,6 +799,9 @@ bool swd_stm32_flash_wait(const stm32_target_info_t *info, uint32_t timeout_ms) 
 }
 
 bool swd_stm32_flash_unlock(const stm32_target_info_t *info) {
+    // Clear sticky errors
+    swd_write_dp(DP_ABORT, 0x1E);
+
     // Write key sequence to FLASH_KEYR
     if (!mem_write32(info->flash_keyr, info->flash_key1))
         return false;
@@ -615,11 +813,14 @@ bool swd_stm32_flash_unlock(const stm32_target_info_t *info) {
     if (!mem_read32(info->flash_cr, &cr))
         return false;
 
-    return !(cr & (1u << 31));  // LOCK bit
+    // F1/F3: LOCK is bit 7; L4: bit 31; F4: bit 31
+    if (info->flash_base == 0x40022000)
+        return !(cr & (1u << 7));    // F1/F3
+    else
+        return !(cr & (1u << 31));   // L4/F4
 }
 
 static bool stm32_opt_unlock(const stm32_target_info_t *info) {
-    // Unlock flash first
     if (!swd_stm32_flash_unlock(info))
         return false;
 
@@ -629,12 +830,17 @@ static bool stm32_opt_unlock(const stm32_target_info_t *info) {
     if (!mem_write32(info->flash_optkeyr, info->opt_key2))
         return false;
 
-    // Verify: OPTLOCK bit in CR should clear
+    // Verify unlock
     uint32_t cr;
     if (!mem_read32(info->flash_cr, &cr))
         return false;
 
-    return !(cr & (1u << 30));  // OPTLOCK bit
+    // F1/F3: OPTWRE (bit 9) should be SET after unlock
+    // L4/F4: OPTLOCK (bit 30) should be CLEAR after unlock
+    if (info->flash_base == 0x40022000)
+        return !!(cr & (1u << 9));    // F1/F3: OPTWRE set = unlocked
+    else
+        return !(cr & (1u << 30));    // L4/F4: OPTLOCK clear = unlocked
 }
 
 int swd_stm32_read_rdp(const stm32_target_info_t *info) {
@@ -647,12 +853,15 @@ int swd_stm32_read_rdp(const stm32_target_info_t *info) {
     // F1/F3: RDP is in FLASH_OBR register, bit 1 = RDPRT
     if (info->flash_base == 0x40022000 &&
         info->flash_optr == 0x4002201C) {
-        // F1/F3 path: OBR bit 1 is RDPRT flag
-        // Also read raw option bytes for actual RDP value
+        // Try raw option bytes first (works at RDP0)
         uint32_t raw_opt;
-        if (!mem_read32(info->opt_base, &raw_opt))
-            return -1;
-        rdp_byte = raw_opt & 0xFF;
+        if (mem_read32(info->opt_base, &raw_opt)) {
+            rdp_byte = raw_opt & 0xFF;
+        } else {
+            // Raw opt bytes unreadable (RDP1) — use OBR RDPRT flag
+            swd_clear_errors();
+            return (optr & (1u << 1)) ? 1 : 0;
+        }
     }
     // F4: RDP in OPTCR bits [15:8]
     else if (info->flash_optr == 0x40023C14) {
@@ -795,6 +1004,16 @@ bool swd_stm32_read_options(const stm32_target_info_t *info) {
         uint32_t raw_opt;
         if (mem_read32(info->opt_base, &raw_opt)) {
             decode_f1_options(optr, raw_opt);
+        } else {
+            // Raw opt bytes unreadable (RDP1) — decode from OBR only
+            swd_clear_errors();
+            printf("  RDPRT      = %u (%s)\r\n", (optr >> 1) & 1,
+                   (optr >> 1) & 1 ? "RDP Level 1" : "RDP Level 0");
+            printf("  WDG_SW     = %u (%s)\r\n", (optr >> 2) & 1,
+                   (optr >> 2) & 1 ? "software WDG" : "hardware WDG");
+            printf("  nRST_STOP  = %u\r\n", (optr >> 3) & 1);
+            printf("  nRST_STDBY = %u\r\n", (optr >> 4) & 1);
+            printf("  (raw option bytes not readable at RDP1)\r\n");
         }
     }
 
@@ -812,13 +1031,96 @@ bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level) {
     else
         return false;
 
-    // Unlock flash + option bytes
-    if (!stm32_opt_unlock(info))
+    printf("[SWD] set_rdp: level=%u, rdp_val=0x%02X\r\n", level, rdp_val);
+
+    // F1/F3 path: SWD-only option byte programming via connect-under-reset.
+    // Halt at reset vector before firmware runs, then program option bytes.
+    if (info->flash_base == 0x40022000) {
+        #define F1_CR_OPTWRE (1u << 9)
+        #define F1_CR_OPTER  (1u << 5)
+        #define F1_CR_STRT   (1u << 6)
+        #define F1_CR_OPTPG  (1u << 4)
+
+        // Connect under reset to halt before firmware/watchdog runs
+        if (!swd_connect_under_reset()) {
+            printf("[SWD] F1: connect-under-reset failed\r\n");
+            return false;
+        }
+
+        // Unlock flash + option bytes
+        mem_write32(info->flash_keyr, info->flash_key1);
+        mem_write32(info->flash_keyr, info->flash_key2);
+        mem_write32(info->flash_optkeyr, info->opt_key1);
+        mem_write32(info->flash_optkeyr, info->opt_key2);
+
+        uint32_t cr;
+        mem_read32(info->flash_cr, &cr);
+        if (!(cr & F1_CR_OPTWRE)) {
+            printf("[SWD] F1: option unlock failed (CR=0x%08X)\r\n", (unsigned)cr);
+            return false;
+        }
+
+        // Erase option bytes: set OPTER, then STRT
+        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTER);
+        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTER | F1_CR_STRT);
+        swd_stm32_flash_wait(info, 2000);
+
+        // Clear OPTER
+        mem_write32(info->flash_cr, F1_CR_OPTWRE);
+
+        // Program RDP value using halfword write
+        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTPG);
+        uint16_t opt_val = rdp_val | ((uint16_t)(~rdp_val & 0xFF) << 8);
+        mem_write16(info->opt_base, opt_val);
+        swd_stm32_flash_wait(info, 100);
+
+        // Program USER byte defaults (WDG_SW=1, nRST_STOP=1, nRST_STDBY=1)
+        mem_write16(info->opt_base + 2, 0x00FF);
+        swd_stm32_flash_wait(info, 100);
+
+        // Clear programming mode
+        mem_write32(info->flash_cr, 0);
+
+        // Reset to apply — RDP0 transition triggers mass erase
+        swd_nrst_pulse(10);
+        if (level == 0) {
+            printf("[SWD] F1: waiting for mass erase...\r\n");
+            sleep_ms(5000);
+        } else {
+            sleep_ms(500);
+        }
+
+        // Reconnect and verify
+        connected = false;
+        ahb_initialized = false;
+        sleep_ms(100);
+        if (swd_connect()) {
+            int new_rdp = swd_stm32_read_rdp(info);
+            printf("[SWD] F1: RDP level = %d\r\n", new_rdp);
+            if (new_rdp == level) {
+                printf("[SWD] F1: RDP change successful!\r\n");
+                return true;
+            }
+        }
+        printf("[SWD] F1: RDP change failed\r\n");
         return false;
+    }
+
+    // Non-F1 path: normal unlock with verification
+    swd_halt();
+    sleep_ms(10);
+
+    // Unlock flash + option bytes
+    if (!stm32_opt_unlock(info)) {
+        printf("[SWD] set_rdp: opt_unlock failed\r\n");
+        return false;
+    }
 
     // Wait for any ongoing operation
-    if (!swd_stm32_flash_wait(info, 1000))
+    if (!swd_stm32_flash_wait(info, 1000)) {
+        printf("[SWD] set_rdp: flash_wait failed\r\n");
         return false;
+    }
 
     // Family-specific option byte programming
     // F4: modify OPTCR register directly
@@ -844,42 +1146,6 @@ bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level) {
         if (!mem_read32(info->flash_cr, &cr))
             return false;
         cr |= (1 << 17);  // OPTSTRT
-        if (!mem_write32(info->flash_cr, cr))
-            return false;
-    }
-    // F1/F3: erase option bytes then reprogram
-    else {
-        // Set OPTER (option byte erase) + STRT
-        uint32_t cr;
-        if (!mem_read32(info->flash_cr, &cr))
-            return false;
-        cr |= (1 << 5);  // OPTER
-        if (!mem_write32(info->flash_cr, cr))
-            return false;
-        cr |= (1 << 6);  // STRT
-        if (!mem_write32(info->flash_cr, cr))
-            return false;
-
-        if (!swd_stm32_flash_wait(info, 1000))
-            return false;
-
-        // Clear OPTER, set OPTPG (option byte program)
-        cr &= ~(1 << 5);
-        cr |= (1 << 4);  // OPTPG
-        if (!mem_write32(info->flash_cr, cr))
-            return false;
-
-        // Write RDP value as halfword to option byte base
-        // F1/F3 option bytes are 16-bit: low byte = value, high byte = complement
-        uint16_t opt_val = rdp_val | ((uint16_t)(~rdp_val) << 8);
-        if (!mem_write32(info->opt_base, (uint32_t)opt_val))
-            return false;
-
-        if (!swd_stm32_flash_wait(info, 1000))
-            return false;
-
-        // Clear OPTPG
-        cr &= ~(1 << 4);
         if (!mem_write32(info->flash_cr, cr))
             return false;
     }
@@ -974,14 +1240,14 @@ uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
         // Clear PG bit
         mem_write32(info->flash_cr, 0);
     }
-    // F1/F3: halfword (16-bit) programming
+    // F1/F3: halfword (16-bit) programming — requires 16-bit bus access
     else if (info->flash_optr == 0x4002201C) {
         if (!mem_write32(info->flash_cr, (1 << 0)))  // PG
             return 0;
 
         while (written + 2 <= len) {
             uint16_t hw = data[written] | (data[written+1] << 8);
-            if (!mem_write32(addr + written, (uint32_t)hw))
+            if (!mem_write16(addr + written, hw))
                 break;
             if (!swd_stm32_flash_wait(info, 1000))
                 break;

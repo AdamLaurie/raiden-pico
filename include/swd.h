@@ -43,6 +43,16 @@ void swd_deinit(void);
 // Returns true on success
 bool swd_connect(void);
 
+// Check if SWD is currently connected
+bool swd_is_connected(void);
+
+// Connect if not already connected (no-op if connected)
+bool swd_ensure_connected(void);
+
+// Connect under reset (hold nRST, connect, halt, release)
+// Required for modifying option bytes on RDP-protected targets
+bool swd_connect_under_reset(void);
+
 // Read Debug Port register
 // addr: register address (0, 4, 8, or C)
 // value: pointer to store result
@@ -97,9 +107,6 @@ uint32_t swd_identify(void);
 
 // Cortex-M debug ID register (STM32-specific)
 #define DBG_IDCODE  0xE0042000
-
-// Bus connectivity test - toggles pins and reads back
-void swd_bus_test(void);
 
 // Assert nRST (hold target in reset)
 void swd_nrst_assert(void);

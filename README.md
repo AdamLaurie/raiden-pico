@@ -285,11 +285,15 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 
 #### SWD Debug Interface
 
-Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting, reading/writing registers and memory, dumping flash, and STM32-specific operations like RDP readout and option byte inspection.
+Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting, reading/writing registers and memory, and STM32-specific operations like RDP readout and option byte inspection.
 
 **`SWD CONNECT`** - Connect to target via SWD
 - Performs line reset + JTAG-to-SWD switch sequence
 - Reads and displays DPIDR on success
+
+**`SWD CONNECTRST`** - Connect under reset
+- Holds nRST, connects via SWD, halts core, releases nRST
+- Required for modifying option bytes on RDP-protected targets
 
 **`SWD IDCODE`** - Identify connected target
 - Reads DPIDR, CPUID, and STM32 debug ID code
@@ -302,40 +306,41 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD REGS`** - Read core registers
 - Displays r0-r15, xPSR, MSP, PSP while halted
 
-**`SWD READ DP <addr>`** - Read Debug Port register
-**`SWD READ AP <ap> <addr>`** - Read Access Port register
-**`SWD READ MEM <addr> [count]`** - Read target memory (1-256 words)
-**`SWD WRITE DP <addr> <value>`** - Write Debug Port register
-**`SWD WRITE AP <ap> <addr> <value>`** - Write Access Port register
-**`SWD WRITE MEM <addr> <value>`** - Write target memory
+**`SWD FILL <addr|region> <value> [n] [ERASE]`** - Fill memory with pattern
+- Fills n words (default: full region for aliases, 1 for raw address)
+- Flash addresses auto-detected — requires ERASE keyword to confirm page erase
+- Examples: `SWD FILL SRAM DEADBEEF 16`, `SWD FILL 08000000 CAFEF00D 8 ERASE`
 
-**`SWD DUMP <addr|FLASH|SRAM|BOOTROM> [bytes]`** - Hex dump memory region
-- Address can be a hex address or an alias: `FLASH`, `SRAM`, `BOOTROM`
-- Aliases use the TARGET's configured base address and size
-- Size is optional with aliases (defaults to full region)
-- Examples: `SWD DUMP 08000000 256`, `SWD DUMP FLASH`, `SWD DUMP BOOTROM 64`
+**`SWD FLASH ERASE <page>`** - Erase a flash page
+
+**`SWD OPT`** - Read option bytes
+- Displays all option registers for the selected STM32 family
 
 **`SWD RDP`** - Read RDP (readout protection) level
 - Requires TARGET set to an STM32 family
 - Returns level 0, 1, or 2
 
 **`SWD RDP SET <0|1>`** - Set RDP level
-- **WARNING**: Setting to 0 triggers mass erase on most families
-- Setting to 2 is permanent and irreversible
+- Setting to 0 triggers mass erase on most families
+- Level 2 is refused (permanent and irreversible)
 
-**`SWD OPT`** - Read option bytes
-- Displays all option registers for the selected STM32 family
+**`SWD READ <addr> [n]`** - Read memory (hex dump format)
+**`SWD READ FLASH|SRAM|BOOTROM [n]`** - Read memory region (default: full)
+**`SWD READ DP|AP <addr>`** - Read debug/access port register
+- Examples: `SWD READ SRAM`, `SWD READ 20000000 16`, `SWD READ FLASH 64`
+
+**`SWD REGS`** - Read core registers
+- Displays r0-r15, xPSR, MSP, PSP while halted
 
 **`SWD RESET`** - Pulse nRST for 100ms
 **`SWD RESET HOLD`** - Assert nRST (hold target in reset)
 **`SWD RESET RELEASE`** - Release nRST
 
-**`SWD FLASH ERASE <page>`** - Erase a flash page
-**`SWD FLASH TEST`** - Write and verify test pattern to flash
-
-**`SWD TEST`** - Bus connectivity test
-- Toggles SWCLK and SWDIO pins and reads back values
-- Useful for verifying wiring before connecting
+**`SWD WRITE <addr> <value> [ERASE]`** - Write memory with auto-verify
+**`SWD WRITE FLASH|SRAM <value> [ERASE]`** - Write to region base address
+**`SWD WRITE DP|AP <addr> <value>`** - Write debug/access port register
+- All writes read back and verify
+- Flash addresses auto-detected — requires ERASE keyword to confirm page erase
 
 #### JTAG Debug Interface
 

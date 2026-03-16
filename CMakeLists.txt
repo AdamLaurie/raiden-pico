@@ -50,6 +50,7 @@ target_link_libraries(raiden_pico
     hardware_pwm
     hardware_gpio
     hardware_timer
+    hardware_adc
 )
 
 # Enable USB-only serial output (no UART stdio)
