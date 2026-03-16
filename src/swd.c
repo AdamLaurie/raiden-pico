@@ -767,6 +767,27 @@ bool swd_read_core_reg(uint8_t reg, uint32_t *value) {
     return false;
 }
 
+bool swd_write_core_reg(uint8_t reg, uint32_t value) {
+    // Write value to DCRDR
+    if (!mem_write32(DCRDR, value))
+        return false;
+
+    // Write register index to DCRSR with REGWnR=1 (bit 16) for write
+    if (!mem_write32(DCRSR, (uint32_t)reg | (1 << 16)))
+        return false;
+
+    // Wait for S_REGRDY
+    for (int i = 0; i < 100; i++) {
+        uint32_t dhcsr;
+        if (!mem_read32(DHCSR, &dhcsr))
+            return false;
+        if (dhcsr & (1 << 16))  // S_REGRDY
+            return true;
+        sleep_us(10);
+    }
+    return false;
+}
+
 bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out) {
     if (!ahb_initialized) {
         if (!swd_init_ahb_ap())

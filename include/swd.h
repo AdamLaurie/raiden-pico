@@ -127,6 +127,9 @@ bool swd_resume(void);
 // reg: 0-15 = r0-r15, 16 = xPSR, 17 = MSP, 18 = PSP
 bool swd_read_core_reg(uint8_t reg, uint32_t *value);
 
+// Write a CPU register (r0-r15, xPSR etc) while halted
+bool swd_write_core_reg(uint8_t reg, uint32_t value);
+
 // Detect target: read CPUID and STM32 debug ID code
 // Fills cpuid and dbg_idcode, returns true on success
 bool swd_detect(uint32_t *cpuid, uint32_t *dbg_idcode);

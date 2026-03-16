@@ -68,5 +68,6 @@ void target_power_cycle(uint32_t time_ms);
 bool target_power_get_state(void);
 void target_power_sweep(void);
 void target_power_glitch(float voltage, uint32_t count);
+void target_power_payload(float voltage, uint32_t max_attempts);
 
 #endif // TARGET_UART_H

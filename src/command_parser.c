@@ -369,7 +369,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP] [ms] - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD] - Control target power (GP10/11/12)\r\n");
         uart_cli_send("                   CYCLE: power off for ms (default 300ms)\r\n");
         uart_cli_send("                   GLITCH <V> [n]: repeat glitch at threshold (default 10x)\r\n");
         uart_cli_send("                   SWEEP: SRAM retention test (needs TARGET, ADC on GP26)\r\n");
@@ -1030,8 +1030,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
             } else {
                 // Match power command
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 5, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 6, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1059,6 +1059,16 @@ void command_parser_execute(cmd_parts_t *parts) {
                     target_power_glitch(voltage, count);
                 } else if (strcmp(parts->parts[2], "SWEEP") == 0) {
                     target_power_sweep();
+                } else if (strcmp(parts->parts[2], "PAYLOAD") == 0) {
+                    float voltage = 1.8f;  // Default: just below BOR, preserve SRAM
+                    uint32_t attempts = 20;
+                    if (parts->count >= 4)
+                        voltage = strtof(parts->parts[3], NULL);
+                    if (parts->count >= 5)
+                        attempts = strtoul(parts->parts[4], NULL, 0);
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 100) attempts = 100;
+                    target_power_payload(voltage, attempts);
                 }
             }
         }

