@@ -645,6 +645,7 @@ This project is for hardware security research and educational purposes. Use res
 
 ## References
 
+- [Stimpik](https://github.com/xobs/stimpik) by Sean Cross (xobs) - STM32 RDP bypass via voltage fault injection. The SRAM retention sweep, power glitch approach, and BOR detection techniques in Raiden Pico are based on stimpik's research.
 - [RP2350 Datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf)
 - [ChipSHOUTER Documentation](https://chipshouter.readthedocs.io/)
 - [Pico SDK Documentation](https://www.raspberrypi.com/documentation/pico-sdk/)

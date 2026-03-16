@@ -804,6 +804,8 @@ static int sram_test_read_pattern(uint32_t sram_base) {
  * High threshold = shallow dip (SRAM survives).
  * Low threshold = deep dip (eventually corrupts SRAM or triggers BOR).
  */
+// SRAM retention sweep — based on stimpik by Sean Cross (xobs)
+// https://github.com/xobs/stimpik
 void target_power_sweep(void) {
     extern bool swd_connect(void);
     extern bool swd_halt(void);
@@ -867,31 +869,28 @@ void target_power_sweep(void) {
         gpio_set_dir(reset_pin, GPIO_IN);
         gpio_pull_up(reset_pin);
 
-        // --- GLITCH: float ALL power pins, let target drain its own caps ---
-        // Like stimpik: set all power GPIOs to INPUT (high-Z).
-        // Target's quiescent current slowly drains decoupling caps.
-        // ADC polls until voltage drops to threshold, then restore.
-        gpio_set_dir(POWER_PIN1, GPIO_IN);
-        gpio_set_dir(POWER_PIN2, GPIO_IN);
-        gpio_set_dir(POWER_PIN3, GPIO_IN);
-        gpio_disable_pulls(POWER_PIN1);
-        gpio_disable_pulls(POWER_PIN2);
-        gpio_disable_pulls(POWER_PIN3);
-
+        // --- Drop power: drive all power pins LOW ---
         adc_select_input(ADC_POWER_CHAN);
         uint32_t adc_log_count = 0;
 
-        // Pre-set output latch low (doesn't drive — pins are INPUT)
         uint64_t t0 = time_us_64();
         gpio_clr_mask(POWER_MASK);
 
         // Poll ADC until voltage drops below threshold
-        // Timeout after 500ms if threshold can't be reached
         bool thresh_reached = true;
+        bool nrst_went_low = false;
+        uint32_t nrst_low_us = 0;
+        uint16_t bor_adc = 0;
         while (true) {
             uint16_t val = adc_read();
             if (adc_log_count < ADC_LOG_SIZE)
                 adc_log[adc_log_count++] = val;
+            // Check nRST while voltage is dropping
+            if (!gpio_get(reset_pin) && !nrst_went_low) {
+                nrst_low_us = (uint32_t)(time_us_64() - t0);
+                bor_adc = val;
+                nrst_went_low = true;
+            }
             if (val <= thresh)
                 break;
             if (time_us_64() - t0 > 500000) {
@@ -900,26 +899,16 @@ void target_power_sweep(void) {
             }
         }
 
-        // Immediately restore ALL power pins (direction back to OUTPUT + drive HIGH)
-        gpio_set_dir(POWER_PIN1, GPIO_OUT);
-        gpio_set_dir(POWER_PIN2, GPIO_OUT);
-        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        // Restore power: drive all pins HIGH
         gpio_set_mask(POWER_MASK);
         uint32_t glitch_us_actual = (uint32_t)(time_us_64() - t0);
 
-        // Monitor NRST IMMEDIATELY after restore (before any other processing)
-        // Matches stimpik: NRST check must happen first to catch BOR pulse
-        bool nrst_went_low = false;
-        uint32_t nrst_low_us = 0;
-        uint16_t bor_adc = 0;
-        uint64_t t_glitch = time_us_64();
+        // Monitor nRST for 50ms after restore — BOR may assert with delay
         for (int i = 0; i < 5000; i++) {
-            if (!gpio_get(reset_pin)) {
-                if (!nrst_went_low) {
-                    nrst_low_us = (uint32_t)(time_us_64() - t_glitch);
-                    bor_adc = adc_read();
-                    nrst_went_low = true;
-                }
+            if (!gpio_get(reset_pin) && !nrst_went_low) {
+                nrst_low_us = (uint32_t)(time_us_64() - t0);
+                bor_adc = adc_read();
+                nrst_went_low = true;
             }
             sleep_us(10);
         }

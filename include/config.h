@@ -105,7 +105,7 @@ typedef struct {
     uint8_t trigger_pin;
     edge_type_t trigger_edge;
     uint8_t trigger_byte;
-    // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP6)
+    // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
 } glitch_config_t;
 
 // Platform Configuration
