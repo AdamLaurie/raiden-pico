@@ -371,6 +371,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP] [ms] - Control target power (GP10/11/12)\r\n");
         uart_cli_send("                   CYCLE: power off for ms (default 300ms)\r\n");
+        uart_cli_send("                   GLITCH <V> [n]: repeat glitch at threshold (default 10x)\r\n");
         uart_cli_send("                   SWEEP: SRAM retention test (needs TARGET, ADC on GP26)\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
@@ -1029,8 +1030,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
             } else {
                 // Match power command
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "SWEEP"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 4, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 5, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1044,6 +1045,18 @@ void command_parser_execute(cmd_parts_t *parts) {
                         cycle_time_ms = atoi(parts->parts[3]);
                     }
                     target_power_cycle(cycle_time_ms);
+                } else if (strcmp(parts->parts[2], "GLITCH") == 0) {
+                    if (parts->count < 4) {
+                        api_error("ERROR: Usage: TARGET POWER GLITCH <voltage> [count]\r\n");
+                        goto api_response;
+                    }
+                    float voltage = strtof(parts->parts[3], NULL);
+                    uint32_t count = 10;
+                    if (parts->count >= 5)
+                        count = strtoul(parts->parts[4], NULL, 0);
+                    if (count < 1) count = 1;
+                    if (count > 1000) count = 1000;
+                    target_power_glitch(voltage, count);
                 } else if (strcmp(parts->parts[2], "SWEEP") == 0) {
                     target_power_sweep();
                 }

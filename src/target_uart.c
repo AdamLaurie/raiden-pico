@@ -736,10 +736,169 @@ static void adc_power_init(void) {
     adc_select_input(ADC_POWER_CHAN);
 }
 
+// GPIO interrupt latch for nRST — catches pulses too brief for polling
+static volatile bool nrst_irq_fired;
+static volatile uint64_t nrst_irq_time;
+
+static void nrst_irq_handler(uint gpio, uint32_t events) {
+    (void)gpio;
+    (void)events;
+    if (!nrst_irq_fired) {
+        nrst_irq_fired = true;
+        nrst_irq_time = time_us_64();
+    }
+}
+
+static void nrst_irq_arm(void) {
+    nrst_irq_fired = false;
+    nrst_irq_time = 0;
+    gpio_set_irq_enabled_with_callback(reset_pin, GPIO_IRQ_EDGE_FALL, true, nrst_irq_handler);
+}
+
+static void nrst_irq_disarm(void) {
+    gpio_set_irq_enabled(reset_pin, GPIO_IRQ_EDGE_FALL, false);
+}
+
+// Result of a single power glitch
+typedef struct {
+    uint32_t glitch_us;
+    uint16_t vmin_raw;
+    bool thresh_reached;
+    bool nrst_went_low;
+    uint32_t nrst_low_us;
+    uint16_t bor_adc;
+} glitch_result_t;
+
+// Execute a single power glitch: drive power low, ADC-gate to threshold,
+// restore, monitor nRST.
+static void power_glitch_once(uint32_t thresh, uint16_t *adc_log,
+                              uint32_t adc_log_size, uint32_t *adc_log_count_out,
+                              glitch_result_t *result) {
+    result->thresh_reached = true;
+    result->nrst_went_low = false;
+    result->nrst_low_us = 0;
+    result->bor_adc = 0;
+    result->vmin_raw = 4095;
+
+    // Arm nRST interrupt to catch brief BOR pulses
+    nrst_irq_arm();
+
+    // Float POWER2/3 so only POWER1 sinks (controlled discharge)
+    gpio_set_dir(POWER_PIN2, GPIO_IN);
+    gpio_set_dir(POWER_PIN3, GPIO_IN);
+    gpio_disable_pulls(POWER_PIN2);
+    gpio_disable_pulls(POWER_PIN3);
+
+    // Select ADC channel (adc_power_init() already called once by caller)
+    adc_select_input(ADC_POWER_CHAN);
+
+    uint32_t adc_log_count = 0;
+
+    // Drive single power pin low
+    uint64_t t0 = time_us_64();
+    gpio_clr_mask(1u << POWER_PIN1);
+
+    // Poll ADC until voltage drops below threshold
+    while (true) {
+        uint16_t val = adc_read();
+        if (adc_log_count < adc_log_size)
+            adc_log[adc_log_count++] = val;
+        if (val < result->vmin_raw)
+            result->vmin_raw = val;
+        if (val <= thresh)
+            break;
+        if (time_us_64() - t0 > 500000) {
+            result->thresh_reached = false;
+            break;
+        }
+    }
+
+    // Restore power: all pins back to output HIGH
+    gpio_set_dir(POWER_PIN2, GPIO_OUT);
+    gpio_set_dir(POWER_PIN3, GPIO_OUT);
+    gpio_set_mask(POWER_MASK);
+    result->glitch_us = (uint32_t)(time_us_64() - t0);
+
+    // Monitor nRST for 50ms (polling + IRQ backup)
+    for (int i = 0; i < 5000; i++) {
+        if (!gpio_get(reset_pin) && !result->nrst_went_low) {
+            result->nrst_low_us = (uint32_t)(time_us_64() - t0);
+            result->bor_adc = adc_read();
+            result->nrst_went_low = true;
+        }
+        sleep_us(10);
+    }
+
+    // Check IRQ latch if polling missed it
+    nrst_irq_disarm();
+    if (!result->nrst_went_low && nrst_irq_fired) {
+        result->nrst_went_low = true;
+        result->nrst_low_us = (uint32_t)(nrst_irq_time - t0);
+        if (adc_log_count > 0 && result->glitch_us > 0) {
+            uint32_t idx = (uint32_t)((uint64_t)result->nrst_low_us * adc_log_count / result->glitch_us);
+            if (idx >= adc_log_count) idx = adc_log_count - 1;
+            result->bor_adc = adc_log[idx];
+        }
+    }
+
+    *adc_log_count_out = adc_log_count;
+}
+
 static float adc_read_voltage(void) {
     adc_select_input(ADC_POWER_CHAN);
     uint16_t raw = adc_read();
     return raw * 3.3f / 4095.0f;
+}
+
+// Auto-detect target via SWD if not already set. Returns target info or NULL.
+static const stm32_target_info_t *ensure_target_type(void) {
+    extern bool swd_connect(void);
+    extern bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+
+    const stm32_target_info_t *info = stm32_get_target_info(current_target_type);
+    if (info)
+        return info;
+
+    // Try SWD IDCODE auto-detection
+    uart_cli_send("No target set, attempting SWD auto-detect...\r\n");
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed. Set target with TARGET or SWD IDCODE\r\n");
+        return NULL;
+    }
+
+    uint32_t cpuid, dbg_id;
+    if (!swd_detect(&cpuid, &dbg_id)) {
+        swd_deinit();
+        uart_cli_send("ERROR: Could not read debug registers. Set target manually\r\n");
+        return NULL;
+    }
+    swd_deinit();
+
+    uint16_t dev_id = dbg_id & 0xFFF;
+    target_type_t auto_tt = TARGET_NONE;
+    switch (dev_id) {
+        case 0x410: case 0x412: case 0x414: case 0x430:
+            auto_tt = TARGET_STM32F1; break;
+        case 0x438:
+            auto_tt = TARGET_STM32F3; break;
+        case 0x413: case 0x419: case 0x421: case 0x423: case 0x433:
+            auto_tt = TARGET_STM32F4; break;
+        case 0x415: case 0x435: case 0x462: case 0x464: case 0x461:
+            auto_tt = TARGET_STM32L4; break;
+    }
+    if (auto_tt == TARGET_NONE) {
+        uart_cli_printf("ERROR: Unknown DEV_ID 0x%03X. Set target manually\r\n", dev_id);
+        return NULL;
+    }
+
+    target_set_type(auto_tt);
+    info = stm32_get_target_info(auto_tt);
+    uart_cli_printf("Auto-detected: %s (DEV_ID 0x%03X)\r\n", info->name, dev_id);
+    return info;
 }
 
 static int sram_test_write_pattern(uint32_t sram_base) {
@@ -812,11 +971,9 @@ void target_power_sweep(void) {
     extern void swd_init(void);
     extern void swd_deinit(void);
 
-    const stm32_target_info_t *info = stm32_get_target_info(current_target_type);
-    if (!info) {
-        uart_cli_send("ERROR: No target type set. Use TARGET or SWD IDCODE first\r\n");
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
         return;
-    }
 
     uint32_t sram_base = info->sram_base;
     uart_cli_printf("SRAM retention sweep on %s (SRAM @ 0x%08lX)\r\n", info->name, sram_base);
@@ -825,7 +982,7 @@ void target_power_sweep(void) {
     adc_power_init();
     power_ensure_init();
 
-    #define SWEEP_MAX 64
+    #define SWEEP_MAX 128
     #define ADC_LOG_SIZE 256
 
     struct {
@@ -840,23 +997,50 @@ void target_power_sweep(void) {
 
     uint16_t adc_log[ADC_LOG_SIZE];
 
-    /* Sweep from ~2.5V down in steps of ~0.08V */
-    for (uint32_t thresh = 3103; thresh >= 100; thresh -= 100) {
+    /* Sweep from ~2.5V down; switch to fine steps after first BOR */
+    uint32_t step = 100;  // ~0.08V coarse steps
+    bool seen_nrst = false;
+    uint32_t nrst_count = 0;
+    for (uint32_t thresh = 3103; thresh >= step; thresh -= step) {
         uart_cli_printf("\r\n--- Threshold: %lu (%.2fV) ---\r\n",
                         thresh, thresh * 3.3f / 4095.0f);
 
-        // Connect and halt target
+        // Connect, halt, write pattern — retry once after power cycle
         swd_init();
-        if (!swd_connect()) {
-            uart_cli_send("ERROR: SWD connect failed\r\n");
-            swd_deinit();
+        bool setup_ok = false;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            if (!swd_connect()) {
+                if (attempt == 0) {
+                    uart_cli_send("SWD connect failed, power cycling...\r\n");
+                    swd_deinit();
+                    gpio_clr_mask(POWER_MASK);
+                    sleep_ms(200);
+                    gpio_set_mask(POWER_MASK);
+                    sleep_ms(200);
+                    swd_init();
+                    continue;
+                }
+                uart_cli_send("ERROR: SWD connect failed after retry\r\n");
+                break;
+            }
+            if (!swd_halt() || sram_test_write_pattern(sram_base) != 0) {
+                if (attempt == 0) {
+                    uart_cli_send("Write failed, power cycling...\r\n");
+                    swd_deinit();
+                    gpio_clr_mask(POWER_MASK);
+                    sleep_ms(200);
+                    gpio_set_mask(POWER_MASK);
+                    sleep_ms(200);
+                    swd_init();
+                    continue;
+                }
+                uart_cli_send("ERROR: Write failed after retry\r\n");
+                break;
+            }
+            setup_ok = true;
             break;
         }
-        swd_halt();
-
-        // Write test pattern
-        if (sram_test_write_pattern(sram_base) != 0) {
-            uart_cli_send("Write failed, aborting sweep\r\n");
+        if (!setup_ok) {
             swd_deinit();
             break;
         }
@@ -869,72 +1053,24 @@ void target_power_sweep(void) {
         gpio_set_dir(reset_pin, GPIO_IN);
         gpio_pull_up(reset_pin);
 
-        // --- Drop power: drive all power pins LOW ---
-        adc_select_input(ADC_POWER_CHAN);
         uint32_t adc_log_count = 0;
-
-        uint64_t t0 = time_us_64();
-        gpio_clr_mask(POWER_MASK);
-
-        // Poll ADC until voltage drops below threshold
-        bool thresh_reached = true;
-        bool nrst_went_low = false;
-        uint32_t nrst_low_us = 0;
-        uint16_t bor_adc = 0;
-        while (true) {
-            uint16_t val = adc_read();
-            if (adc_log_count < ADC_LOG_SIZE)
-                adc_log[adc_log_count++] = val;
-            // Check nRST while voltage is dropping
-            if (!gpio_get(reset_pin) && !nrst_went_low) {
-                nrst_low_us = (uint32_t)(time_us_64() - t0);
-                bor_adc = val;
-                nrst_went_low = true;
-            }
-            if (val <= thresh)
-                break;
-            if (time_us_64() - t0 > 500000) {
-                thresh_reached = false;
-                break;
-            }
-        }
-
-        // Restore power: drive all pins HIGH
-        gpio_set_mask(POWER_MASK);
-        uint32_t glitch_us_actual = (uint32_t)(time_us_64() - t0);
-
-        // Monitor nRST for 50ms after restore — BOR may assert with delay
-        for (int i = 0; i < 5000; i++) {
-            if (!gpio_get(reset_pin) && !nrst_went_low) {
-                nrst_low_us = (uint32_t)(time_us_64() - t0);
-                bor_adc = adc_read();
-                nrst_went_low = true;
-            }
-            sleep_us(10);
-        }
-
-        // Now find actual Vmin from ADC log
-        uint16_t vmin_raw = 4095;
-        for (uint32_t i = 0; i < adc_log_count; i++) {
-            if (adc_log[i] < vmin_raw)
-                vmin_raw = adc_log[i];
-        }
+        glitch_result_t gr;
+        power_glitch_once(thresh, adc_log, ADC_LOG_SIZE, &adc_log_count, &gr);
 
         // Report glitch stats
-        // Report glitch stats
-        if (!thresh_reached) {
+        if (!gr.thresh_reached) {
             uart_cli_printf("Timeout: Vmin=%.2fV (can't reach %.2fV), NRST: %s\r\n",
-                            vmin_raw * 3.3f / 4095.0f,
+                            gr.vmin_raw * 3.3f / 4095.0f,
                             thresh * 3.3f / 4095.0f,
-                            nrst_went_low ? "TRIGGERED" : "no reset");
+                            gr.nrst_went_low ? "TRIGGERED" : "no reset");
         } else {
             uart_cli_printf("Glitch: %luus, Vmin=%.2fV, NRST: %s",
-                            glitch_us_actual,
-                            vmin_raw * 3.3f / 4095.0f,
-                            nrst_went_low ? "TRIGGERED" : "no reset");
-            if (nrst_went_low)
+                            gr.glitch_us,
+                            gr.vmin_raw * 3.3f / 4095.0f,
+                            gr.nrst_went_low ? "TRIGGERED" : "no reset");
+            if (gr.nrst_went_low)
                 uart_cli_printf(" (after %luus, BOR@%.2fV)",
-                                nrst_low_us, bor_adc * 3.3f / 4095.0f);
+                                gr.nrst_low_us, gr.bor_adc * 3.3f / 4095.0f);
             uart_cli_send("\r\n");
         }
 
@@ -945,13 +1081,18 @@ void target_power_sweep(void) {
         swd_init();
         int good = -1;
         if (swd_connect()) {
-            swd_halt();
-            good = sram_test_read_pattern(sram_base);
+            if (swd_halt())
+                good = sram_test_read_pattern(sram_base);
         }
         swd_deinit();
 
         if (good < 0) {
-            uart_cli_send("Read failed (can't attach after glitch)\r\n");
+            uart_cli_send("Read failed — power cycling target\r\n");
+            // Full power cycle to recover target
+            gpio_clr_mask(POWER_MASK);
+            sleep_ms(200);
+            gpio_set_mask(POWER_MASK);
+            sleep_ms(200);
         } else {
             uart_cli_printf("Result: %d/%d words retained at %.2fV threshold\r\n",
                             good, SRAM_TEST_WORDS, thresh * 3.3f / 4095.0f);
@@ -960,25 +1101,35 @@ void target_power_sweep(void) {
         // Record result
         if (result_count < SWEEP_MAX) {
             results[result_count].thresh = thresh;
-            results[result_count].vmin_raw = vmin_raw;
+            results[result_count].vmin_raw = gr.vmin_raw;
             results[result_count].good = (int16_t)good;
-            results[result_count].glitch_us = glitch_us_actual;
-            results[result_count].nrst = nrst_went_low;
-            results[result_count].bor_adc = bor_adc;
+            results[result_count].glitch_us = gr.glitch_us;
+            results[result_count].nrst = gr.nrst_went_low;
+            results[result_count].bor_adc = gr.bor_adc;
             result_count++;
         }
 
-        // Stop if threshold not reached or corruption/failure
-        if (!thresh_reached) {
-            uart_cli_printf("*** Voltage floor reached at %.2fV, stopping sweep ***\r\n",
-                            vmin_raw * 3.3f / 4095.0f);
-            break;
-        }
-        if (good < SRAM_TEST_WORDS) {
-            uart_cli_send("*** Corruption detected, stopping sweep ***\r\n");
-            break;
+        // After first SRAM corruption, switch to fine steps (~8mV)
+        if (good >= 0 && good < SRAM_TEST_WORDS && !seen_nrst) {
+            seen_nrst = true;
+            step = 10;
+            uart_cli_printf("  (Corruption detected, switching to fine steps: ~%.0fmV)\r\n",
+                            step * 3300.0f / 4095.0f);
+            nrst_count++;
+        } else if (good >= 0 && good < SRAM_TEST_WORDS) {
+            nrst_count++;
+            if (nrst_count >= 8) {
+                uart_cli_send("*** 8 corruption events, stopping sweep ***\r\n");
+                break;
+            }
         }
 
+        // Stop if threshold not reached
+        if (!gr.thresh_reached) {
+            uart_cli_printf("*** Voltage floor reached at %.2fV, stopping sweep ***\r\n",
+                            gr.vmin_raw * 3.3f / 4095.0f);
+            break;
+        }
         sleep_ms(200);  // Let target fully recover
     }
 
@@ -1029,4 +1180,130 @@ void target_power_sweep(void) {
     gpio_put(reset_pin, reset_active_high ? 0 : 1);
 
     uart_cli_send("Sweep complete, power restored\r\n");
+}
+
+// Repeated power glitch at a fixed threshold — reports success rate
+void target_power_glitch(float voltage, uint32_t count) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t thresh = (uint32_t)(voltage * 4095.0f / 3.3f);
+    if (thresh > 4095) thresh = 4095;
+
+    uart_cli_printf("Power glitch: %.2fV threshold (ADC %lu), %lu iterations on %s\r\n",
+                    voltage, thresh, count, info->name);
+
+    adc_power_init();
+    power_ensure_init();
+
+    uint32_t total_retained = 0;
+    uint32_t total_nrst = 0;
+    uint32_t total_both = 0;  // retained AND nRST
+    uint32_t total_fail = 0;
+    uint32_t total_timeout = 0;
+    uint32_t glitch_us_sum = 0;
+
+    #define GLITCH_ADC_LOG 256
+    uint16_t adc_log[GLITCH_ADC_LOG];
+
+    for (uint32_t iter = 0; iter < count; iter++) {
+        // Connect, halt, write pattern
+        swd_init();
+        if (!swd_connect()) {
+            uart_cli_printf("[%lu/%lu] SWD connect failed\r\n", iter + 1, count);
+            swd_deinit();
+            total_fail++;
+            sleep_ms(200);
+            continue;
+        }
+        swd_halt();
+        if (sram_test_write_pattern(sram_base) != 0) {
+            uart_cli_printf("[%lu/%lu] SRAM write failed\r\n", iter + 1, count);
+            swd_deinit();
+            total_fail++;
+            sleep_ms(200);
+            continue;
+        }
+
+        // Float SWD pins before glitch
+        swd_deinit();
+
+        // nRST as input with pull-up
+        gpio_init(reset_pin);
+        gpio_set_dir(reset_pin, GPIO_IN);
+        gpio_pull_up(reset_pin);
+
+        uint32_t adc_log_count = 0;
+        glitch_result_t gr;
+        power_glitch_once(thresh, adc_log, GLITCH_ADC_LOG, &adc_log_count, &gr);
+
+        if (!gr.thresh_reached) {
+            total_timeout++;
+            uart_cli_printf("[%lu/%lu] Timeout\r\n", iter + 1, count);
+            sleep_ms(200);
+            continue;
+        }
+
+        glitch_us_sum += gr.glitch_us;
+
+        // Wait for target to stabilize, then read back SRAM
+        sleep_ms(50);
+        swd_init();
+        int good = -1;
+        if (swd_connect()) {
+            swd_halt();
+            good = sram_test_read_pattern(sram_base);
+        }
+        swd_deinit();
+
+        bool retained = (good == SRAM_TEST_WORDS);
+        if (retained) total_retained++;
+        if (gr.nrst_went_low) total_nrst++;
+        if (retained && gr.nrst_went_low) total_both++;
+        if (good < 0) total_fail++;
+
+        uart_cli_printf("[%lu/%lu] %luus Vmin=%.2fV NRST:%s SRAM:%s\r\n",
+                        iter + 1, count, gr.glitch_us,
+                        gr.vmin_raw * 3.3f / 4095.0f,
+                        gr.nrst_went_low ? "Y" : "N",
+                        good < 0 ? "FAIL" : (retained ? "OK" : "CORRUPT"));
+
+        sleep_ms(200);
+    }
+
+    // Summary
+    uint32_t valid = count - total_timeout - total_fail;
+    uart_cli_send("\r\n=== Power Glitch Summary ===\r\n");
+    uart_cli_printf("Threshold: %.2fV, Iterations: %lu\r\n", voltage, count);
+    if (valid > 0)
+        uart_cli_printf("Avg glitch: %luus\r\n", glitch_us_sum / valid);
+    uart_cli_printf("SRAM retained: %lu/%lu (%lu%%)\r\n",
+                    total_retained, count,
+                    count > 0 ? total_retained * 100 / count : 0);
+    uart_cli_printf("nRST fired:    %lu/%lu (%lu%%)\r\n",
+                    total_nrst, count,
+                    count > 0 ? total_nrst * 100 / count : 0);
+    uart_cli_printf("Both (window): %lu/%lu (%lu%%)\r\n",
+                    total_both, count,
+                    count > 0 ? total_both * 100 / count : 0);
+    if (total_fail > 0)
+        uart_cli_printf("SWD failures:  %lu\r\n", total_fail);
+    if (total_timeout > 0)
+        uart_cli_printf("Timeouts:      %lu\r\n", total_timeout);
+
+    // Restore
+    gpio_set_mask(POWER_MASK);
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_disable_pulls(reset_pin);
+    gpio_put(reset_pin, reset_active_high ? 0 : 1);
+
+    uart_cli_send("Glitch test complete, power restored\r\n");
 }
