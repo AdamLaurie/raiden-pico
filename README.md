@@ -227,10 +227,26 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Defaults: 300ms pulse, GPIO 15, active low
 - Example: `TARGET RESET PERIOD 500 PIN 16 HIGH`
 
-**`TARGET POWER [ON|OFF|CYCLE] [ms]`** - Control/show target power on GP10
+**`TARGET POWER [ON|OFF|CYCLE] [ms]`** - Control/show target power on GP10/11/12
 - `ON` - Enable power
 - `OFF` - Disable power
 - `CYCLE` - Power cycle with optional duration (default: 300ms)
+
+**`TARGET POWER SWEEP`** - Calibrate voltage glitch threshold
+- Ramps target power down via ADC monitoring to find brown-out reset voltage
+- Required before PAYLOAD or BYPASS commands
+
+**`TARGET POWER GLITCH <voltage> [count]`** - Power glitch attack
+- Glitch target power to specified voltage threshold
+- Default: 1 attempt
+
+**`TARGET POWER PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
+- Power glitch then re-enter bootloader to check for ISP code readout bypass
+
+**`TARGET POWER BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
+- Two-stage attack: POR glitch → FPB redirect → UART flash dump at 115200 baud
+- Default: 20 attempts, full flash size
+- See [STM32F1 RDP1 Bypass Workflow](#4-stm32f1-rdp1-bypass) below
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms
@@ -467,6 +483,84 @@ TRIGGER GPIO RISING
 ARM ON
 ```
 
+### 4. STM32F1 RDP1 Bypass
+
+Extract flash from an RDP Level 1 protected STM32F103 using voltage fault injection and FPB (Flash Patch and Breakpoint) redirect.
+
+This attack is based on the original [stimpik](https://github.com/xobs/stimpik) research by Sean Cross (xobs), which demonstrated STM32F1 RDP bypass via voltage fault injection to achieve SRAM boot with memory retention. Raiden Pico's implementation improves on this by replacing the non-deterministic timing-based glitch (which requires many random attempts to hit the right moment) with a **deterministic approach** based on known ARM Cortex-M brown-out reset (BOR) behaviour at specific voltage thresholds. The `TARGET POWER SWEEP` command characterises the target's exact BOR threshold and SRAM retention window, meaning the subsequent attack glitch is calibrated to land in the proven-working voltage range every time — typically succeeding on the first attempt.
+
+#### Tuning
+
+If `TARGET POWER SWEEP` shows nRST being triggered at every threshold but no SRAM retention (all reads fail), the power rail capacitance is too low — the voltage drops below the BOR threshold too quickly for SRAM to retain its contents. Add decoupling capacitors (10-100µF) across the target VDD/GND to slow the voltage decay. Conversely, if nRST never triggers, the capacitance is too high and the voltage doesn't drop fast enough — reduce or remove external capacitors on VDD. The goal is a sweep that shows a range of thresholds where nRST fires AND SRAM contents are fully retained.
+
+#### Wiring
+
+| Pico GPIO | STM32 Pin | Function |
+|-----------|-----------|----------|
+| GP4 | PA10 (USART1 RX) | Bootloader/bypass TX |
+| GP5 | PA9 (USART1 TX) | Bypass RX (flash dump data) |
+| GP10/11/12 | VDD | Target power (ganged for current) |
+| GP13 | BOOT0 | Boot mode select |
+| GP14 | BOOT1 | Boot mode select |
+| GP15 | nRST | Reset control |
+| GP17 | SWCLK | SWD clock (payload upload) |
+| GP18 | SWDIO | SWD data (payload upload) |
+| GP26 | VDD | ADC voltage monitor (via divider) |
+| GND | GND | Common ground |
+
+#### How it works
+
+1. **Calibrate**: `TARGET POWER SWEEP` ramps power down to find the brown-out reset (BOR) threshold voltage
+2. **Upload**: Payload is written to SRAM via SWD — contains a NOP sled, FPB configuration (stage 1), and UART flash dump code (stage 2)
+3. **BOOT0=HIGH, POR glitch**: Power is cut below BOR threshold then restored. The glitch causes a power-on reset while BOOT0 is held high, forcing SRAM boot. The NOP sled catches all possible SRAM entry points
+4. **Stage 1**: Code configures FPB to redirect the reset vector fetch (address 0x04) to a remap table in SRAM containing stage 2's address, then signals ready via LED
+5. **BOOT0=LOW, nRST pulse**: Pico sets BOOT0 low and pulses nRST. CPU resets into flash boot mode — RDP sees flash boot and allows flash reads. But FPB (preserved across reset) redirects the reset vector fetch to stage 2 in SRAM
+6. **Stage 2**: Sends `RDP1` header + CPUID + continuous flash contents over USART1 at 115200 baud
+7. **Capture**: Pico receives the requested number of bytes, then power cycles the target to stop the dump
+
+#### Commands
+
+```bash
+# Check RDP level (should show Level 1)
+SWD RDP
+
+# Calibrate glitch threshold
+TARGET POWER SWEEP
+
+# Full flash dump (128KB for F103)
+TARGET POWER BYPASS
+
+# Partial dump (first 256 bytes, up to 50 attempts)
+TARGET POWER BYPASS 50 256
+```
+
+#### Example output
+
+```
+RDP1 bypass: 804 byte payload -> 0x20000000, dumping 131072 bytes
+Sweep calibrated threshold: 0.81V
+
+[1] Uploading bypass payload to SRAM...
+[SWD] Connected, DPIDR=0x1BA01477
+    Payload uploaded and verified
+[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)
+[3] Power glitch for POR (threshold: 0.81V, max 20 attempts)...
+  [1] Vmin=0.64V glitch=78us nRST=LOW
+    POR triggered — stage 1 configuring FPB...
+[4] Initializing UART RX (GP5, 115200, 8N1)...
+[5] Setting BOOT0=LOW (flash boot), pulsing nRST...
+[6] Receiving flash dump via UART...
+    Header: RDP1
+    CPUID: 0x411FC231 (Cortex-M3 r1p1)
+
+=== RDP1 BYPASS — FLASH DUMP ===
+Dumping 131072 bytes from 0x08000000:
+0x08000000: 00 50 00 20 09 04 00 08 ...
+...
+Dump complete: 131072 bytes received
+[7] Power cycling target...
+```
+
 ## Heatmap Visualization Tools
 
 The project includes Python scripts for automated XY scanning with real-time heatmap visualization.
@@ -506,9 +600,9 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 ### Default Pinout
 
 - **GPIO 2** - Glitch output (default)
-- **GPIO 4** - Target UART TX
-- **GPIO 5** - Target UART RX (also PIO monitored for UART triggers)
-- **GPIO 15** - Target reset (active low)
+- **GPIO 4** - Target UART TX (bootloader/bypass)
+- **GPIO 5** - Target UART RX (bootloader/bypass, also PIO monitored for UART triggers)
+- **GPIO 15** - Target reset / nRST (active low)
 
 ### ChipSHOUTER Connection
 
@@ -522,6 +616,14 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 9** - GRBL UART RX (UART1 alternate function)
 
 **Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
+
+### STM32 Attack / RDP Bypass
+
+- **GPIO 10/11/12** - Target Power (ganged, default ON, 12mA drive each)
+- **GPIO 13** - BOOT0 control
+- **GPIO 14** - BOOT1 control
+- **GPIO 15** - nRST (shared with Target Reset)
+- **GPIO 26** - ADC power monitor (voltage sense for glitch detection)
 
 ### SWD/JTAG Debug Interface
 
@@ -645,7 +747,7 @@ This project is for hardware security research and educational purposes. Use res
 
 ## References
 
-- [Stimpik](https://github.com/xobs/stimpik) by Sean Cross (xobs) - STM32 RDP bypass via voltage fault injection. The SRAM retention sweep, power glitch approach, and BOR detection techniques in Raiden Pico are based on stimpik's research.
+- [Stimpik](https://github.com/xobs/stimpik) by Sean Cross (xobs) - Original STM32 RDP bypass via voltage fault injection. The SRAM retention sweep, power glitch approach, and BOR detection techniques in Raiden Pico are based on stimpik's pioneering research. See [STM32F1 RDP1 Bypass](#4-stm32f1-rdp1-bypass) for details on how Raiden Pico extends this with deterministic glitch calibration.
 - [RP2350 Datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf)
 - [ChipSHOUTER Documentation](https://chipshouter.readthedocs.io/)
 - [Pico SDK Documentation](https://www.raspberrypi.com/documentation/pico-sdk/)

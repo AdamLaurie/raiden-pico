@@ -69,5 +69,6 @@ bool target_power_get_state(void);
 void target_power_sweep(void);
 void target_power_glitch(float voltage, uint32_t count);
 void target_power_payload(float voltage, uint32_t max_attempts);
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes);
 
 #endif // TARGET_UART_H

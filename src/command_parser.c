@@ -369,10 +369,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD] - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD|BYPASS] - Control target power (GP10/11/12)\r\n");
         uart_cli_send("                   CYCLE: power off for ms (default 300ms)\r\n");
         uart_cli_send("                   GLITCH <V> [n]: repeat glitch at threshold (default 10x)\r\n");
         uart_cli_send("                   SWEEP: SRAM retention test (needs TARGET, ADC on GP26)\r\n");
+        uart_cli_send("                   BYPASS [attempts] [count]: RDP1 flash dump [STM32F1] (default: full flash)\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
@@ -738,8 +739,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("USB  - CLI (ttyACM0, USB CDC)\r\n");
         uart_cli_send("GP0  - ChipSHOUTER UART TX (UART0)\r\n");
         uart_cli_send("GP1  - ChipSHOUTER UART RX (UART0)\r\n");
-        uart_cli_send("GP4  - Target UART TX (UART1)\r\n");
-        uart_cli_send("GP5  - Target UART RX (UART1, also PIO monitored)\r\n");
+        uart_cli_send("GP4  - Target UART TX (UART1, bootloader/bypass TX)\r\n");
+        uart_cli_send("GP5  - Target UART RX (UART1, bootloader/bypass RX, also PIO monitored)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_printf("GP%u  - Glitch Output (normal)\r\n", PIN_GLITCH_OUT);
@@ -762,6 +763,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== STM32 Attack ==\r\n");
         uart_cli_printf("GP%u - BOOT0 Control\r\n", STM32_BOOT0_PIN);
         uart_cli_printf("GP%u - BOOT1 Control\r\n", STM32_BOOT1_PIN);
+        uart_cli_send("GP26 - ADC Power Monitor (voltage sense for glitch detection)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Debug Interface (SWD/JTAG) ==\r\n");
         uart_cli_send("GP15 - nRST / TRST (shared with Target Reset)\r\n");
@@ -1030,8 +1032,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
             } else {
                 // Match power command
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 6, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD", "BYPASS"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 7, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1069,6 +1071,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
                     target_power_payload(voltage, attempts);
+                } else if (strcmp(parts->parts[2], "BYPASS") == 0) {
+                    // BYPASS [attempts] [count]
+                    uint32_t attempts = 20;
+                    uint32_t dump_bytes = 0;  // 0 = full flash
+                    if (parts->count >= 4)
+                        attempts = strtoul(parts->parts[3], NULL, 0);
+                    if (parts->count >= 5)
+                        dump_bytes = strtoul(parts->parts[4], NULL, 0);
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 100) attempts = 100;
+                    target_power_bypass(attempts, dump_bytes);
                 }
             }
         }
@@ -1829,7 +1842,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                     uint8_t *p = (uint8_t *)buf;
                     for (uint32_t i = 0; i < nread * 4 && (offset * 4 + i) < bytes; i += 16) {
                         uint32_t line_addr = addr + offset * 4 + i;
-                        uart_cli_printf("%08X:", line_addr);
+                        uart_cli_printf("0x%08X:", line_addr);
                         for (uint32_t j = i; j < i + 16 && (offset * 4 + j) < bytes; j++) {
                             if (j < nread * 4)
                                 uart_cli_printf(" %02X", p[j]);
@@ -2202,6 +2215,11 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else {
                     api_error("ERROR: Failed to set RDP\r\n");
                 }
+            } else if (parts->count >= 3) {
+                // User typed something like "SWD RDP 1" — suggest correct syntax
+                uart_cli_send("ERROR: Unknown RDP subcommand. Did you mean:\r\n");
+                uart_cli_send("  SWD RDP          - Read current RDP level\r\n");
+                uart_cli_send("  SWD RDP SET <0|1> - Set RDP level\r\n");
             } else {
                 int rdp = swd_stm32_read_rdp(info);
                 if (rdp >= 0) {
