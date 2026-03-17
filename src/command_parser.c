@@ -369,11 +369,12 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD|BYPASS] - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD|BYPASS|HALT] - Control target power (GP10/11/12)\r\n");
         uart_cli_send("                   CYCLE: power off for ms (default 300ms)\r\n");
         uart_cli_send("                   GLITCH <V> [n]: repeat glitch at threshold (default 10x)\r\n");
         uart_cli_send("                   SWEEP: SRAM retention test (needs TARGET, ADC on GP26)\r\n");
-        uart_cli_send("                   BYPASS [attempts] [count]: RDP1 flash dump [STM32F1] (default: full flash)\r\n");
+        uart_cli_send("                   BYPASS [attempts] [count]: RDP1 flash dump via glitch [STM32F1] (default: full flash)\r\n");
+        uart_cli_send("                   HALT [count]: RDP1 flash dump via SWD+FPB [STM32F1] (no glitch needed)\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
@@ -1032,8 +1033,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
             } else {
                 // Match power command
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD", "BYPASS"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 7, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD", "BYPASS", "HALT"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 8, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1082,6 +1083,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
                     target_power_bypass(attempts, dump_bytes);
+                } else if (strcmp(parts->parts[2], "HALT") == 0) {
+                    // HALT [count]
+                    uint32_t dump_bytes = 0;  // 0 = full flash
+                    if (parts->count >= 4)
+                        dump_bytes = strtoul(parts->parts[3], NULL, 0);
+                    target_power_halt(dump_bytes);
                 }
             }
         }

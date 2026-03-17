@@ -394,50 +394,63 @@ bool swd_read_dp(uint8_t addr, uint32_t *value) {
     if (!initialized)
         return false;
 
-    // Send request
     uint8_t request = make_request(false, true, addr);
-    swd_seq_out(request, 8);
 
-    // Read ACK
-    last_ack = swd_seq_in(3);
+    for (int retry = 0; retry < 100; retry++) {
+        swd_seq_out(request, 8);
+        last_ack = swd_seq_in(3);
 
-    if (last_ack != SWD_ACK_OK) {
-        swd_turnaround(SWDIO_DRIVE);
-        return false;
+        if (last_ack == SWD_ACK_WAIT) {
+            swd_turnaround(SWDIO_DRIVE);
+            swd_seq_out(0, 8);
+            continue;
+        }
+        if (last_ack != SWD_ACK_OK) {
+            swd_turnaround(SWDIO_DRIVE);
+            return false;
+        }
+
+        bool parity_ok = swd_seq_in_parity(value);
+        swd_seq_out(0, 8);
+        return parity_ok;
     }
-
-    // Read data with parity (seq_in_parity calls turnaround(DRIVE) internally)
-    bool parity_ok = swd_seq_in_parity(value);
-
-    // Idle cycles
-    swd_seq_out(0, 8);
-
-    return parity_ok;
+    // WAIT timeout
+    swd_write_dp(DP_ABORT, 0x1E);
+    return false;
 }
 
 bool swd_write_dp(uint8_t addr, uint32_t value) {
     if (!initialized)
         return false;
 
-    // Send request
     uint8_t request = make_request(false, false, addr);
-    swd_seq_out(request, 8);
 
-    // Read ACK
-    last_ack = swd_seq_in(3);
+    for (int retry = 0; retry < 100; retry++) {
+        swd_seq_out(request, 8);
+        last_ack = swd_seq_in(3);
 
-    if (last_ack != SWD_ACK_OK) {
-        swd_turnaround(SWDIO_DRIVE);
-        return false;
+        if (last_ack == SWD_ACK_WAIT) {
+            swd_turnaround(SWDIO_DRIVE);
+            swd_seq_out(0, 8);
+            continue;
+        }
+        if (last_ack != SWD_ACK_OK) {
+            swd_turnaround(SWDIO_DRIVE);
+            return false;
+        }
+
+        swd_seq_out_parity(value);
+        swd_seq_out(0, 8);
+        return true;
     }
-
-    // Write data with parity (seq_out_parity->seq_out handles turnaround internally)
-    swd_seq_out_parity(value);
-
-    // Idle cycles
+    // WAIT timeout — clear sticky overrun
+    uint8_t abort_req = make_request(false, false, DP_ABORT);
+    swd_seq_out(abort_req, 8);
+    swd_seq_in(3);
+    swd_turnaround(SWDIO_DRIVE);
+    swd_seq_out_parity(0x1E);
     swd_seq_out(0, 8);
-
-    return true;
+    return false;
 }
 
 // Set SELECT register for AP access
@@ -458,22 +471,32 @@ bool swd_read_ap(uint8_t ap, uint8_t addr, uint32_t *value) {
     if (!swd_select_ap(ap, addr))
         return false;
 
-    // First AP read is posted - do dummy read
+    // First AP read is posted - do dummy read with WAIT retry
     uint8_t request = make_request(true, true, addr & 0xC);
-    swd_seq_out(request, 8);
 
-    last_ack = swd_seq_in(3);
-    if (last_ack != SWD_ACK_OK) {
-        swd_turnaround(SWDIO_DRIVE);
-        return false;
+    for (int retry = 0; retry < 100; retry++) {
+        swd_seq_out(request, 8);
+        last_ack = swd_seq_in(3);
+
+        if (last_ack == SWD_ACK_WAIT) {
+            swd_turnaround(SWDIO_DRIVE);
+            swd_seq_out(0, 8);
+            continue;
+        }
+        if (last_ack != SWD_ACK_OK) {
+            swd_turnaround(SWDIO_DRIVE);
+            return false;
+        }
+
+        uint32_t dummy;
+        swd_seq_in_parity(&dummy);
+        swd_seq_out(0, 8);
+
+        // Read RDBUFF to get actual value
+        return swd_read_dp(DP_RDBUFF, value);
     }
-
-    uint32_t dummy;
-    swd_seq_in_parity(&dummy);
-    swd_seq_out(0, 8);
-
-    // Read RDBUFF to get actual value
-    return swd_read_dp(DP_RDBUFF, value);
+    swd_write_dp(DP_ABORT, 0x1E);
+    return false;
 }
 
 bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value) {
@@ -484,19 +507,27 @@ bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value) {
         return false;
 
     uint8_t request = make_request(true, false, addr & 0xC);
-    swd_seq_out(request, 8);
 
-    last_ack = swd_seq_in(3);
+    for (int retry = 0; retry < 100; retry++) {
+        swd_seq_out(request, 8);
+        last_ack = swd_seq_in(3);
 
-    if (last_ack != SWD_ACK_OK) {
-        swd_turnaround(SWDIO_DRIVE);
-        return false;
+        if (last_ack == SWD_ACK_WAIT) {
+            swd_turnaround(SWDIO_DRIVE);
+            swd_seq_out(0, 8);
+            continue;
+        }
+        if (last_ack != SWD_ACK_OK) {
+            swd_turnaround(SWDIO_DRIVE);
+            return false;
+        }
+
+        swd_seq_out_parity(value);
+        swd_seq_out(0, 8);
+        return true;
     }
-
-    swd_seq_out_parity(value);
-    swd_seq_out(0, 8);
-
-    return true;
+    swd_write_dp(DP_ABORT, 0x1E);
+    return false;
 }
 
 // Base CSW value — read from AP defaults during init, like BMP's adiv5_new_ap.

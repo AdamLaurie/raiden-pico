@@ -145,6 +145,12 @@ static const uint8_t f103_rdp_bypass_payload[] = {
   0x0c, 0x38, 0x01, 0x40, 0x00, 0x38, 0x01, 0x40, 0x00, 0xed, 0x00, 0xe0,
 };
 
+// Diagnostic variant of RDP bypass payload (896 bytes)
+// Same as above but stage 2 sends register diagnostics before flash dump
+// Protocol: "RDP1" + CPUID(4B) + "DIAG" + 7 regs(28B) + flash bytes
+// Regs: DHCSR, DEMCR, FP_CTRL, FP_COMP0, VTOR, FLASH_OBR, RCC_CSR
+#include "../stm32_payloads/f1/rdp_bypass_diag_hex.h"
+
 // RDP bypass constants
 #define BYPASS_DUMP_ADDR   0x20004000  // Where stage2 dumps flash
 #define BYPASS_DUMP_WORDS  64          // 256 bytes = 64 words
@@ -1953,6 +1959,399 @@ bypass_reset:
 
 bypass_cleanup:
     // Restore boot pins
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+}
+
+// STM32F1 RDP1 bypass via SWD halt + FPB redirect (no power glitch needed)
+// Connects under reset, writes payload + FPB config via SWD, then flash-boots
+// with FPB redirecting reset vector to stage 2 UART dump code in SRAM.
+void target_power_halt(uint32_t dump_bytes) {
+    extern bool swd_connect_under_reset(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(f103_rdp_bypass_diag_payload) + 3) / 4;
+
+    // Default to full flash if no count specified
+    if (dump_bytes == 0)
+        dump_bytes = info->flash_size;
+    // Round up to word boundary
+    dump_bytes = (dump_bytes + 3) & ~3u;
+
+    // Stage 2 entry point (thumb address) — from payload ELF symbols
+    // stage2_start is at offset 0x3AC from SRAM base (diag payload with FPB reader + STOP debug kill)
+    const uint32_t stage2_thumb_addr = sram_base + 0x3AC + 1;  // +1 for thumb bit
+
+    uart_cli_printf("RDP1 HALT bypass: %u byte diag payload -> 0x%08lX, dumping %lu bytes\r\n",
+                    (unsigned)sizeof(f103_rdp_bypass_diag_payload), sram_base, dump_bytes);
+    uart_cli_printf("Stage 2 entry: 0x%08lX\r\n", stage2_thumb_addr);
+
+    // === Step 1: Connect under reset, upload payload + configure FPB ===
+    uart_cli_send("\r\n[1] Connecting under reset...\r\n");
+    swd_init();
+
+    // Set BOOT0=0 now (flash boot mode for after release)
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 0);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 0);
+
+    if (!swd_connect_under_reset()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect under reset failed\r\n");
+        return;
+    }
+    uart_cli_send("    Connected, core halted under reset\r\n");
+
+    // === Step 2: Upload diag payload to SRAM ===
+    uart_cli_send("[2] Uploading diag payload to SRAM...\r\n");
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)f103_rdp_bypass_diag_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    // Verify write
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, f103_rdp_bypass_diag_payload, sizeof(f103_rdp_bypass_diag_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    // === Step 3: Configure FPB via SWD ===
+    uart_cli_send("[3] Configuring FPB via SWD...\r\n");
+
+    // Write stage 2 thumb address to remap table at 0x20000020
+    // (this overwrites part of the NOP sled, which is fine — stage 1 won't run)
+    uint32_t remap_val = stage2_thumb_addr;
+    if (swd_write_mem(sram_base + 0x20, &remap_val, 1) != 1) {
+        uart_cli_send("ERROR: Failed to write remap table\r\n");
+        swd_deinit();
+        return;
+    }
+
+    // FP_CTRL (0xE0002000) = 0x03: ENABLE + KEY
+    uint32_t fp_ctrl = 0x03;
+    if (swd_write_mem(0xE0002000, &fp_ctrl, 1) != 1) {
+        uart_cli_send("ERROR: Failed to write FP_CTRL\r\n");
+        swd_deinit();
+        return;
+    }
+
+    // FP_REMAP (0xE0002004) = 0x20: remap table at 0x20000020 (bits[28:5])
+    uint32_t fp_remap = 0x20000020;
+    if (swd_write_mem(0xE0002004, &fp_remap, 1) != 1) {
+        uart_cli_send("ERROR: Failed to write FP_REMAP\r\n");
+        swd_deinit();
+        return;
+    }
+
+    // FP_COMP0 (0xE0002008) = 0x05: ENABLE + match address 0x04 (REPLACE=00 remap)
+    uint32_t fp_comp0 = 0x05;
+    if (swd_write_mem(0xE0002008, &fp_comp0, 1) != 1) {
+        uart_cli_send("ERROR: Failed to write FP_COMP0\r\n");
+        swd_deinit();
+        return;
+    }
+
+    // Verify FPB config
+    uint32_t verify_val;
+    swd_read_mem(0xE0002000, &verify_val, 1);
+    uart_cli_printf("    FP_CTRL:  0x%08lX\r\n", verify_val);
+    swd_read_mem(0xE0002004, &verify_val, 1);
+    uart_cli_printf("    FP_REMAP: 0x%08lX\r\n", verify_val);
+    swd_read_mem(0xE0002008, &verify_val, 1);
+    uart_cli_printf("    FP_COMP0: 0x%08lX\r\n", verify_val);
+    swd_read_mem(sram_base + 0x20, &verify_val, 1);
+    uart_cli_printf("    Remap[0]: 0x%08lX (stage 2 entry)\r\n", verify_val);
+
+    // Clear VC_CORERESET so core doesn't re-halt on resume
+    uint32_t demcr_val = 0;
+    swd_write_mem(0xE000EDFC, &demcr_val, 1);
+
+    // === Step 4: Set PC to stage 1, resume, tri-state SWD ===
+    uart_cli_send("[4] Running stage 1 (STOP/wake debug kill)...\r\n");
+    extern bool swd_write_core_reg(uint8_t reg, uint32_t value);
+    uint32_t stage1_addr = sram_base + 0x200 + 1;
+    swd_write_core_reg(13, 0x20005000);
+    swd_write_core_reg(15, stage1_addr);
+    // Init UART before resume so we catch stage 1's diagnostic output
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    // BMP cortexm_detach: 3-step DHCSR to clear C_DEBUGEN via DAP
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    uint32_t dhcsr_val;
+    // Step 1: halt + debugen (ensure clean state)
+    dhcsr_val = 0xA05F0003;  // DBGKEY | C_DEBUGEN | C_HALT
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    // Step 2: resume with debugen (clear C_HALT)
+    dhcsr_val = 0xA05F0001;  // DBGKEY | C_DEBUGEN
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    // Step 3: clear C_DEBUGEN (core running, debug disabled)
+    dhcsr_val = 0xA05F0000;  // DBGKEY only
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    // Tri-state SWD
+    swd_deinit();
+
+    // Wait for stage 1: clear debug + RTC setup + STOP + wake + UART report
+    sleep_ms(200);
+
+    // Read stage 1 diagnostic: "S1:X\n" where X = C_DEBUGEN after STOP/wake
+    uart_cli_send("    Stage 1 report: ");
+    int s1_chars = 0;
+    while (uart_is_readable(TARGET_UART_ID) && s1_chars < 20) {
+        uint8_t c = uart_getc(TARGET_UART_ID);
+        uart_cli_printf("%02X ", c);
+        s1_chars++;
+    }
+    if (s1_chars == 0) uart_cli_send("(nothing received)");
+    uart_cli_send("\r\n");
+
+    // === Step 5: Pulse nRST — FPB redirects reset vector to stage 2 ===
+    uart_cli_send("[5] Pulsing nRST (flash boot with FPB redirect)...\r\n");
+    uart_cli_send("[6] Receiving flash dump via UART...\r\n");
+
+    // Drain FIFO before reset
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    // Pulse nRST low then release — system reset preserves FPB
+    uint8_t reset_pin = 15;  // GP15 = nRST
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    // --- Wait for "RDP1" header (scan byte-by-byte) ---
+    #define HALT_TIMEOUT_US 5000000     // 5 second total timeout
+    #define HALT_BYTE_TIMEOUT_US 500000 // 500ms idle = give up
+
+    uint8_t hdr_state = 0;
+    const char *hdr_str = "RDP1";
+    uint64_t rx_start = time_us_64();
+    uint64_t last_byte_time = rx_start;
+    bool hdr_found = false;
+
+    while (!hdr_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            last_byte_time = time_us_64();
+            if (c == hdr_str[hdr_state]) {
+                hdr_state++;
+                if (hdr_state == 4) hdr_found = true;
+            } else {
+                hdr_state = (c == 'R') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - rx_start > HALT_TIMEOUT_US) break;
+            if (hdr_state > 0 && (time_us_64() - last_byte_time > HALT_BYTE_TIMEOUT_US)) break;
+        }
+    }
+
+    if (!hdr_found) {
+        uart_cli_send("ERROR: \"RDP1\" header not received — stage 2 may not be executing\r\n");
+        uart_cli_send("  FPB may have been cleared by reset, or debug access was blocked\r\n");
+        goto halt_cleanup;
+    }
+    uart_cli_send("    Header: RDP1\r\n");
+
+    // --- Receive CPUID (4 bytes) ---
+    uint8_t cpuid_buf[4];
+    for (int i = 0; i < 4; i++) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > HALT_BYTE_TIMEOUT_US) {
+                uart_cli_send("ERROR: Timeout reading CPUID\r\n");
+                goto halt_cleanup;
+            }
+        }
+        cpuid_buf[i] = uart_getc(TARGET_UART_ID);
+    }
+    uint32_t cpuid = cpuid_buf[0] | (cpuid_buf[1] << 8) |
+                    (cpuid_buf[2] << 16) | (cpuid_buf[3] << 24);
+    uint8_t implementer = (cpuid >> 24) & 0xFF;
+    uint16_t partno = (cpuid >> 4) & 0xFFF;
+    uart_cli_printf("    CPUID: 0x%08lX", cpuid);
+    if (implementer == 0x41 && partno == 0xC23)
+        uart_cli_printf(" (Cortex-M3 r%lup%lu)\r\n", (cpuid >> 20) & 0xF, cpuid & 0xF);
+    else if (implementer == 0x41 && partno == 0xC24)
+        uart_cli_send(" (Cortex-M4)\r\n");
+    else
+        uart_cli_send("\r\n");
+
+    // --- Receive "DIAG" marker (4 bytes) ---
+    uint8_t diag_state = 0;
+    const char *diag_str = "DIAG";
+    bool diag_found = false;
+    uint64_t diag_start = time_us_64();
+
+    while (!diag_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            if (c == diag_str[diag_state]) {
+                diag_state++;
+                if (diag_state == 4) diag_found = true;
+            } else {
+                diag_state = (c == 'D') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - diag_start > HALT_BYTE_TIMEOUT_US) break;
+        }
+    }
+
+    if (!diag_found) {
+        uart_cli_send("WARNING: \"DIAG\" marker not received — may be non-diag payload\r\n");
+    } else {
+        // Read 7 diagnostic registers (4 bytes each, little-endian)
+        uart_cli_send("\r\n=== DIAGNOSTIC REGISTERS ===\r\n");
+        struct {
+            const char *name;
+            uint32_t addr;
+            const char *desc;
+        } diag_regs[] = {
+            {"DHCSR",     0xE000EDF0, "C_DEBUGEN"},
+            {"DEMCR",     0xE000EDFC, "VC_CORERESET"},
+            {"FP_CTRL",   0xE0002000, "FPB enable"},
+            {"FP_COMP0",  0xE0002008, "comparator 0"},
+            {"VTOR",      0xE000ED08, "vector table"},
+            {"FLASH_OBR", 0x4002201C, "RDP status"},
+            {"RCC_CSR",   0x40021024, "reset flags"},
+        };
+
+        for (int reg = 0; reg < 7; reg++) {
+            uint8_t reg_buf[4];
+            bool reg_ok = true;
+            for (int i = 0; i < 4; i++) {
+                uint64_t t0 = time_us_64();
+                while (!uart_is_readable(TARGET_UART_ID)) {
+                    if (time_us_64() - t0 > HALT_BYTE_TIMEOUT_US) {
+                        reg_ok = false;
+                        break;
+                    }
+                }
+                if (!reg_ok) break;
+                reg_buf[i] = uart_getc(TARGET_UART_ID);
+            }
+            if (!reg_ok) {
+                uart_cli_printf("  %s: TIMEOUT\r\n", diag_regs[reg].name);
+                break;
+            }
+            uint32_t val = reg_buf[0] | (reg_buf[1] << 8) |
+                          (reg_buf[2] << 16) | (reg_buf[3] << 24);
+            uart_cli_printf("  %-10s (0x%08lX) = 0x%08lX", diag_regs[reg].name, diag_regs[reg].addr, val);
+
+            // Decode key bits
+            if (reg == 0) { // DHCSR
+                uart_cli_printf("  C_DEBUGEN=%lu", val & 1);
+                if (val & (1 << 1)) uart_cli_send(" C_HALT");
+                if (val & (1 << 17)) uart_cli_send(" S_HALT");
+            } else if (reg == 1) { // DEMCR
+                uart_cli_printf("  VC_CORERESET=%lu TRCENA=%lu", val & 1, (val >> 24) & 1);
+            } else if (reg == 2) { // FP_CTRL
+                uart_cli_printf("  ENABLE=%lu NUM_CODE=%lu", val & 1, (val >> 4) & 0xF);
+            } else if (reg == 3) { // FP_COMP0
+                uart_cli_printf("  ENABLE=%lu COMP=0x%08lX", val & 1, val & ~3u);
+            } else if (reg == 4) { // VTOR
+                uart_cli_printf("  %s", val == 0 ? "FLASH" : (val == 0x20000000 ? "SRAM" : "OTHER"));
+            } else if (reg == 5) { // FLASH_OBR
+                uart_cli_printf("  RDPRT=%lu", (val >> 1) & 1);
+            } else if (reg == 6) { // RCC_CSR
+                uart_cli_send(" ");
+                if (val & (1 << 26)) uart_cli_send("PIN_RST ");
+                if (val & (1 << 27)) uart_cli_send("POR ");
+                if (val & (1 << 28)) uart_cli_send("SW_RST ");
+                if (val & (1 << 29)) uart_cli_send("IWDG ");
+                if (val & (1 << 30)) uart_cli_send("WWDG ");
+                if (val & (1 << 31)) uart_cli_send("LPWR ");
+            }
+            uart_cli_send("\r\n");
+        }
+        uart_cli_send("============================\r\n");
+    }
+
+    // --- Stream flash data ---
+    uart_cli_send("\r\n=== RDP1 HALT BYPASS — FLASH DUMP ===\r\n");
+    uart_cli_printf("Dumping %lu bytes from 0x08000000:\r\n", dump_bytes);
+
+    uint32_t rx_total = 0;
+    uint8_t line_buf[16];
+    uint32_t line_pos = 0;
+
+    while (rx_total < dump_bytes) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > HALT_BYTE_TIMEOUT_US) {
+                if (line_pos > 0) {
+                    uint32_t line_addr = 0x08000000 + rx_total - line_pos;
+                    uart_cli_printf("0x%08lX:", line_addr);
+                    for (uint32_t j = 0; j < line_pos; j++)
+                        uart_cli_printf(" %02X", line_buf[j]);
+                    for (uint32_t j = line_pos; j < 16; j++)
+                        uart_cli_send("   ");
+                    uart_cli_send("  ");
+                    for (uint32_t j = 0; j < line_pos; j++) {
+                        char c = line_buf[j];
+                        uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+                    }
+                    uart_cli_send("\r\n");
+                }
+                uart_cli_printf("\r\nERROR: Timeout after %lu of %lu bytes\r\n", rx_total, dump_bytes);
+                goto halt_reset;
+            }
+        }
+        line_buf[line_pos++] = uart_getc(TARGET_UART_ID);
+        rx_total++;
+
+        if (line_pos == 16 || rx_total == dump_bytes) {
+            uint32_t line_addr = 0x08000000 + rx_total - line_pos;
+            uart_cli_printf("0x%08lX:", line_addr);
+            for (uint32_t j = 0; j < line_pos; j++)
+                uart_cli_printf(" %02X", line_buf[j]);
+            for (uint32_t j = line_pos; j < 16; j++)
+                uart_cli_send("   ");
+            uart_cli_send("  ");
+            for (uint32_t j = 0; j < line_pos; j++) {
+                char c = line_buf[j];
+                uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+            }
+            uart_cli_send("\r\n");
+            line_pos = 0;
+        }
+    }
+
+    uart_cli_printf("\r\nDump complete: %lu bytes received\r\n", rx_total);
+
+halt_reset:
+    uart_cli_send("[7] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
+
+halt_cleanup:
     gpio_put(BOOT0_PIN, 0);
     gpio_put(BOOT1_PIN, 0);
 }
