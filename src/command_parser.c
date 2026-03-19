@@ -28,6 +28,26 @@ static char *part_buffers[MAX_CMD_PARTS];
 
 // API mode state
 static bool api_mode = false;
+
+// Safe hex/int parsing with overflow detection
+// Returns true on success, false on overflow or empty input
+static bool parse_u32(const char *str, int base, uint32_t *out) {
+    if (!str || !*str) return false;
+    char *end;
+    unsigned long val = strtoul(str, &end, base);
+    if (end == str || *end != '\0') return false;  // no digits or trailing junk
+    if (val > 0xFFFFFFFFUL) return false;           // overflow on 64-bit
+    // On 32-bit, strtoul wraps — detect by checking digit count for base 16
+    if (base == 16 || base == 0) {
+        const char *hex = str;
+        if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+        size_t ndigits = strlen(hex);
+        if (base == 0 && hex != str) ndigits = strlen(hex); // 0x prefix already stripped
+        if (ndigits > 8) return false;  // more than 8 hex digits = overflow
+    }
+    *out = (uint32_t)val;
+    return true;
+}
 static bool command_failed = false;
 static char last_error[MAX_ERROR_LENGTH] = {0};
 
@@ -248,8 +268,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 12, "TARGET sub-command")) {
+                                              "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 13, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
@@ -369,12 +389,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
-        uart_cli_send("TARGET POWER [ON|OFF|CYCLE|SWEEP|PAYLOAD|BYPASS|HALT] - Control target power (GP10/11/12)\r\n");
-        uart_cli_send("                   CYCLE: power off for ms (default 300ms)\r\n");
-        uart_cli_send("                   GLITCH <V> [n]: repeat glitch at threshold (default 10x)\r\n");
-        uart_cli_send("                   SWEEP: SRAM retention test (needs TARGET, ADC on GP26)\r\n");
-        uart_cli_send("                   BYPASS [attempts] [count]: RDP1 flash dump via glitch [STM32F1] (default: full flash)\r\n");
-        uart_cli_send("                   HALT [count]: RDP1 flash dump via SWD+FPB [STM32F1] (no glitch needed)\r\n");
+        uart_cli_send("TARGET POWER [ON|OFF|CYCLE [ms]]  - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
+        uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
+        uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [n] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
+        uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
+        uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
+        uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
+        uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
+        uart_cli_send("TARGET GLITCH RESETTEST           - Reset/low-power disruption test\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
@@ -1028,13 +1052,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
             if (parts->count < 3) {
-                // Show current power state
                 bool power_state = target_power_get_state();
                 uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
             } else {
-                // Match power command
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "GLITCH", "SWEEP", "PAYLOAD", "BYPASS", "HALT"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 8, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 3, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1043,52 +1065,110 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else if (strcmp(parts->parts[2], "OFF") == 0) {
                     target_power_off();
                 } else if (strcmp(parts->parts[2], "CYCLE") == 0) {
-                    uint32_t cycle_time_ms = 300;  // Default 300ms
+                    uint32_t cycle_time_ms = 300;
                     if (parts->count >= 4) {
-                        cycle_time_ms = atoi(parts->parts[3]);
+                        if (!parse_u32(parts->parts[3], 0, &cycle_time_ms)) {
+                            api_error("ERROR: Invalid cycle time. Usage: TARGET POWER CYCLE [ms]\r\n");
+                            goto api_response;
+                        }
                     }
                     target_power_cycle(cycle_time_ms);
-                } else if (strcmp(parts->parts[2], "GLITCH") == 0) {
+                }
+            }
+        } else if (strcmp(parts->parts[1], "GLITCH") == 0) {
+            if (parts->count < 3) {
+                uart_cli_send("Usage: TARGET GLITCH <command>\r\n");
+                uart_cli_send("  TEST <voltage> [count]     - Basic power glitch test\r\n");
+                uart_cli_send("  SWEEP                      - Voltage sweep\r\n");
+                uart_cli_send("  PAYLOAD [voltage] [attempts] - Glitch with SRAM payload\r\n");
+                uart_cli_send("  BYPASS [attempts] [dump_bytes] - RDP bypass + flash dump\r\n");
+                uart_cli_send("  HALT [dump_bytes]          - Halt-based flash dump\r\n");
+                uart_cli_send("  LITERAL                    - Literal payload test\r\n");
+                uart_cli_send("  REGDUMP                    - Register dump payload\r\n");
+                uart_cli_send("  GLITCH_REGDUMP [attempts]  - Glitch + register dump\r\n");
+                uart_cli_send("  RESETTEST                  - Reset/low-power disruption test\r\n");
+            } else {
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, 9, "GLITCH command")) {
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "TEST") == 0) {
                     if (parts->count < 4) {
-                        api_error("ERROR: Usage: TARGET POWER GLITCH <voltage> [count]\r\n");
+                        api_error("ERROR: Usage: TARGET GLITCH TEST <voltage> [count]\r\n");
                         goto api_response;
                     }
                     float voltage = strtof(parts->parts[3], NULL);
                     uint32_t count = 10;
-                    if (parts->count >= 5)
-                        count = strtoul(parts->parts[4], NULL, 0);
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &count)) {
+                            api_error("ERROR: Invalid count. Usage: TARGET GLITCH TEST <voltage> [count]\r\n");
+                            goto api_response;
+                        }
+                    }
                     if (count < 1) count = 1;
                     if (count > 1000) count = 1000;
                     target_power_glitch(voltage, count);
                 } else if (strcmp(parts->parts[2], "SWEEP") == 0) {
                     target_power_sweep();
                 } else if (strcmp(parts->parts[2], "PAYLOAD") == 0) {
-                    float voltage = 1.8f;  // Default: just below BOR, preserve SRAM
+                    float voltage = 1.8f;
                     uint32_t attempts = 20;
                     if (parts->count >= 4)
                         voltage = strtof(parts->parts[3], NULL);
-                    if (parts->count >= 5)
-                        attempts = strtoul(parts->parts[4], NULL, 0);
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH PAYLOAD [voltage] [attempts]\r\n");
+                            goto api_response;
+                        }
+                    }
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
                     target_power_payload(voltage, attempts);
                 } else if (strcmp(parts->parts[2], "BYPASS") == 0) {
-                    // BYPASS [attempts] [count]
                     uint32_t attempts = 20;
-                    uint32_t dump_bytes = 0;  // 0 = full flash
-                    if (parts->count >= 4)
-                        attempts = strtoul(parts->parts[3], NULL, 0);
-                    if (parts->count >= 5)
-                        dump_bytes = strtoul(parts->parts[4], NULL, 0);
+                    uint32_t dump_bytes = 0;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            goto api_response;
+                        }
+                    }
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
                     target_power_bypass(attempts, dump_bytes);
                 } else if (strcmp(parts->parts[2], "HALT") == 0) {
-                    // HALT [count]
-                    uint32_t dump_bytes = 0;  // 0 = full flash
-                    if (parts->count >= 4)
-                        dump_bytes = strtoul(parts->parts[3], NULL, 0);
+                    uint32_t dump_bytes = 0;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &dump_bytes)) {
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH HALT [dump_bytes]\r\n");
+                            goto api_response;
+                        }
+                    }
                     target_power_halt(dump_bytes);
+                } else if (strcmp(parts->parts[2], "LITERAL") == 0) {
+                    target_power_literal();
+                } else if (strcmp(parts->parts[2], "REGDUMP") == 0) {
+                    target_power_regdump();
+                } else if (strcmp(parts->parts[2], "GLITCH_REGDUMP") == 0) {
+                    uint32_t attempts = 20;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH GLITCH_REGDUMP [attempts]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 100) attempts = 100;
+                    target_power_glitch_regdump(attempts);
+                } else if (strcmp(parts->parts[2], "RESETTEST") == 0) {
+                    target_power_resettest();
                 }
             }
         }
@@ -1750,7 +1830,7 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         } else if (strcmp(parts->parts[1], "READ") == 0) {
             if (parts->count < 3) {
-                api_error("ERROR: Usage: SWD READ <DP|AP|MEM|FLASH|SRAM|BOOTROM> <addr> [count]\r\n");
+                api_error("ERROR: Usage: SWD READ <addr|AP|BOOTROM|DP|FLASH|MEM|SRAM> [count]\r\n");
                 goto api_response;
             }
 
@@ -1779,22 +1859,34 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[2], "DP") == 0) {
                 if (parts->count < 4) { api_error("ERROR: Usage: SWD READ DP <addr>\r\n"); goto api_response; }
                 op = SWD_DP;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD READ DP <addr>\r\n");
+                    goto api_response;
+                }
                 count_arg_idx = -1;
             } else if (strcmp(parts->parts[2], "AP") == 0) {
                 if (parts->count < 4) { api_error("ERROR: Usage: SWD READ AP <addr>\r\n"); goto api_response; }
                 op = SWD_AP;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD READ AP <addr>\r\n");
+                    goto api_response;
+                }
                 count_arg_idx = -1;
             } else if (strcmp(parts->parts[2], "MEM") == 0) {
                 if (parts->count < 4) { api_error("ERROR: Usage: SWD READ MEM <addr> [count]\r\n"); goto api_response; }
                 op = SWD_MEM;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD READ MEM <addr> [count]\r\n");
+                    goto api_response;
+                }
                 count_arg_idx = 4;
             } else {
                 // Treat as raw hex address: SWD READ <addr> [count]
                 op = SWD_MEM;
-                addr = strtoul(parts->parts[2], NULL, 16);
+                if (!parse_u32(parts->parts[2], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD READ <addr|AP|BOOTROM|DP|FLASH|MEM|SRAM> [count]\r\n");
+                    goto api_response;
+                }
                 count_arg_idx = 3;
             }
 
@@ -1819,7 +1911,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 // Determine byte count
                 uint32_t bytes;
                 if (count_arg_idx >= 0 && parts->count > (uint32_t)count_arg_idx) {
-                    bytes = strtoul(parts->parts[count_arg_idx], NULL, 0) * 4;
+                    uint32_t cnt;
+                    if (!parse_u32(parts->parts[count_arg_idx], 0, &cnt)) {
+                        api_error("ERROR: Invalid count\r\n");
+                        goto api_response;
+                    }
+                    bytes = cnt * 4;
                 } else if (alias_size > 0) {
                     bytes = alias_size;
                 } else {
@@ -1873,7 +1970,7 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         } else if (strcmp(parts->parts[1], "WRITE") == 0) {
             if (parts->count < 4) {
-                api_error("ERROR: Usage: SWD WRITE <DP|AP|MEM|FLASH|SRAM|BOOTROM> <addr> <value>\r\n");
+                api_error("ERROR: Usage: SWD WRITE <addr|AP|BOOTROM|DP|FLASH|MEM|SRAM> <value>\r\n");
                 goto api_response;
             }
 
@@ -1899,28 +1996,45 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[2], "DP") == 0) {
                 if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE DP <addr> <value>\r\n"); goto api_response; }
                 op = SWD_WR_DP;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD WRITE DP <addr> <value>\r\n");
+                    goto api_response;
+                }
                 val_arg_idx = 4;
             } else if (strcmp(parts->parts[2], "AP") == 0) {
                 if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE AP <addr> <value>\r\n"); goto api_response; }
                 op = SWD_WR_AP;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD WRITE AP <addr> <value>\r\n");
+                    goto api_response;
+                }
                 val_arg_idx = 4;
             } else if (strcmp(parts->parts[2], "MEM") == 0) {
                 if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE MEM <addr> <value>\r\n"); goto api_response; }
                 op = SWD_WR_MEM;
-                addr = strtoul(parts->parts[3], NULL, 16);
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD WRITE MEM <addr> <value>\r\n");
+                    goto api_response;
+                }
                 val_arg_idx = 4;
             } else {
                 // Treat as raw hex address: SWD WRITE <addr> <value>
                 op = SWD_WR_MEM;
-                addr = strtoul(parts->parts[2], NULL, 16);
+                if (!parse_u32(parts->parts[2], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD WRITE <addr|AP|BOOTROM|DP|FLASH|MEM|SRAM> <value>\r\n");
+                    goto api_response;
+                }
                 val_arg_idx = 3;
             }
 
             switch (op) {
             case SWD_WR_DP: {
-                uint32_t value = strtoul(parts->parts[val_arg_idx], NULL, 16);
+                uint32_t value;
+                if (!parse_u32(parts->parts[val_arg_idx], 16, &value)) {
+                    api_error("ERROR: Invalid value. Usage: SWD WRITE DP <addr> <value>\r\n");
+                    goto api_response;
+                }
+                uart_cli_printf("Writing DP[0x%X] = 0x%08X\r\n", addr & 0xC, value);
                 if (swd_write_dp(addr & 0xC, value))
                     uart_cli_printf("OK: DP[0x%X] = 0x%08X\r\n", addr & 0xC, value);
                 else
@@ -1928,7 +2042,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 break;
             }
             case SWD_WR_AP: {
-                uint32_t value = strtoul(parts->parts[val_arg_idx], NULL, 16);
+                uint32_t value;
+                if (!parse_u32(parts->parts[val_arg_idx], 16, &value)) {
+                    api_error("ERROR: Invalid value. Usage: SWD WRITE AP <addr> <value>\r\n");
+                    goto api_response;
+                }
+                uart_cli_printf("Writing AP[0x%02X] = 0x%08X\r\n", addr, value);
                 if (swd_write_ap(0, addr, value))
                     uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
                 else
@@ -1936,7 +2055,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 break;
             }
             case SWD_WR_MEM: {
-                uint32_t value = strtoul(parts->parts[val_arg_idx], NULL, 16);
+                uint32_t value;
+                if (!parse_u32(parts->parts[val_arg_idx], 16, &value)) {
+                    api_error("ERROR: Invalid value (max 8 hex digits). Usage: SWD WRITE <addr> <value>\r\n");
+                    goto api_response;
+                }
+                uart_cli_printf("Writing [0x%08X] = 0x%08X\r\n", addr, value);
 
                 // Auto-detect flash address and use flash controller
                 if (addr >= 0x08000000 && addr < 0x08100000) {
@@ -2028,7 +2152,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 val_idx = 3;
                 count_idx = 4;
             } else {
-                addr = strtoul(parts->parts[2], NULL, 16);
+                if (!parse_u32(parts->parts[2], 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD FILL <addr> <value> <words>\r\n");
+                    goto api_response;
+                }
                 val_idx = 3;
                 count_idx = 4;
                 if (parts->count < 5) {
@@ -2037,13 +2164,20 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
             }
 
-            uint32_t pattern = strtoul(parts->parts[val_idx], NULL, 16);
+            uint32_t pattern;
+            if (!parse_u32(parts->parts[val_idx], 16, &pattern)) {
+                api_error("ERROR: Invalid pattern (max 8 hex digits). Usage: SWD FILL <addr> <value> [words]\r\n");
+                goto api_response;
+            }
             // Parse optional word count — skip ERASE keyword
             uint32_t words = 0;
             bool have_count = false;
             if ((uint32_t)count_idx < parts->count &&
                 strcmp(parts->parts[count_idx], "ERASE") != 0) {
-                words = strtoul(parts->parts[count_idx], NULL, 0);
+                if (!parse_u32(parts->parts[count_idx], 0, &words)) {
+                    api_error("ERROR: Invalid word count\r\n");
+                    goto api_response;
+                }
                 have_count = true;
             }
             if (!have_count) {
@@ -2053,6 +2187,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                     words = 1;
             }
             if (words == 0) words = 1;
+
+            uart_cli_printf("Filling %u words at 0x%08X with pattern 0x%08X\r\n", words, addr, pattern);
 
             // Flash fill: needs erase + flash controller
             if (addr >= 0x08000000 && addr < 0x08100000) {
@@ -2275,7 +2411,11 @@ void command_parser_execute(cmd_parts_t *parts) {
                     api_error("ERROR: Usage: SWD FLASH ERASE <page>\r\n");
                     goto api_response;
                 }
-                uint32_t page = strtoul(parts->parts[3], NULL, 0);
+                uint32_t page;
+                if (!parse_u32(parts->parts[3], 0, &page)) {
+                    api_error("ERROR: Invalid page number. Usage: SWD FLASH ERASE <page>\r\n");
+                    goto api_response;
+                }
                 uart_cli_printf("Erasing page %u on %s...\r\n", page, info->name);
                 if (swd_stm32_flash_erase_page(info, page)) {
                     uart_cli_printf("OK: Page %u erased\r\n", page);
@@ -2295,8 +2435,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("OK: nRST released\r\n");
             } else {
                 uint32_t ms = 100;
-                if (parts->count >= 3)
-                    ms = strtoul(parts->parts[2], NULL, 0);
+                if (parts->count >= 3) {
+                    if (!parse_u32(parts->parts[2], 0, &ms)) {
+                        api_error("ERROR: Invalid duration. Usage: SWD RESET [ms|HOLD|RELEASE]\r\n");
+                        goto api_response;
+                    }
+                }
                 if (ms < 1) ms = 1;
                 if (ms > 10000) ms = 10000;
                 swd_nrst_pulse(ms);
@@ -2373,11 +2517,19 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: Usage: JTAG IR <value> [bits]\r\n");
                 goto api_response;
             }
-            uint32_t value = strtoul(parts->parts[2], NULL, 0);
-            uint8_t bits = 4;  // Default for ARM7
-            if (parts->count >= 4)
-                bits = atoi(parts->parts[3]);
-            if (bits > 32) bits = 32;
+            uint32_t value;
+            if (!parse_u32(parts->parts[2], 0, &value)) {
+                api_error("ERROR: Invalid value. Usage: JTAG IR <value> [bits]\r\n");
+                goto api_response;
+            }
+            uint32_t bits_val = 4;  // Default for ARM7
+            if (parts->count >= 4) {
+                if (!parse_u32(parts->parts[3], 0, &bits_val)) {
+                    api_error("ERROR: Invalid bits. Usage: JTAG IR <value> [bits]\r\n");
+                    goto api_response;
+                }
+            }
+            uint8_t bits = (bits_val > 32) ? 32 : (uint8_t)bits_val;
 
             uint32_t result = jtag_ir_shift(value, bits);
             uart_cli_printf("OK: IR shift: in=0x%X, out=0x%X (%u bits)\r\n", value, result, bits);
@@ -2387,11 +2539,19 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: Usage: JTAG DR <value> [bits]\r\n");
                 goto api_response;
             }
-            uint32_t value = strtoul(parts->parts[2], NULL, 0);
-            uint8_t bits = 32;  // Default
-            if (parts->count >= 4)
-                bits = atoi(parts->parts[3]);
-            if (bits > 32) bits = 32;
+            uint32_t value;
+            if (!parse_u32(parts->parts[2], 0, &value)) {
+                api_error("ERROR: Invalid value. Usage: JTAG DR <value> [bits]\r\n");
+                goto api_response;
+            }
+            uint32_t bits_val = 32;  // Default
+            if (parts->count >= 4) {
+                if (!parse_u32(parts->parts[3], 0, &bits_val)) {
+                    api_error("ERROR: Invalid bits. Usage: JTAG DR <value> [bits]\r\n");
+                    goto api_response;
+                }
+            }
+            uint8_t bits = (bits_val > 32) ? 32 : (uint8_t)bits_val;
 
             uint32_t result = jtag_dr_shift(value, bits);
             uart_cli_printf("OK: DR shift: in=0x%08X, out=0x%08X (%u bits)\r\n", value, result, bits);

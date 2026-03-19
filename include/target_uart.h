@@ -71,5 +71,9 @@ void target_power_glitch(float voltage, uint32_t count);
 void target_power_payload(float voltage, uint32_t max_attempts);
 void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes);
 void target_power_halt(uint32_t dump_bytes);
+void target_power_literal(void);
+void target_power_regdump(void);
+void target_power_glitch_regdump(uint32_t max_attempts);
+void target_power_resettest(void);
 
 #endif // TARGET_UART_H
