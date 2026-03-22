@@ -27,6 +27,7 @@ add_executable(raiden_pico
     src/swd.c
     src/jtag.c
     src/stm32_target.c
+    src/stm32_breakpoints.c
 )
 
 # Include directories
@@ -51,6 +52,7 @@ target_link_libraries(raiden_pico
     hardware_gpio
     hardware_timer
     hardware_adc
+    hardware_dma
 )
 
 # Enable USB-only serial output (no UART stdio)

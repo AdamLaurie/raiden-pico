@@ -318,8 +318,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "SET") == 0 && parts->count >= 2) {
-        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP"};
-        if (!match_and_replace(&parts->parts[1], variables, 4, "variable name")) {
+        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP", "BREAKPOINT", "BP"};
+        if (!match_and_replace(&parts->parts[1], variables, 6, "variable name")) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "GET") == 0 && parts->count == 2) {
@@ -399,6 +399,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
         uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
         uart_cli_send("TARGET GLITCH RESETTEST           - Reset/low-power disruption test\r\n");
+        uart_cli_send("TARGET GLITCH TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
+        uart_cli_send("                                   - DWT cycle count + ADC shunt timing\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
@@ -562,6 +564,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
 
         uart_cli_send("\r\n");
+        uart_cli_send("== PIO Debug ==\r\n");
+        glitch_debug_pio();
+        uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
         uint32_t clock_freq = clock_get_frequency();
         bool clock_enabled = clock_is_enabled();
@@ -583,6 +588,76 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("  WIDTH: %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
             uart_cli_printf("  GAP:   %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
             uart_cli_printf("  COUNT: %u\r\n", cfg->count);
+        } else if (strcmp(parts->parts[1], "BREAKPOINT") == 0 || strcmp(parts->parts[1], "BP") == 0) {
+            // SET BREAKPOINT <slot> <name|0xADDR> [HARD|SOFT]
+            // SET BREAKPOINT LIST
+            // SET BREAKPOINT CLEAR [slot|ALL]
+            #include "stm32_breakpoints.h"
+            if (parts->count == 2 || (parts->count == 3 && strcasecmp(parts->parts[2], "LIST") == 0)) {
+                swd_bp_list();
+            } else if (parts->count >= 3 && strcasecmp(parts->parts[2], "CLEAR") == 0) {
+                if (parts->count >= 4 && strcasecmp(parts->parts[3], "ALL") == 0) {
+                    swd_bp_clear_all();
+                } else if (parts->count >= 4) {
+                    uint32_t slot;
+                    if (!parse_u32(parts->parts[3], 0, &slot)) {
+                        api_error("ERROR: Invalid slot number\r\n");
+                        goto api_response;
+                    }
+                    swd_bp_clear_hard(slot);
+                } else {
+                    swd_bp_clear_all();
+                }
+            } else if (parts->count >= 4) {
+                uint32_t slot;
+                if (!parse_u32(parts->parts[2], 0, &slot)) {
+                    api_error("ERROR: Usage: SET BREAKPOINT <slot 0-5> <name|0xADDR> [HARD|SOFT]\r\n");
+                    goto api_response;
+                }
+
+                const char *bp_arg = parts->parts[3];
+                uint32_t addr = 0;
+                const char *bp_name = NULL;
+
+                // Resolve name or address
+                extern target_type_t target_get_type(void);
+                const stm32_bp_table_t *table = stm32_get_breakpoints(target_get_type());
+                if (bp_arg[0] == '0' && (bp_arg[1] == 'x' || bp_arg[1] == 'X')) {
+                    addr = strtoul(bp_arg, NULL, 16);
+                    if (table) {
+                        const stm32_bp_entry_t *e = stm32_find_breakpoint(table, bp_arg);
+                        if (e) bp_name = e->name;
+                    }
+                } else {
+                    if (!table) {
+                        api_error("ERROR: Set TARGET type first for named breakpoints\r\n");
+                        goto api_response;
+                    }
+                    const stm32_bp_entry_t *e = stm32_find_breakpoint(table, bp_arg);
+                    if (!e) {
+                        api_error_printf("ERROR: Unknown breakpoint '%s'\r\n", bp_arg);
+                        goto api_response;
+                    }
+                    addr = e->addr;
+                    bp_name = e->name;
+                }
+
+                // Hard or soft?
+                bool soft = false;
+                if (parts->count >= 5) {
+                    if (strcasecmp(parts->parts[4], "SOFT") == 0) soft = true;
+                }
+
+                if (soft) {
+                    swd_bp_set_soft(addr, bp_name);
+                } else {
+                    swd_bp_set_hard(slot, addr, bp_name);
+                }
+            } else {
+                uart_cli_send("Usage: SET BREAKPOINT <slot 0-5> <name|0xADDR> [HARD|SOFT]\r\n");
+                uart_cli_send("       SET BREAKPOINT LIST\r\n");
+                uart_cli_send("       SET BREAKPOINT CLEAR [slot|ALL]\r\n");
+            }
         } else if (parts->count != 3) {
             uart_cli_send("ERROR: Usage: SET <PAUSE|WIDTH|GAP|COUNT> <value>\r\n");
             uart_cli_send("       Value is in system clock cycles (150MHz = 6.67ns per cycle)\r\n");
@@ -645,11 +720,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else {
                     uart_cli_send("ERROR: Failed to arm system\r\n");
                 }
+            } else if (strcmp(parts->parts[1], "TRACE") == 0) {
+                if (glitch_arm_trace()) {
+                    uart_cli_send("OK: Trace armed (trigger only, no glitch pulse)\r\n");
+                } else {
+                    uart_cli_send("ERROR: Failed to arm trace\r\n");
+                }
             } else if (strcmp(parts->parts[1], "OFF") == 0) {
                 glitch_disarm();
                 uart_cli_send("OK: System disarmed\r\n");
             } else {
-                api_error("ERROR: Usage: ARM <ON|OFF>\r\n");
+                api_error("ERROR: Usage: ARM <ON|OFF|TRACE>\r\n");
                 goto api_response;
             }
         } else {
@@ -789,6 +870,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("GP%u - BOOT0 Control\r\n", STM32_BOOT0_PIN);
         uart_cli_printf("GP%u - BOOT1 Control\r\n", STM32_BOOT1_PIN);
         uart_cli_send("GP26 - ADC Power Monitor (voltage sense for glitch detection)\r\n");
+        uart_cli_send("GP27 - ADC Shunt Current Monitor (timing measurement)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Debug Interface (SWD/JTAG) ==\r\n");
         uart_cli_send("GP15 - nRST / TRST (shared with Target Reset)\r\n");
@@ -1087,9 +1169,11 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  REGDUMP                    - Register dump payload\r\n");
                 uart_cli_send("  GLITCH_REGDUMP [attempts]  - Glitch + register dump\r\n");
                 uart_cli_send("  RESETTEST                  - Reset/low-power disruption test\r\n");
+                uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
+                uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST"};
-                if (!match_and_replace(&parts->parts[2], glitch_cmds, 9, "GLITCH command")) {
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING", "TRACE"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
                 }
 
@@ -1169,6 +1253,56 @@ void command_parser_execute(cmd_parts_t *parts) {
                     target_power_glitch_regdump(attempts);
                 } else if (strcmp(parts->parts[2], "RESETTEST") == 0) {
                     target_power_resettest();
+                } else if (strcmp(parts->parts[2], "TIMING") == 0) {
+                    if (parts->count < 4) {
+                        // No args: list breakpoints
+                        target_power_timing(NULL, 0, true);
+                    } else {
+                        const char *bp_name = parts->parts[3];
+                        uint32_t samples = 0;  // 0 = use default in target_power_timing()
+                        bool bootloader = true;
+                        if (parts->count >= 5) {
+                            // Check if arg 4 is a boot mode or sample count
+                            if (strcasecmp(parts->parts[4], "FLASH") == 0) {
+                                bootloader = false;
+                            } else if (strcasecmp(parts->parts[4], "BOOTLOADER") == 0) {
+                                bootloader = true;
+                            } else {
+                                if (!parse_u32(parts->parts[4], 0, &samples)) {
+                                    api_error("ERROR: Invalid samples. Usage: TARGET GLITCH TIMING <name|0xADDR> [samples] [FLASH|BOOTLOADER]\r\n");
+                                    goto api_response;
+                                }
+                            }
+                        }
+                        if (parts->count >= 6) {
+                            if (strcasecmp(parts->parts[5], "FLASH") == 0) {
+                                bootloader = false;
+                            } else if (strcasecmp(parts->parts[5], "BOOTLOADER") == 0) {
+                                bootloader = true;
+                            }
+                        }
+                        target_power_timing(bp_name, samples, bootloader);
+                    }
+                } else if (strcmp(parts->parts[2], "TRACE") == 0) {
+                    extern void trace_start(uint32_t samples, uint32_t pre_pct);
+                    extern void trace_stop(void);
+                    extern void trace_status(void);
+                    extern void trace_dump(void);
+                    if (parts->count >= 4 && strcmp(parts->parts[3], "STOP") == 0) {
+                        trace_stop();
+                    } else if (parts->count >= 4 && strcmp(parts->parts[3], "STATUS") == 0) {
+                        trace_status();
+                    } else if (parts->count >= 4 && strcmp(parts->parts[3], "DUMP") == 0) {
+                        trace_dump();
+                    } else {
+                        // TRACE [samples] [pre%]  or  TRACE START [samples] [pre%]
+                        uint32_t samp = 0, pre = 0;
+                        int i = 3;
+                        if (i < parts->count && strcmp(parts->parts[i], "START") == 0) i++;
+                        if (i < parts->count) parse_u32(parts->parts[i++], 0, &samp);
+                        if (i < parts->count) parse_u32(parts->parts[i++], 0, &pre);
+                        trace_start(samp, pre);
+                    }
                 }
             }
         }

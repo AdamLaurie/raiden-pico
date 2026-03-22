@@ -2,13 +2,78 @@
 #include "uart_cli.h"
 #include "swd.h"
 #include "stm32_pwner.h"
+#include "stm32_breakpoints.h"
+#include "glitch.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/adc.h"
+#include "hardware/dma.h"
+#include "hardware/structs/padsbank0.h"
 #include "pico/stdlib.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+// Shared GPIO IRQ dispatcher — single callback for all GPIO interrupts.
+// Pico SDK allows only ONE gpio_set_irq_callback per core; multiple subsystems
+// (nRST latch, trace GP12, etc.) register via gpio_irq_register/unregister.
+#define GPIO_IRQ_MAX_HANDLERS 4
+typedef void (*gpio_irq_fn_t)(uint gpio, uint32_t events);
+static struct {
+    uint gpio;
+    uint32_t events_mask;
+    gpio_irq_fn_t fn;
+} gpio_irq_handlers[GPIO_IRQ_MAX_HANDLERS];
+static int gpio_irq_handler_count = 0;
+static bool gpio_irq_callback_installed = false;
+
+static void shared_gpio_irq_callback(uint gpio, uint32_t events) {
+    for (int i = 0; i < gpio_irq_handler_count; i++) {
+        if (gpio_irq_handlers[i].gpio == gpio &&
+            (gpio_irq_handlers[i].events_mask & events)) {
+            gpio_irq_handlers[i].fn(gpio, events);
+        }
+    }
+}
+
+static void gpio_irq_register(uint gpio, uint32_t events, gpio_irq_fn_t fn) {
+    // Install shared callback once
+    if (!gpio_irq_callback_installed) {
+        gpio_set_irq_callback(shared_gpio_irq_callback);
+        irq_set_enabled(IO_IRQ_BANK0, true);
+        gpio_irq_callback_installed = true;
+    }
+    // Check if already registered for this pin — update in place
+    for (int i = 0; i < gpio_irq_handler_count; i++) {
+        if (gpio_irq_handlers[i].gpio == gpio && gpio_irq_handlers[i].fn == fn) {
+            gpio_irq_handlers[i].events_mask = events;
+            gpio_set_irq_enabled(gpio, events, true);
+            return;
+        }
+    }
+    if (gpio_irq_handler_count < GPIO_IRQ_MAX_HANDLERS) {
+        gpio_irq_handlers[gpio_irq_handler_count].gpio = gpio;
+        gpio_irq_handlers[gpio_irq_handler_count].events_mask = events;
+        gpio_irq_handlers[gpio_irq_handler_count].fn = fn;
+        gpio_irq_handler_count++;
+        gpio_set_irq_enabled(gpio, events, true);
+    }
+}
+
+static void gpio_irq_unregister(uint gpio, gpio_irq_fn_t fn) {
+    for (int i = 0; i < gpio_irq_handler_count; i++) {
+        if (gpio_irq_handlers[i].gpio == gpio && gpio_irq_handlers[i].fn == fn) {
+            gpio_set_irq_enabled(gpio, gpio_irq_handlers[i].events_mask, false);
+            // Compact array
+            gpio_irq_handler_count--;
+            for (int j = i; j < gpio_irq_handler_count; j++) {
+                gpio_irq_handlers[j] = gpio_irq_handlers[j + 1];
+            }
+            return;
+        }
+    }
+}
 
 // STM32F103 blink payload — blinks PA5 (LD2 on Nucleo-F103RB)
 // 608 bytes: vector table + 252-NOP sled + debug-aware blink code
@@ -208,20 +273,15 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 void target_uart_clear_response(void);
 void target_uart_print_response_hex(void);
 
-// UART RX interrupt handler for immediate trigger response
+// UART RX interrupt handler
 void target_uart_irq_handler(void) {
-    extern void glitch_check_uart_trigger(uint8_t byte);
     extern void uart_cli_printf(const char *format, ...);
     extern void uart_cli_send(const char *str);
 
     while (uart_is_readable(TARGET_UART_ID)) {
         uint8_t byte = uart_getc(TARGET_UART_ID);
 
-        // Check for trigger IMMEDIATELY in interrupt context for minimal latency
-        // This must be called before any other processing for lowest latency
-        glitch_check_uart_trigger(byte);
-
-        // Display received byte in debug mode (after trigger check)
+        // Display received byte in debug mode
         if (debug_mode) {
             uart_cli_printf("[RX] %02X", byte);
             if (byte >= 32 && byte < 127) {
@@ -334,6 +394,9 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
         uart_getc(TARGET_UART_ID);
     }
 
+    // Suspend trigger detection so PIO UART decoder doesn't match the ACK byte
+    glitch_suspend_trigger();
+
     // Target-specific bootloader entry
     switch (current_target_type) {
         case TARGET_LPC:
@@ -431,6 +494,7 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
                         break;
                     } else if (byte == 0x1F) {
                         uart_cli_send("ERROR: NACK received - bootloader rejected sync\r\n");
+                        glitch_resume_trigger();
                         return false;
                     }
                 }
@@ -439,6 +503,7 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 
             if (!got_response) {
                 uart_cli_send("ERROR: No response from bootloader (check BOOT0 pin and connections)\r\n");
+                glitch_resume_trigger();
                 return false;
             }
             break;
@@ -446,8 +511,12 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 
         default:
             uart_cli_send("ERROR: Unknown target type\r\n");
+            glitch_resume_trigger();
             return false;
     }
+
+    // Resume trigger detection now that sync is complete
+    glitch_resume_trigger();
 
     // Re-enable UART RX interrupts for normal trigger operation
     uart_set_irq_enables(TARGET_UART_ID, true, false);
@@ -497,6 +566,10 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     // Set TX and RX pins for UART1 (GP4/GP5 are default UART1 pins)
     gpio_set_function(tx_pin, GPIO_FUNC_UART);
     gpio_set_function(rx_pin, GPIO_FUNC_UART);
+
+    // Clear RP2350 GPIO isolation bit on RX pin so PIO can also read it
+    // gpio_set_function sets ISO, blocking PIO UART trigger from snooping GP5
+    hw_clear_bits(&padsbank0_hw->io[rx_pin], PADS_BANK0_GPIO0_ISO_BITS);
 
     // Enable UART FIFO
     uart_set_fifo_enabled(TARGET_UART_ID, true);
@@ -559,9 +632,6 @@ void target_uart_send_string(const char *str) {
     uart_putc_raw(TARGET_UART_ID, '\r');
     uart_tx_wait_blocking(TARGET_UART_ID);
 
-    // External trigger check function
-    extern void glitch_check_uart_trigger(uint8_t byte);
-
     // Transparent bridge: forward ALL bytes from target to host (raw, no processing)
     // Timeout resets on each received byte
     uint32_t start = to_ms_since_boot(get_absolute_time());
@@ -573,9 +643,6 @@ void target_uart_send_string(const char *str) {
 
             // Reset timeout on any data received
             start = to_ms_since_boot(get_absolute_time());
-
-            // Check for UART trigger byte
-            glitch_check_uart_trigger(byte);
 
             // Display received byte in debug mode
             if (debug_mode) {
@@ -671,9 +738,6 @@ void target_uart_send_hex(const char *hex_str) {
     // Wait for TX to complete (no \r append for raw hex - STM32 bootloader needs exact bytes)
     uart_tx_wait_blocking(TARGET_UART_ID);
 
-    // External trigger check function
-    extern void glitch_check_uart_trigger(uint8_t byte);
-
     // Transparent bridge: forward ALL bytes from target to host (raw, no processing)
     // Timeout resets on each received byte
     uint32_t start = to_ms_since_boot(get_absolute_time());
@@ -685,9 +749,6 @@ void target_uart_send_hex(const char *hex_str) {
 
             // Reset timeout on any data received
             start = to_ms_since_boot(get_absolute_time());
-
-            // Check for UART trigger byte
-            glitch_check_uart_trigger(byte);
 
             // Display received byte in debug mode
             if (debug_mode) {
@@ -907,11 +968,11 @@ static void nrst_irq_handler(uint gpio, uint32_t events) {
 static void nrst_irq_arm(void) {
     nrst_irq_fired = false;
     nrst_irq_time = 0;
-    gpio_set_irq_enabled_with_callback(reset_pin, GPIO_IRQ_EDGE_FALL, true, nrst_irq_handler);
+    gpio_irq_register(reset_pin, GPIO_IRQ_EDGE_FALL, nrst_irq_handler);
 }
 
 static void nrst_irq_disarm(void) {
-    gpio_set_irq_enabled(reset_pin, GPIO_IRQ_EDGE_FALL, false);
+    gpio_irq_unregister(reset_pin, nrst_irq_handler);
 }
 
 // Result of a single power glitch
@@ -3659,4 +3720,489 @@ resettest_done:
     gpio_clr_mask(POWER_MASK);
     sleep_ms(100);
     gpio_set_mask(POWER_MASK);
+}
+
+// ============================================================
+// TARGET GLITCH TIMING — DWT cycle counter + ADC shunt profile
+// ============================================================
+
+#define ADC_SHUNT_PIN   27  // GP27 = ADC1, shunt resistor on target VDD
+#define ADC_SHUNT_CHAN  1
+
+void target_power_timing(const char *name_or_addr, uint32_t samples, bool bootloader_mode) {
+    // Ensure target type is set
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info) {
+        uart_cli_send("ERROR: No STM32 target detected. Set with TARGET STM32F1\r\n");
+        return;
+    }
+
+    const stm32_bp_table_t *table = stm32_get_breakpoints(target_get_type());
+
+    // No args: list breakpoints
+    if (!name_or_addr) {
+        if (!table) {
+            uart_cli_send("ERROR: No breakpoint table for this target\r\n");
+            return;
+        }
+        uart_cli_printf("=== Breakpoint Table: %s (%u entries) ===\r\n", table->name, table->count);
+        uart_cli_send("  NAME              ADDR        CATEGORY      DESCRIPTION\r\n");
+        for (int i = 0; i < table->count; i++) {
+            const stm32_bp_entry_t *e = &table->entries[i];
+            uart_cli_printf("  %-16s  0x%08lX  %-12s  %s\r\n",
+                            e->name, e->addr,
+                            stm32_bp_category_name(e->category), e->desc);
+        }
+        uart_cli_send("\r\nUsage: TARGET GLITCH TIMING <name|0xADDR> [samples] [FLASH|BOOTLOADER]\r\n");
+        return;
+    }
+
+    // Resolve breakpoint address
+    uint32_t bp_addr = 0;
+    const char *bp_name = NULL;
+    const stm32_bp_entry_t *entry = NULL;
+
+    if (name_or_addr[0] == '0' && (name_or_addr[1] == 'x' || name_or_addr[1] == 'X')) {
+        bp_addr = strtoul(name_or_addr, NULL, 16);
+        if (table)
+            entry = stm32_find_breakpoint(table, name_or_addr);
+        bp_name = entry ? entry->name : name_or_addr;
+    } else {
+        if (!table) {
+            uart_cli_send("ERROR: No breakpoint table for this target\r\n");
+            return;
+        }
+        entry = stm32_find_breakpoint(table, name_or_addr);
+        if (!entry) {
+            uart_cli_printf("ERROR: Unknown breakpoint '%s'. Run TIMING with no args to list.\r\n", name_or_addr);
+            return;
+        }
+        bp_addr = entry->addr;
+        bp_name = entry->name;
+    }
+
+    if (bp_addr == 0) {
+        uart_cli_send("ERROR: Invalid breakpoint address\r\n");
+        return;
+    }
+
+    if (samples == 0) samples = 32768;
+    if (samples > 32768) samples = 32768;
+
+    uart_cli_printf("\r\n=== TIMING: %s (0x%08lX) ===\r\n", bp_name, bp_addr);
+    uart_cli_printf("Boot mode: %s (BOOT0=%u)\r\n",
+                    bootloader_mode ? "BOOTLOADER" : "FLASH",
+                    bootloader_mode ? 1 : 0);
+    if (entry)
+        uart_cli_printf("Category: %s — %s\r\n", stm32_bp_category_name(entry->category), entry->desc);
+
+    // === Step 1: Set BOOT0 pin ===
+    uart_cli_send("[1] Configuring BOOT pins...\r\n");
+    gpio_init(STM32_BOOT0_PIN);
+    gpio_set_dir(STM32_BOOT0_PIN, GPIO_OUT);
+    gpio_put(STM32_BOOT0_PIN, bootloader_mode ? 1 : 0);
+    gpio_init(STM32_BOOT1_PIN);
+    gpio_set_dir(STM32_BOOT1_PIN, GPIO_OUT);
+    gpio_put(STM32_BOOT1_PIN, 0);
+
+    // === Step 2: Connect under reset (halts at reset vector via VC_CORERESET) ===
+    uart_cli_send("[2] Connect under reset...\r\n");
+    swd_init();
+    if (!swd_connect_under_reset()) {
+        uart_cli_send("ERROR: Connect under reset failed\r\n");
+        swd_deinit();
+        return;
+    }
+    uart_cli_send("    Core halted at reset vector\r\n");
+
+    // === Step 3: Configure DWT + FPB while core is halted ===
+    // FPB is in system reset domain — does NOT survive nRST.
+    // But since we're halted (no more resets), FPB stays intact.
+    uart_cli_send("[3] Configuring DWT + FPB...\r\n");
+    uint32_t zero = 0;
+
+    // DEMCR: TRCENA=1 only (no VC_CORERESET — let core run freely after nRST)
+    uint32_t demcr_val = (1u << 24);
+    swd_write_mem(DEMCR, &demcr_val, 1);
+
+    // DWT_CTRL.CYCCNTENA = 1
+    uint32_t dwt_ctrl = 1;
+    swd_write_mem(0xE0001000, &dwt_ctrl, 1);
+
+    // Zero cycle counter
+    swd_write_mem(0xE0001004, &zero, 1);
+
+    // FP_CTRL = ENABLE + KEY
+    uint32_t fp_ctrl = 0x03;
+    swd_write_mem(0xE0002000, &fp_ctrl, 1);
+
+    // FP_COMP0: Cortex-M3 FPB encoding
+    // Bits[28:2] = address, bit[0] = ENABLE
+    // Bits[31:30] = REPLACE: 01=lower halfword, 10=upper halfword
+    uint32_t comp = (bp_addr & 0x1FFFFFFC) | 1;
+    if (bp_addr & 2)
+        comp |= (1u << 31);  // REPLACE=10 upper halfword
+    else
+        comp |= (1u << 30);  // REPLACE=01 lower halfword
+    swd_write_mem(0xE0002008, &comp, 1);
+
+    // Verify FPB was written correctly
+    uint32_t verify_comp, verify_ctrl;
+    swd_read_mem(0xE0002008, &verify_comp, 1);
+    swd_read_mem(0xE0002000, &verify_ctrl, 1);
+    uart_cli_printf("    FP_CTRL=0x%08lX FP_COMP0=0x%08lX (want: 0x%08lX)\r\n",
+                    verify_ctrl, verify_comp, comp);
+
+    // === Step 4: Disconnect SWD, assert nRST ===
+    // FPB + DWT are set. Disconnect SWD so it doesn't interfere with boot.
+    // FPB is in the debug domain — survives system reset (nRST).
+    uart_cli_send("[4] Disconnect SWD + assert nRST...\r\n");
+    swd_deinit();
+    sleep_ms(1);
+
+    // Assert nRST via GPIO directly (SWD is deinitialized)
+    gpio_init(SWD_NRST_PIN);
+    gpio_set_dir(SWD_NRST_PIN, GPIO_OUT);
+    gpio_put(SWD_NRST_PIN, 0);
+    sleep_ms(5);
+
+    // === Step 5: Init ADC, release nRST, sample ===
+    adc_init();
+    adc_gpio_init(ADC_SHUNT_PIN);
+    adc_select_input(ADC_SHUNT_CHAN);
+
+    static uint16_t adc_buf[32768];
+    uint32_t adc_count = 0;
+
+    uart_cli_send("[5] Release nRST + sampling ADC...\r\n");
+
+    // Release nRST — core boots, DWT counts, FPB armed
+    gpio_put(SWD_NRST_PIN, 1);
+    gpio_set_dir(SWD_NRST_PIN, GPIO_IN);  // High-Z after release
+    uint64_t t0 = time_us_64();
+
+    // Tight ADC sampling loop (~2us/sample, no pacing)
+    uint32_t window_us = 500000;
+
+    while (adc_count < samples) {
+        adc_buf[adc_count++] = adc_read();
+        if (time_us_64() - t0 > window_us) break;
+    }
+
+    uint64_t t_sample_end = time_us_64();
+    uint32_t sample_us = (uint32_t)(t_sample_end - t0);
+
+    // === Step 6: Reconnect SWD, read results ===
+    uart_cli_send("[6] Reconnecting SWD...\r\n");
+    swd_init();
+    if (!swd_connect()) {
+        uart_cli_send("WARNING: SWD reconnect failed\r\n");
+        goto print_adc;
+    }
+
+    uint32_t dhcsr = 0;
+    swd_read_mem(DHCSR, &dhcsr, 1);
+    bool halted = (dhcsr & (1u << 17)) != 0;
+    uart_cli_printf("Core halted: %s (DHCSR=0x%08lX)\r\n", halted ? "YES" : "NO", dhcsr);
+
+    if (halted) {
+        uint32_t cyccnt;
+        swd_read_mem(0xE0001004, &cyccnt, 1);
+
+        uint32_t pc;
+        swd_read_core_reg(15, &pc);
+
+        float time_ms = (float)cyccnt / 8000.0f;
+
+        uart_cli_printf("\r\nDWT_CYCCNT: %lu cycles (%.2fms @ 8MHz HSI)\r\n", cyccnt, time_ms);
+        uart_cli_printf("           ^^^^^^^^ use this as PAUSE for glitch targeting\r\n");
+        uart_cli_printf("PC: 0x%08lX %s\r\n", pc,
+                        (pc == bp_addr || pc == (bp_addr | 1)) ? "(MATCH)" : "(MISMATCH)");
+
+        // Verify FPB still intact
+        uint32_t fp_comp_after;
+        swd_read_mem(0xE0002008, &fp_comp_after, 1);
+        uart_cli_printf("FP_COMP0 after: 0x%08lX\r\n", fp_comp_after);
+
+        // Pico equivalent: STM32 8MHz -> Pico 150MHz = x18.75
+        uint32_t pause_pico = (uint32_t)((float)cyccnt * 18.75f);
+        uart_cli_printf("\r\nPICO PAUSE equivalent: %lu cycles (150MHz)\r\n", pause_pico);
+        uart_cli_printf("    SET PAUSE %lu\r\n", pause_pico);
+    } else {
+        uart_cli_send("WARNING: Core not halted — breakpoint may not have been reached yet\r\n");
+        uart_cli_send("         Try increasing sample count or check breakpoint address\r\n");
+    }
+
+    // Cleanup FPB
+    uint32_t fp_disable = 0x02;
+    swd_write_mem(0xE0002000, &fp_disable, 1);
+    swd_write_mem(0xE0002008, &zero, 1);
+
+print_adc:
+    // === ADC trace ===
+    uart_cli_printf("\r\nADC shunt profile (%lu samples, %luus total, ~%luus/sample):\r\n",
+                    adc_count, sample_us,
+                    adc_count > 0 ? sample_us / adc_count : 0);
+
+    // Find min/max
+    uint16_t amin = 4095, amax = 0;
+    for (uint32_t i = 0; i < adc_count; i++) {
+        if (adc_buf[i] < amin) amin = adc_buf[i];
+        if (adc_buf[i] > amax) amax = adc_buf[i];
+    }
+    uart_cli_printf("  ADC range: %u-%u (%.2fV-%.2fV)\r\n",
+                    amin, amax,
+                    amin * 3.3f / 4095.0f, amax * 3.3f / 4095.0f);
+
+    // Raw sample dump — hex dump format, 16-bit LE samples, 16 bytes (8 samples) per line
+    uint32_t total_bytes = adc_count * 2;
+    uart_cli_printf("  RAW_START %lu %lu\r\n", adc_count, sample_us);  // sample_count sample_window_us
+    uint8_t *p = (uint8_t *)adc_buf;
+    for (uint32_t i = 0; i < total_bytes; i += 16) {
+        uart_cli_printf("%06X:", i);
+        for (uint32_t j = i; j < i + 16 && j < total_bytes; j++) {
+            uart_cli_printf(" %02X", p[j]);
+        }
+        uart_cli_send("\r\n");
+    }
+    uart_cli_send("  RAW_END\r\n");
+
+    swd_deinit();
+    adc_select_input(ADC_POWER_CHAN);
+
+    uart_cli_send("\r\n=== TIMING COMPLETE ===\r\n");
+}
+
+// ============================================================
+// Background ADC trace capture (DMA + GP12 interrupt)
+//
+// TRACE START [samples] [pre%]  — start DMA circular capture
+// TRACE STATUS                  — check state
+// TRACE DUMP                    — output captured buffer
+// TRACE STOP                    — abort
+//
+// Flow: DMA runs ADC into circular buffer continuously.
+// GP12 rising edge ISR (GLITCH_FIRED) snapshots DMA position,
+// then reconfigures DMA for exactly post_samples more transfers.
+// DMA stops itself when count hits zero. No CPU involvement.
+// ============================================================
+
+#define TRACE_BUF_SAMPLES 4096
+#define TRACE_BUF_BYTES   (TRACE_BUF_SAMPLES * 2)
+#define TRACE_BUF_LOG2    13  // log2(8192)
+
+static uint16_t __attribute__((aligned(TRACE_BUF_BYTES))) trace_buf[TRACE_BUF_SAMPLES];
+
+typedef enum {
+    TRACE_IDLE = 0,
+    TRACE_RUNNING,      // DMA active, waiting for trigger
+    TRACE_TRIGGERED,    // Trigger fired, DMA counting down post_samples
+    TRACE_COMPLETE,     // DMA finished, buffer ready for dump
+} trace_state_t;
+
+static volatile trace_state_t trace_state = TRACE_IDLE;
+static volatile uint32_t trace_trig_sample = 0;  // buffer index at trigger
+static int trace_dma_chan = -1;
+static uint32_t trace_post_samples = 0;
+static uint32_t trace_total_samples = 0;
+static uint32_t trace_pre_pct = 25;
+static uint64_t trace_start_us = 0;
+static uint64_t trace_trig_us = 0;
+static uint64_t trace_end_us = 0;
+
+// GP12 rising edge ISR — trigger fired
+static void trace_gp12_isr(uint gpio, uint32_t events) {
+    if (gpio != PIN_GLITCH_FIRED || trace_state != TRACE_RUNNING) return;
+
+    // Snapshot DMA write position = trigger point in circular buffer
+    uint32_t write_addr = (uint32_t)dma_channel_hw_addr(trace_dma_chan)->write_addr;
+    trace_trig_sample = (write_addr - (uint32_t)trace_buf) / 2;
+    trace_trig_us = time_us_64();
+
+    // Abort DMA (register-level, ISR-safe), then restart with post_samples count.
+    // Can't modify running counter on RP2350 — must abort+restart.
+    dma_hw->abort = (1u << trace_dma_chan);
+    while (dma_hw->abort & (1u << trace_dma_chan)) tight_loop_contents();
+
+    // Drain any residual ADC FIFO samples
+    while (!adc_fifo_is_empty()) adc_fifo_get();
+
+    // Restart DMA: write continues from trigger point, post_samples transfers.
+    // Writing al1_transfer_count_trig sets count AND triggers the channel.
+    dma_hw->ch[trace_dma_chan].write_addr = write_addr;
+    dma_hw->ch[trace_dma_chan].al1_transfer_count_trig = trace_post_samples;
+
+    trace_state = TRACE_TRIGGERED;
+
+    // Disable this interrupt — one-shot
+    gpio_set_irq_enabled(PIN_GLITCH_FIRED, GPIO_IRQ_EDGE_RISE, false);
+}
+
+// DMA completion ISR — post_samples done
+static void trace_dma_isr(void) {
+    dma_channel_acknowledge_irq0(trace_dma_chan);
+    adc_run(false);
+    trace_end_us = time_us_64();
+    trace_state = TRACE_COMPLETE;
+}
+
+void trace_start(uint32_t samples, uint32_t pre_pct_arg) {
+    if (trace_state == TRACE_RUNNING || trace_state == TRACE_TRIGGERED) {
+        uart_cli_send("ERROR: Trace already running (TRACE STOP first)\r\n");
+        return;
+    }
+
+    if (samples == 0) samples = TRACE_BUF_SAMPLES;
+    if (samples > TRACE_BUF_SAMPLES) samples = TRACE_BUF_SAMPLES;
+    if (pre_pct_arg == 0) pre_pct_arg = 25;
+    if (pre_pct_arg > 90) pre_pct_arg = 90;
+
+    trace_total_samples = samples;
+    trace_pre_pct = pre_pct_arg;
+    trace_post_samples = samples - (samples * pre_pct_arg) / 100;
+    trace_state = TRACE_IDLE;
+    trace_trig_sample = 0;
+
+    // Init ADC free-running with DMA
+    adc_init();
+    adc_gpio_init(ADC_SHUNT_PIN);
+    adc_select_input(ADC_SHUNT_CHAN);
+    adc_fifo_setup(true, true, 1, false, false);
+    adc_set_clkdiv(0);  // ~500ksps
+
+    // Claim DMA channel
+    trace_dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config cfg = dma_channel_get_default_config(trace_dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
+    channel_config_set_read_increment(&cfg, false);
+    channel_config_set_write_increment(&cfg, true);
+    channel_config_set_ring(&cfg, true, TRACE_BUF_LOG2);
+    channel_config_set_dreq(&cfg, DREQ_ADC);
+
+    dma_channel_configure(trace_dma_chan, &cfg,
+        trace_buf,          // write
+        &adc_hw->fifo,      // read
+        0xFFFFFFFF,         // circular until ISR sets post count
+        false);
+
+    // Set up DMA completion interrupt (fires when transfer_count hits 0)
+    dma_channel_set_irq0_enabled(trace_dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, trace_dma_isr);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    // Set up GP12 rising edge interrupt (GLITCH_FIRED) via shared dispatcher
+    gpio_irq_register(PIN_GLITCH_FIRED, GPIO_IRQ_EDGE_RISE, trace_gp12_isr);
+
+    // Start DMA then ADC
+    dma_channel_start(trace_dma_chan);
+    adc_run(true);
+    trace_start_us = time_us_64();
+    trace_state = TRACE_RUNNING;
+
+    uart_cli_printf("OK: Trace started (%lu samples, %lu%% pre-trigger, %lu post)\r\n",
+                    samples, pre_pct_arg, trace_post_samples);
+    uart_cli_send("  Waiting for trigger (GP12 rising edge)...\r\n");
+}
+
+void trace_stop(void) {
+    if (trace_state == TRACE_IDLE) {
+        uart_cli_send("Trace not running\r\n");
+        return;
+    }
+    adc_run(false);
+    if (trace_dma_chan >= 0) {
+        dma_channel_abort(trace_dma_chan);
+        dma_channel_set_irq0_enabled(trace_dma_chan, false);
+        dma_channel_unclaim(trace_dma_chan);
+        trace_dma_chan = -1;
+    }
+    irq_set_enabled(DMA_IRQ_0, false);
+    gpio_irq_unregister(PIN_GLITCH_FIRED, trace_gp12_isr);
+    adc_fifo_drain();
+    adc_fifo_setup(false, false, 0, false, false);
+    adc_select_input(ADC_POWER_CHAN);
+    trace_state = TRACE_IDLE;
+    uart_cli_send("OK: Trace stopped\r\n");
+}
+
+void trace_status(void) {
+    const char *state_str;
+    switch (trace_state) {
+        case TRACE_IDLE:      state_str = "IDLE"; break;
+        case TRACE_RUNNING:   state_str = "RUNNING (waiting for trigger)"; break;
+        case TRACE_TRIGGERED: state_str = "TRIGGERED (capturing post samples)"; break;
+        case TRACE_COMPLETE:  state_str = "COMPLETE (ready for TRACE DUMP)"; break;
+        default:              state_str = "UNKNOWN"; break;
+    }
+    uart_cli_printf("Trace: %s\r\n", state_str);
+    if (trace_state >= TRACE_TRIGGERED) {
+        uart_cli_printf("  Trigger at buffer index %lu\r\n", trace_trig_sample);
+    }
+    if (trace_state == TRACE_COMPLETE) {
+        uint32_t total_us = (uint32_t)(trace_end_us - trace_start_us);
+        uart_cli_printf("  Total time: %luus\r\n", total_us);
+    }
+}
+
+void trace_dump(void) {
+    if (trace_state != TRACE_COMPLETE) {
+        uart_cli_printf("ERROR: Trace not complete (state: %d)\r\n", trace_state);
+        return;
+    }
+
+    uint32_t pre_count = (trace_total_samples * trace_pre_pct) / 100;
+    uint32_t post_count = trace_post_samples;
+
+    // Check if buffer wrapped enough for full pre-trigger
+    // DMA ran for at least (trigger_time - start_time) at ~500ksps
+    uint32_t capture_us = (uint32_t)(trace_trig_us - trace_start_us);
+    uint32_t est_pre_available = capture_us / 2;  // ~2us/sample
+    if (pre_count > est_pre_available)
+        pre_count = est_pre_available;
+    if (pre_count > TRACE_BUF_SAMPLES - post_count)
+        pre_count = TRACE_BUF_SAMPLES - post_count;
+
+    uint32_t out_total = pre_count + post_count;
+    uint32_t total_us = (uint32_t)(trace_end_us - trace_start_us);
+
+    uart_cli_printf("Captured %lu samples (%lu pre + %lu post trigger)\r\n",
+                    out_total, pre_count, post_count);
+    uart_cli_printf("Trigger at sample %lu, ~2us/sample\r\n", pre_count);
+
+    // Extract window from circular buffer — unwrap in-place to out_buf
+    // Post-trigger data ends at: (trig_sample + post_count) & mask
+    // Pre-trigger data starts at: (trig_sample - pre_count) & mask
+    static uint16_t out_buf[32768];
+    uint32_t mask = TRACE_BUF_SAMPLES - 1;
+    for (uint32_t i = 0; i < out_total; i++) {
+        uint32_t src = (trace_trig_sample - pre_count + i) & mask;
+        out_buf[i] = trace_buf[src];
+    }
+
+    // Hex dump
+    uint32_t total_bytes = out_total * 2;
+    uart_cli_printf("  RAW_START %lu %lu %lu\r\n", out_total, total_us, pre_count);
+    uint8_t *p = (uint8_t *)out_buf;
+    for (uint32_t i = 0; i < total_bytes; i += 16) {
+        uart_cli_printf("%06X:", i);
+        for (uint32_t j = i; j < i + 16 && j < total_bytes; j++) {
+            uart_cli_printf(" %02X", p[j]);
+        }
+        uart_cli_send("\r\n");
+    }
+    uart_cli_send("  RAW_END\r\n");
+
+    // Clean up
+    if (trace_dma_chan >= 0) {
+        dma_channel_set_irq0_enabled(trace_dma_chan, false);
+        dma_channel_unclaim(trace_dma_chan);
+        trace_dma_chan = -1;
+    }
+    irq_set_enabled(DMA_IRQ_0, false);
+    adc_fifo_drain();
+    adc_fifo_setup(false, false, 0, false, false);
+    adc_select_input(ADC_POWER_CHAN);
+    trace_state = TRACE_IDLE;
+
+    uart_cli_send("=== TRACE COMPLETE ===\r\n");
 }

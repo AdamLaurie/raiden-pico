@@ -105,6 +105,16 @@ uint32_t swd_identify(void);
 // DHCSR key for writes
 #define DBGKEY      0xA05F0000
 
+// FPB (Flash Patch and Breakpoint) registers
+#define FP_CTRL     0xE0002000  // FPB Control Register
+#define FP_REMAP    0xE0002004  // FPB Remap Register
+#define FP_COMP0    0xE0002008  // FPB Comparator 0
+// FP_COMPn = FP_COMP0 + n*4, n=0..5 (instruction), 6..7 (literal)
+
+// DWT (Data Watchpoint and Trace) registers
+#define DWT_CTRL    0xE0001000  // DWT Control
+#define DWT_CYCCNT  0xE0001004  // DWT Cycle Counter
+
 // Cortex-M debug ID register (STM32-specific)
 #define DBG_IDCODE  0xE0042000
 

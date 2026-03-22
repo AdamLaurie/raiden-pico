@@ -31,6 +31,15 @@ void glitch_set_trigger_byte(uint8_t byte);
 bool glitch_arm(void);
 void glitch_disarm(void);
 
+// Arm trigger detection only (no glitch pulse) for trace capture
+// GP12 (GLITCH_FIRED) goes HIGH on trigger, no pulse output
+bool glitch_arm_trace(void);
+
+// Temporarily suspend/resume trigger detection (e.g. during TARGET SYNC)
+// Prevents PIO UART decoder from matching bytes while armed
+void glitch_suspend_trigger(void);
+void glitch_resume_trigger(void);
+
 // Execute a glitch
 bool glitch_execute(void);
 
@@ -42,6 +51,9 @@ uint32_t glitch_get_count(void);
 
 // Update flag outputs (call periodically from main loop)
 void glitch_update_flags(void);
+
+// Debug: dump PIO state
+void glitch_debug_pio(void);
 
 // Clock generator control
 void clock_set_frequency(uint32_t freq_hz);

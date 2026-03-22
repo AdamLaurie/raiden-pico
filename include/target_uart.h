@@ -76,4 +76,10 @@ void target_power_regdump(void);
 void target_power_glitch_regdump(uint32_t max_attempts);
 void target_power_resettest(void);
 
+// Breakpoint timing measurement via DWT cycle counter + ADC shunt current
+// name_or_addr: breakpoint name or "0xADDR", NULL to list breakpoints
+// samples: number of ADC samples (0 = default 4096)
+// bootloader_mode: true = BOOT0=1 (bootloader), false = BOOT0=0 (flash)
+void target_power_timing(const char *name_or_addr, uint32_t samples, bool bootloader_mode);
+
 #endif // TARGET_UART_H
