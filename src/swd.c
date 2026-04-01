@@ -1085,80 +1085,10 @@ bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level) {
 
     printf("[SWD] set_rdp: level=%u, rdp_val=0x%02X\r\n", level, rdp_val);
 
-    // F1/F3 path: SWD-only option byte programming via connect-under-reset.
-    // Halt at reset vector before firmware runs, then program option bytes.
-    if (info->flash_base == 0x40022000) {
-        #define F1_CR_OPTWRE (1u << 9)
-        #define F1_CR_OPTER  (1u << 5)
-        #define F1_CR_STRT   (1u << 6)
-        #define F1_CR_OPTPG  (1u << 4)
-
-        // Connect under reset to halt before firmware/watchdog runs
-        if (!swd_connect_under_reset()) {
-            printf("[SWD] F1: connect-under-reset failed\r\n");
-            return false;
-        }
-
-        // Unlock flash + option bytes
-        mem_write32(info->flash_keyr, info->flash_key1);
-        mem_write32(info->flash_keyr, info->flash_key2);
-        mem_write32(info->flash_optkeyr, info->opt_key1);
-        mem_write32(info->flash_optkeyr, info->opt_key2);
-
-        uint32_t cr;
-        mem_read32(info->flash_cr, &cr);
-        if (!(cr & F1_CR_OPTWRE)) {
-            printf("[SWD] F1: option unlock failed (CR=0x%08X)\r\n", (unsigned)cr);
-            return false;
-        }
-
-        // Erase option bytes: set OPTER, then STRT
-        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTER);
-        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTER | F1_CR_STRT);
-        swd_stm32_flash_wait(info, 2000);
-
-        // Clear OPTER
-        mem_write32(info->flash_cr, F1_CR_OPTWRE);
-
-        // Program RDP value using halfword write
-        mem_write32(info->flash_cr, F1_CR_OPTWRE | F1_CR_OPTPG);
-        uint16_t opt_val = rdp_val | ((uint16_t)(~rdp_val & 0xFF) << 8);
-        mem_write16(info->opt_base, opt_val);
-        swd_stm32_flash_wait(info, 100);
-
-        // Program USER byte defaults (WDG_SW=1, nRST_STOP=1, nRST_STDBY=1)
-        mem_write16(info->opt_base + 2, 0x00FF);
-        swd_stm32_flash_wait(info, 100);
-
-        // Clear programming mode
-        mem_write32(info->flash_cr, 0);
-
-        // Reset to apply — RDP0 transition triggers mass erase
-        swd_nrst_pulse(10);
-        if (level == 0) {
-            printf("[SWD] F1: waiting for mass erase...\r\n");
-            sleep_ms(5000);
-        } else {
-            sleep_ms(500);
-        }
-
-        // Reconnect and verify
-        connected = false;
-        ahb_initialized = false;
-        sleep_ms(100);
-        if (swd_connect()) {
-            int new_rdp = swd_stm32_read_rdp(info);
-            printf("[SWD] F1: RDP level = %d\r\n", new_rdp);
-            if (new_rdp == level) {
-                printf("[SWD] F1: RDP change successful!\r\n");
-                return true;
-            }
-        }
-        printf("[SWD] F1: RDP change failed\r\n");
-        return false;
-    }
-
-    // Non-F1 path: normal unlock with verification
+    // Generic path: halt, unlock, program option bytes.
+    // NOTE: connect-under-reset was previously used here for F1, but under RDP1
+    // the STM32F1 blocks flash unlock when debugger is detected at startup.
+    // The generic halt-based approach works for all families including F1 under RDP1.
     swd_halt();
     sleep_ms(10);
 
@@ -1201,6 +1131,57 @@ bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level) {
         if (!mem_write32(info->flash_cr, cr))
             return false;
     }
+    // F1/F3: erase option bytes then reprogram via halfword writes
+    else if (info->flash_optr == 0x4002201C) {
+        uint32_t sr;
+
+        // Clear any pending errors
+        mem_write32(info->flash_sr, 0x34);
+
+        // OPTER (erase option bytes) + STRT
+        uint32_t cr;
+        if (!mem_read32(info->flash_cr, &cr))
+            return false;
+        cr |= (1 << 5);  // OPTER
+        if (!mem_write32(info->flash_cr, cr))
+            return false;
+        cr |= (1 << 6);  // STRT
+        if (!mem_write32(info->flash_cr, cr))
+            return false;
+
+        if (!swd_stm32_flash_wait(info, 2000))
+            return false;
+        mem_read32(info->flash_sr, &sr);
+        if (sr & 0x14) {
+            printf("[SWD] F1: option erase failed (SR=0x%08X)\r\n", (unsigned)sr);
+            return false;
+        }
+
+        // Clear OPTER, set OPTPG (option byte program)
+        cr &= ~((1 << 5) | (1 << 6));
+        cr |= (1 << 4);  // OPTPG
+        if (!mem_write32(info->flash_cr, cr))
+            return false;
+
+        // Write RDP value as halfword to option byte base
+        uint16_t opt_val = rdp_val | ((uint16_t)(~rdp_val & 0xFF) << 8);
+        if (!mem_write16(info->opt_base, opt_val))
+            return false;
+        if (!swd_stm32_flash_wait(info, 1000))
+            return false;
+
+        // Program USER byte defaults (WDG_SW=1, nRST_STOP=1, nRST_STDBY=1)
+        mem_write32(info->flash_sr, 0x34);  // Clear EOP
+        if (!mem_write16(info->opt_base + 2, 0x00FF))
+            return false;
+        if (!swd_stm32_flash_wait(info, 1000))
+            return false;
+
+        // Clear OPTPG
+        cr &= ~(1 << 4);
+        if (!mem_write32(info->flash_cr, cr))
+            return false;
+    }
 
     // Wait for completion
     if (!swd_stm32_flash_wait(info, 5000))
@@ -1213,6 +1194,39 @@ bool swd_stm32_set_rdp(const stm32_target_info_t *info, uint8_t level) {
             return false;
         cr |= (1 << 27);  // OBL_LAUNCH
         mem_write32(info->flash_cr, cr);  // Target will reset, may fail
+    }
+
+    // F1/F3: power cycle to apply option byte changes and reload shadow registers
+    if (info->flash_optr == 0x4002201C) {
+        extern void target_power_off(void);
+        extern void target_power_on(void);
+
+        printf("[SWD] F1: power cycling to apply option bytes...\r\n");
+        swd_deinit();
+        connected = false;
+        ahb_initialized = false;
+
+        target_power_off();
+        sleep_ms(100);
+        target_power_on();
+        if (level == 0) {
+            printf("[SWD] F1: waiting for mass erase...\r\n");
+            sleep_ms(5000);
+        } else {
+            sleep_ms(500);
+        }
+
+        swd_init();
+        if (swd_connect()) {
+            int new_rdp = swd_stm32_read_rdp(info);
+            printf("[SWD] F1: RDP level = %d\r\n", new_rdp);
+            if (new_rdp == level) {
+                printf("[SWD] F1: RDP change successful!\r\n");
+                return true;
+            }
+        }
+        printf("[SWD] F1: RDP readback failed\r\n");
+        return false;
     }
 
     return true;
