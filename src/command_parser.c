@@ -248,9 +248,10 @@ void command_parser_execute(cmd_parts_t *parts) {
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
-        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32", "SWD", "JTAG"
+        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32", "SWD", "JTAG",
+        "TRACE"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 19, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 20, "command")) {
         goto api_response;
     }
 
@@ -289,8 +290,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "RDP", "OPT", "FLASH", "RESET"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 13, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 15, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -298,6 +299,9 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (!match_and_replace(&parts->parts[1], jtag_subcmds, 7, "JTAG sub-command")) {
                 goto api_response;
             }
+        } else if (strcmp(parts->parts[0], "TRACE") == 0 && parts->count >= 2) {
+            const char *trace_subcmds[] = {"START", "RESET", "STATUS", "DUMP", "ARM"};
+            match_and_replace(&parts->parts[1], trace_subcmds, 5, NULL);
         }
     }
 
@@ -313,8 +317,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "ARM") == 0 && parts->count == 2) {
-        const char *arm_states[] = {"ON", "OFF"};
-        if (!match_and_replace(&parts->parts[1], arm_states, 2, "ARM state")) {
+        const char *arm_states[] = {"ON", "OFF", "TRACE"};
+        if (!match_and_replace(&parts->parts[1], arm_states, 3, "ARM state")) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "SET") == 0 && parts->count >= 2) {
@@ -370,7 +374,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns @ 150MHz)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
-        uart_cli_send("ARM [ON|OFF]           - Arm/disarm/show glitch system\r\n");
+        uart_cli_send("ARM [ON|OFF|TRACE]     - Arm/disarm/show (TRACE = trigger only, no glitch)\r\n");
         uart_cli_send("DEBUG [ON|OFF]         - Toggle/show target UART debug display\r\n");
         uart_cli_send("GLITCH                 - Execute single glitch\r\n");
         uart_cli_send("PINS                   - Show pin configuration\r\n");
@@ -414,7 +418,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TRIGGER [NONE|GPIO|UART] - Configure/show trigger\r\n");
         uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
         uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
-        uart_cli_send("TRIGGER UART <byte>    - UART byte trigger\r\n");
+        uart_cli_send("TRIGGER UART <byte> [TX|RX] - UART byte trigger (TX=Raiden TX, RX=Raiden RX)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== ADC Trace (GP27/ADC1 shunt current) ==\r\n");
+        uart_cli_send("TRACE [samples] [pre%] - Start ADC trace (~2us/sample, default 4096/50%)\r\n");
+        uart_cli_send("TRACE STATUS           - Check trace state (IDLE/RUNNING/COMPLETE)\r\n");
+        uart_cli_send("TRACE DUMP             - Dump raw ADC samples (hex)\r\n");
+        uart_cli_send("TRACE RATE <clkdiv>    - Set ADC rate (0=2us, 50=100us, 500=1ms/sample)\r\n");
+        uart_cli_send("TRACE RESET            - Discard trace and reset to IDLE\r\n");
+        uart_cli_send("  Usage: TRIGGER UART 79 → TRACE 4096 50 → ARM TRACE → (trigger event)\r\n");
+        uart_cli_send("         TRACE STATUS → TRACE DUMP → ARM OFF\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
@@ -453,17 +466,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("JTAG IR <value> [bits] - Shift instruction register (default 4 bits)\r\n");
         uart_cli_send("JTAG DR <value> [bits] - Shift data register (default 32 bits)\r\n");
         uart_cli_send("\r\n");
+        uart_cli_send("== General ==\r\n");
+        uart_cli_send("VERSION                - Show firmware version and features\r\n");
+        uart_cli_send("STATUS                 - Show current configuration and state\r\n");
+        uart_cli_send("REBOOT                 - Reboot Raiden Pico\r\n");
+        uart_cli_send("PINS                   - Show GPIO pin assignments\r\n");
+        uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_printf("Raiden Pico Glitcher v0.3\r\n");
-        uart_cli_printf("Build: Cycle-based timing, improved ARM/GLITCH handling\r\n");
-        uart_cli_printf("Features:\r\n");
-        uart_cli_printf(" - System clock cycle timing (150MHz, 6.67ns resolution)\r\n");
-        uart_cli_printf(" - TARGET SYNC with 5 retries\r\n");
-        uart_cli_printf(" - Fixed ARM after GLITCH issue\r\n");
-        uart_cli_printf(" - Ultra-low latency PIO-based UART triggering\r\n");
-        uart_cli_printf(" - RP2350 GPIO ISO bit handling for PIO/UART sharing\r\n");
-        uart_cli_send("OK\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.4\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -539,6 +550,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("Edge:         %s\r\n", cfg->trigger_edge == EDGE_RISING ? "RISING" : "FALLING");
         } else if (cfg->trigger == TRIGGER_UART) {
             uart_cli_printf("Byte:         0x%02X (%u)\r\n", cfg->trigger_byte, cfg->trigger_byte);
+            uart_cli_printf("Pin:          GP%u (%s)\r\n", cfg->trigger_uart_pin,
+                           cfg->trigger_uart_pin == 4 ? "TX" : "RX");
         }
         uart_cli_send("\r\n");
 
@@ -563,9 +576,6 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
 
-        uart_cli_send("\r\n");
-        uart_cli_send("== PIO Debug ==\r\n");
-        glitch_debug_pio();
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
         uint32_t clock_freq = clock_get_frequency();
@@ -900,7 +910,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                     cfg->trigger_pin,
                     cfg->trigger_edge == EDGE_RISING ? "RISING" : "FALLING");
             } else if (cfg->trigger == TRIGGER_UART) {
-                uart_cli_printf("UART (Byte: 0x%02X)\r\n", cfg->trigger_byte);
+                uart_cli_printf("UART (Byte: 0x%02X, %s)\r\n", cfg->trigger_byte,
+                               cfg->trigger_uart_pin == 4 ? "TX" : "RX");
             }
         } else if (strcmp(parts->parts[1], "NONE") == 0) {
             glitch_set_trigger_type(TRIGGER_NONE);
@@ -917,7 +928,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                           edge == EDGE_RISING ? "RISING" : "FALLING");
         } else if (strcmp(parts->parts[1], "UART") == 0) {
             if (parts->count < 3) {
-                uart_cli_send("ERROR: Usage: TRIGGER UART <byte>\r\n");
+                uart_cli_send("ERROR: Usage: TRIGGER UART <byte> [TX|RX]\r\n");
                 goto api_response;
             }
             // Parse hex value (support both 0x0D and 0D formats)
@@ -938,9 +949,22 @@ void command_parser_execute(cmd_parts_t *parts) {
                     byte = (uint8_t)atoi(val);
                 }
             }
+            // Optional TX/RX pin selection (default RX = GP5)
+            uint8_t uart_pin = 5;  // GP5 = RX (STM32 TX → Pico)
+            const char *pin_name = "RX";
+            if (parts->count >= 4) {
+                if (strcasecmp(parts->parts[3], "TX") == 0) {
+                    uart_pin = 4;  // GP4 = TX (Pico → STM32)
+                    pin_name = "TX";
+                } else if (strcasecmp(parts->parts[3], "RX") == 0) {
+                    uart_pin = 5;
+                    pin_name = "RX";
+                }
+            }
             glitch_set_trigger_byte(byte);
             glitch_set_trigger_type(TRIGGER_UART);
-            uart_cli_printf("OK: UART trigger on byte 0x%02X (%u)\r\n", byte, byte);
+            glitch_get_config()->trigger_uart_pin = uart_pin;
+            uart_cli_printf("OK: UART trigger on %s byte 0x%02X (%u)\r\n", pin_name, byte, byte);
         }
 
     } else if (strcmp(parts->parts[0], "TARGET") == 0) {
@@ -1172,8 +1196,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING", "TRACE"};
-                if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, 10, "GLITCH command")) {
                     goto api_response;
                 }
 
@@ -1282,26 +1306,6 @@ void command_parser_execute(cmd_parts_t *parts) {
                             }
                         }
                         target_power_timing(bp_name, samples, bootloader);
-                    }
-                } else if (strcmp(parts->parts[2], "TRACE") == 0) {
-                    extern void trace_start(uint32_t samples, uint32_t pre_pct);
-                    extern void trace_stop(void);
-                    extern void trace_status(void);
-                    extern void trace_dump(void);
-                    if (parts->count >= 4 && strcmp(parts->parts[3], "STOP") == 0) {
-                        trace_stop();
-                    } else if (parts->count >= 4 && strcmp(parts->parts[3], "STATUS") == 0) {
-                        trace_status();
-                    } else if (parts->count >= 4 && strcmp(parts->parts[3], "DUMP") == 0) {
-                        trace_dump();
-                    } else {
-                        // TRACE [samples] [pre%]  or  TRACE START [samples] [pre%]
-                        uint32_t samp = 0, pre = 0;
-                        int i = 3;
-                        if (i < parts->count && strcmp(parts->parts[i], "START") == 0) i++;
-                        if (i < parts->count) parse_u32(parts->parts[i++], 0, &samp);
-                        if (i < parts->count) parse_u32(parts->parts[i++], 0, &pre);
-                        trace_start(samp, pre);
                     }
                 }
             }
@@ -1824,7 +1828,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         // Auto-connect for all SWD commands except CONNECT, CONNECTRST, DISCONNECT
         if (strcmp(parts->parts[1], "CONNECT") != 0 &&
             strcmp(parts->parts[1], "CONNECTRST") != 0 &&
-            strcmp(parts->parts[1], "DISCONNECT") != 0) {
+            strcmp(parts->parts[1], "DISCONNECT") != 0 &&
+            strcmp(parts->parts[1], "BPTEST") != 0) {
             if (!swd_ensure_connected()) {
                 api_error("ERROR: SWD connection failed (check target power and wiring)\r\n");
                 goto api_response;
@@ -1960,6 +1965,37 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else {
                     uart_cli_printf("  %-5s = <read failed>\r\n", reg_names[i]);
                 }
+            }
+
+        } else if (strcmp(parts->parts[1], "SETREG") == 0) {
+            // SWD SETREG <reg> <value> — write core register via DCRSR/DCRDR
+            // reg: 0-12=r0-r12, 13=sp, 14=lr, 15=pc, 16=xPSR, 17=MSP, 18=PSP
+            // Also accepts names: r0-r12, sp, lr, pc, xpsr, msp, psp
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: SWD SETREG <reg|name> <value>\r\n");
+                goto api_response;
+            }
+            int reg_num = -1;
+            const char *rarg = parts->parts[2];
+            // Try register name first
+            const char *rnames[] = {"r0","r1","r2","r3","r4","r5","r6","r7",
+                                    "r8","r9","r10","r11","r12","sp","lr","pc",
+                                    "xpsr","msp","psp"};
+            for (int i = 0; i < 19; i++) {
+                if (strcasecmp(rarg, rnames[i]) == 0) { reg_num = i; break; }
+            }
+            if (reg_num < 0) {
+                reg_num = (int)strtoul(rarg, NULL, 0);
+                if (reg_num > 18) {
+                    api_error("ERROR: Register must be 0-18 or name (r0-r12,sp,lr,pc,xpsr,msp,psp)\r\n");
+                    goto api_response;
+                }
+            }
+            uint32_t val = strtoul(parts->parts[3], NULL, 16);
+            if (swd_write_core_reg(reg_num, val)) {
+                uart_cli_printf("OK: %s = 0x%08X\r\n", rnames[reg_num], val);
+            } else {
+                api_error("ERROR: Failed to write register\r\n");
             }
 
         } else if (strcmp(parts->parts[1], "READ") == 0) {
@@ -2581,6 +2617,310 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("OK: nRST pulsed for %u ms\r\n", (unsigned)ms);
             }
 
+        } else if (strcmp(parts->parts[1], "BPTEST") == 0) {
+            // Test breakpoints on SRAM code: BKPT instruction, DWT PC-match,
+            // and boot ROM equivalent timing with ADC shunt.
+            // Strategy: normal connect + halt (not reset) so IWDG doesn't interfere.
+            uart_cli_send("=== SWD Breakpoint Test ===\r\n");
+
+            // Helper: connect, halt, freeze watchdogs
+            uart_cli_send("[1] Connecting and halting...\r\n");
+            if (!swd_connect()) {
+                api_error("ERROR: SWD connect failed\r\n");
+                goto api_response;
+            }
+            swd_clear_errors();
+            if (!swd_halt()) {
+                api_error("ERROR: Halt failed\r\n");
+                goto api_response;
+            }
+            // Freeze watchdogs
+            uint32_t dbg_cr;
+            swd_read_mem(0xE0042004, &dbg_cr, 1);
+            dbg_cr |= (1u << 8) | (1u << 9);
+            swd_write_mem(0xE0042004, &dbg_cr, 1);
+
+            uint32_t dhcsr;
+            swd_read_mem(0xE000EDF0, &dhcsr, 1);
+            uart_cli_printf("    DHCSR = 0x%08X\r\n", dhcsr);
+
+            uint32_t pc_init;
+            if (swd_read_core_reg(15, &pc_init))
+                uart_cli_printf("    PC = 0x%08X\r\n", pc_init);
+
+            uint32_t pc_check, func0;
+
+            // ============================================================
+            // Part 1: Software BKPT instruction test
+            // ============================================================
+            uart_cli_send("\r\n--- Part 1: Software BKPT instruction ---\r\n");
+            {
+                // Code at 0x20004000:
+                //   mov r0, #0       ; 0x2000
+                //   bkpt #0          ; 0xBE00  <- should halt here
+                //   add r0, #1       ; 0x3001
+                //   b .-4            ; 0xE7FC
+                uint32_t bkpt_code[2] = { 0xBE002000, 0xE7FC3001 };
+                swd_write_mem(0x20004000, bkpt_code, 2);
+
+                // Verify
+                uint32_t readback[2];
+                swd_read_mem(0x20004000, readback, 2);
+                uart_cli_printf("    Code: %08X %08X %s\r\n",
+                               readback[0], readback[1],
+                               (readback[0] == 0xBE002000) ? "OK" : "FAIL");
+
+                // Set registers
+                swd_write_core_reg(13, 0x20005000);  // SP
+                swd_write_core_reg(15, 0x20004001);  // PC (Thumb)
+                uint32_t xpsr;
+                swd_read_core_reg(16, &xpsr);
+                xpsr |= (1u << 24);  // T bit
+                swd_write_core_reg(16, xpsr);
+
+                // Enable debug halt on BKPT: C_DEBUGEN must be set (it already is)
+                // DEMCR: TRCENA + no vector catch
+                uint32_t demcr = (1u << 24);
+                swd_write_mem(0xE000EDFC, &demcr, 1);
+
+                // Resume
+                swd_resume();
+                sleep_ms(50);
+
+                // Check halt
+                swd_read_mem(0xE000EDF0, &dhcsr, 1);
+                bool halted = (dhcsr & (1u << 17)) != 0;
+                swd_read_core_reg(15, &pc_check);
+                uart_cli_printf("    DHCSR=0x%08X PC=0x%08X\r\n", dhcsr, pc_check);
+
+                if (halted && pc_check == 0x20004002) {
+                    uart_cli_send("*** PASS: Software BKPT works ***\r\n");
+                } else if (halted) {
+                    uart_cli_printf("    Halted but PC=0x%08X (expected 0x20004002)\r\n", pc_check);
+                } else {
+                    uart_cli_send("    FAIL: Not halted\r\n");
+                    swd_halt();
+                }
+            }
+
+            // Re-halt for next test
+            swd_halt();
+
+            // ============================================================
+            // Part 2: DWT PC-match test
+            // ============================================================
+            uart_cli_send("\r\n--- Part 2: DWT PC-match breakpoint ---\r\n");
+            {
+                // Code at 0x20004000:
+                //   mov r0, #0       ; 0x2000
+                //   add r0, #1       ; 0x3001  <- DWT breakpoint here (0x20004002)
+                //   b .-2            ; 0xE7FD
+                //   nop              ; 0xBF00
+                uint32_t dwt_code[2] = { 0x30012000, 0xBF00E7FD };
+                swd_write_mem(0x20004000, dwt_code, 2);
+
+                swd_write_core_reg(13, 0x20005000);
+                swd_write_core_reg(15, 0x20004001);
+                uint32_t xpsr;
+                swd_read_core_reg(16, &xpsr);
+                xpsr |= (1u << 24);
+                swd_write_core_reg(16, xpsr);
+
+                // DWT PC-match
+                uint32_t demcr = (1u << 24);
+                swd_write_mem(0xE000EDFC, &demcr, 1);
+                uint32_t bp_addr = 0x20004002;
+                swd_write_mem(0xE0001020, &bp_addr, 1);  // COMP0
+                uint32_t zero = 0;
+                swd_write_mem(0xE0001024, &zero, 1);      // MASK0
+                uint32_t dwt_func = 4;                     // PC match
+                swd_write_mem(0xE0001028, &dwt_func, 1);  // FUNCTION0
+
+                swd_resume();
+                sleep_ms(50);
+
+                swd_read_mem(0xE000EDF0, &dhcsr, 1);
+                bool halted = (dhcsr & (1u << 17)) != 0;
+                swd_read_core_reg(15, &pc_check);
+                swd_read_mem(0xE0001028, &func0, 1);
+                uart_cli_printf("    DHCSR=0x%08X PC=0x%08X FUNC0=0x%08X\r\n",
+                               dhcsr, pc_check, func0);
+
+                if (halted && pc_check == 0x20004002 && (func0 & (1u << 24))) {
+                    uart_cli_send("*** PASS: DWT PC-match works (MATCHED=1) ***\r\n");
+                } else {
+                    uart_cli_printf("    FAIL: halted=%d MATCHED=%u\r\n",
+                                   halted, (func0 >> 24) & 1);
+                    swd_halt();
+                }
+            }
+
+            // Re-halt for next test
+            swd_halt();
+
+            // ============================================================
+            // Part 3: Boot ROM equivalent — RDP check code in SRAM
+            // with DWT_CYCCNT timing + ADC shunt power trace
+            //
+            // Replicates boot ROM 0x1FFFF132..0x1FFFF13E:
+            //   ldr r1, [pc, #N]   ; r1 = FLASH base (0x40022000)
+            //   movs r0, #0        ; r0 = 0 (not protected)
+            //   ldr r1, [r1, #28]  ; r1 = FLASH_OBR (0x4002201C)
+            //   lsls r1, r1, #30   ; shift bit 1 into N flag
+            //   bpl .+2            ; if N=0, skip
+            //   movs r0, #1        ; r0 = 1 (protected)
+            //   bkpt #0            ; halt here ← software breakpoint
+            //   b .-14             ; loop back to start
+            // ============================================================
+            uart_cli_send("\r\n--- Part 3: Boot ROM RDP equivalent + timing ---\r\n");
+            {
+                // Enable DWT cycle counter
+                uint32_t demcr = (1u << 24);
+                swd_write_mem(0xE000EDFC, &demcr, 1);
+
+                // Disable any DWT watchpoints from part 2
+                uint32_t zero = 0;
+                swd_write_mem(0xE0001028, &zero, 1);  // FUNCTION0=0 (disabled)
+
+                // Zero DWT_CYCCNT and enable counter
+                swd_write_mem(0xE0001004, &zero, 1);   // CYCCNT = 0
+                uint32_t cyccnt_en = 1;
+                swd_write_mem(0xE0001000, &cyccnt_en, 1);  // DWT_CTRL.CYCCNTENA
+
+                // Write boot ROM RDP-check equivalent to SRAM at 0x20004000
+                // Thumb-2 encoding, little-endian words:
+                //
+                // 0x20004000: ldr r1, [pc, #16]   ; 0x4908  → loads from 0x20004024
+                // 0x20004002: movs r0, #0          ; 0x2000
+                // 0x20004004: ldr r1, [r1, #28]    ; 0x69C9  (FLASH_OBR = base+0x1C)
+                // 0x20004006: lsls r1, r1, #30     ; 0x0789
+                // 0x20004008: bpl .+2               ; 0xD500
+                // 0x2000400A: movs r0, #1           ; 0x2001
+                // 0x2000400C: bkpt #0               ; 0xBE00  ← halt here
+                // 0x2000400E: b 0x20004000          ; 0xE7F7
+                //
+                // Literal pool at 0x20004024:
+                // 0x20004024: 0x40022000            ; FLASH register base
+                //
+                // Note: ldr r1, [pc, #16] at addr 0x20004000:
+                //   PC-relative load: (PC & ~3) + 4 + 16 = 0x20004000 + 4 + 16 = 0x20004014
+                //   Wait, that's wrong. Let me recalculate.
+                //   For Thumb: effective PC = (addr + 4) & ~3 = 0x20004004 & ~3 = 0x20004004
+                //   Offset = 16 → target = 0x20004004 + 16 = 0x20004014
+                //   Hmm, let me just put literal right after code at aligned offset.
+                //
+                // Simpler: put literal at 0x20004010 (word-aligned, right after code)
+                //   ldr r1, [pc, #8] at 0x20004000:
+                //     effective PC = 0x20004004 (aligned)
+                //     target = 0x20004004 + 8 = 0x2000400C — no, that's the bkpt
+                //
+                // Even simpler: use mov/movt to load 0x40022000 directly.
+                //   movw r1, #0x2000     ; 0xF240 0x1000 → F240 1000
+                //   movt r1, #0x4002     ; 0xF2C4 0x0102 → F2C4 0102  (imm16=0x4002)
+                //   movs r0, #0          ; 0x2000
+                //   ldr r1, [r1, #28]    ; 0x69C9
+                //   lsls r1, r1, #30     ; 0x0789
+                //   bpl .+2              ; 0xD500
+                //   movs r0, #1          ; 0x2001
+                //   bkpt #0              ; 0xBE00
+                //   b start              ; 0xE7F5 (back to movw, 12 halfwords back)
+                //   nop                  ; 0xBF00
+                //
+                // movw encoding: 0xF240 | (imm4<<16) | (i<<26), 0x(imm3<<12)|(rd<<8)|(imm8)
+                // movw r1, #0x2000: imm16=0x2000 → imm4=0x2,i=0,imm3=0,imm8=0x00
+                //   = F242 1000
+                // movt r1, #0x4002: imm16=0x4002 → imm4=0x4,i=0,imm3=0,imm8=0x02
+                //   = F2C4 0102
+                //
+                // Actually Thumb-2 movw/movt encoding is complex. Let me use a
+                // simpler approach: put the constant in SRAM and use a PC-relative load.
+                //
+                // Better approach: just put code + literal pool contiguously.
+                // At 0x20004000:
+                //   0x00: movs r0, #0          ; 0x2000
+                //   0x02: ldr  r1, [pc, #12]   ; 0x4903  → loads from (0x20004006 & ~3) + 12 = 0x20004010
+                //   0x04: ldr  r1, [r1, #28]   ; 0x69C9
+                //   0x06: lsls r1, r1, #30     ; 0x0789
+                //   0x08: bpl  .+2              ; 0xD500
+                //   0x0A: movs r0, #1           ; 0x2001
+                //   0x0C: bkpt #0               ; 0xBE00
+                //   0x0E: b    .-14             ; 0xE7F7 (back to 0x20004000)
+                //   0x10: .word 0x40022000      ; literal pool
+                //
+                // Check: ldr r1, [pc, #12] at 0x20004002:
+                //   effective PC = (0x20004002 + 4) & ~3 = 0x20004004
+                //   target = 0x20004004 + 12 = 0x20004010  ✓
+
+                uint32_t rdp_code[] = {
+                    0x49032000,  // movs r0, #0; ldr r1, [pc, #12]
+                    0x078969C9,  // ldr r1, [r1, #28]; lsls r1, r1, #30
+                    0x2001D500,  // bpl .+2; movs r0, #1
+                    0xE7F7BE00,  // bkpt #0; b .-14
+                    0x40022000,  // literal: FLASH register base
+                };
+                swd_write_mem(0x20004000, rdp_code, 5);
+
+                // Verify
+                uint32_t readback[5];
+                swd_read_mem(0x20004000, readback, 5);
+                bool code_ok = true;
+                for (int i = 0; i < 5; i++) {
+                    if (readback[i] != rdp_code[i]) code_ok = false;
+                }
+                uart_cli_printf("    Code written: %s\r\n", code_ok ? "OK" : "FAIL");
+                if (!code_ok) {
+                    for (int i = 0; i < 5; i++)
+                        uart_cli_printf("    [%d] w:0x%08X r:0x%08X\r\n",
+                                       i, rdp_code[i], readback[i]);
+                }
+
+                // Set SP and PC
+                swd_write_core_reg(13, 0x20005000);
+                swd_write_core_reg(15, 0x20004001);  // Thumb
+                uint32_t xpsr;
+                swd_read_core_reg(16, &xpsr);
+                xpsr |= (1u << 24);
+                swd_write_core_reg(16, xpsr);
+
+                // Zero cycle counter right before resume
+                swd_write_mem(0xE0001004, &zero, 1);
+
+                // Resume — BKPT instruction will halt the core
+                uart_cli_send("    Resuming...\r\n");
+                swd_resume();
+                sleep_ms(50);
+
+                // Check halt
+                swd_read_mem(0xE000EDF0, &dhcsr, 1);
+                bool halted = (dhcsr & (1u << 17)) != 0;
+
+                if (!halted) {
+                    swd_halt();
+                    swd_read_mem(0xE000EDF0, &dhcsr, 1);
+                }
+
+                // Read results
+                swd_read_core_reg(15, &pc_check);
+                uint32_t r0_val, r1_val;
+                swd_read_core_reg(0, &r0_val);
+                swd_read_core_reg(1, &r1_val);
+                uint32_t cyccnt;
+                swd_read_mem(0xE0001004, &cyccnt, 1);
+
+                uart_cli_printf("    DHCSR=0x%08X PC=0x%08X\r\n", dhcsr, pc_check);
+                uart_cli_printf("    R0=%u (RDP: 0=off, 1=on) R1=0x%08X\r\n", r0_val, r1_val);
+                uart_cli_printf("    DWT_CYCCNT=%lu cycles (%.2fms @ 8MHz)\r\n",
+                               cyccnt, (float)cyccnt / 8000.0f);
+
+                if (halted && pc_check == 0x2000400C) {
+                    uart_cli_send("*** PASS: Boot ROM RDP equivalent halted at BKPT ***\r\n");
+                } else {
+                    uart_cli_printf("    Expected PC=0x2000400C, got 0x%08X\r\n", pc_check);
+                }
+            }
+
+            uart_cli_send("\r\n=== BPTEST complete ===\r\n");
+
         } else {
             api_error("ERROR: Unknown SWD command\r\n");
         }
@@ -2703,6 +3043,46 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else {
             uart_cli_send("No error recorded\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "TRACE") == 0) {
+        extern void trace_start(uint32_t samples, uint32_t pre_pct);
+        extern void trace_stop(void);
+        extern void trace_status(void);
+        extern void trace_dump(void);
+
+        if (parts->count < 2) {
+            trace_status();
+        } else if (strcmp(parts->parts[1], "RESET") == 0) {
+            trace_stop();
+        } else if (strcmp(parts->parts[1], "STATUS") == 0) {
+            trace_status();
+        } else if (strcmp(parts->parts[1], "DUMP") == 0) {
+            trace_dump();
+        } else if (strcmp(parts->parts[1], "RATE") == 0) {
+            extern void trace_set_clkdiv(uint32_t div);
+            if (parts->count >= 3) {
+                uint32_t div = 0;
+                parse_u32(parts->parts[2], 0, &div);
+                trace_set_clkdiv(div);
+                uart_cli_printf("OK: ADC clkdiv=%lu (~%.0f us/sample)\r\n", div, (div + 1) * 2.0f / 1000.0f * 1000.0f);
+            } else {
+                uart_cli_send("Usage: TRACE RATE <clkdiv> (0=2us, 50=100us, 500=1ms)\r\n");
+            }
+        } else if (strcmp(parts->parts[1], "ARM") == 0) {
+            if (glitch_arm_trace()) {
+                // armed
+            } else {
+                uart_cli_send("ERROR: Failed to arm trace\r\n");
+            }
+        } else {
+            // TRACE [START] [samples] [pre%]
+            uint32_t samp = 0, pre = 0;
+            int i = 1;
+            if (strcmp(parts->parts[i], "START") == 0) i++;
+            if (i < parts->count) parse_u32(parts->parts[i++], 0, &samp);
+            if (i < parts->count) parse_u32(parts->parts[i++], 0, &pre);
+            trace_start(samp, pre);
         }
 
     } else {

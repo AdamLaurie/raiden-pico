@@ -52,9 +52,6 @@ uint32_t glitch_get_count(void);
 // Update flag outputs (call periodically from main loop)
 void glitch_update_flags(void);
 
-// Debug: dump PIO state
-void glitch_debug_pio(void);
-
 // Clock generator control
 void clock_set_frequency(uint32_t freq_hz);
 void clock_enable(void);

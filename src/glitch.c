@@ -51,6 +51,9 @@ static uint offset_irq_trigger;
 
 // Track which trigger programs are loaded (avoid removing unloaded programs)
 static bool trigger_programs_loaded = false;
+static bool edge_rising_loaded = false;
+static bool edge_falling_loaded = false;
+static bool uart_decoder_loaded = false;
 // Track if core programs (pulse_gen, irq_trigger) were removed by ARM TRACE
 static bool core_programs_removed = false;
 // Track if irq_trigger was removed to make room for UART decoder
@@ -68,6 +71,7 @@ void glitch_init(void) {
     config.trigger_pin = 3;  // Default trigger pin
     config.trigger_edge = EDGE_RISING;
     config.trigger_byte = 0x00;
+    config.trigger_uart_pin = 5;  // Default: GP5 (target RX = STM32 TX)
     // Glitch output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
 
     // Initialize flags
@@ -85,7 +89,7 @@ void glitch_init(void) {
     gpio_set_dir(PIN_ARMED, GPIO_OUT);
     gpio_put(PIN_ARMED, 0);  // Start disarmed
 
-    // GP12 (GLITCH_FIRED): PIO0 sets HIGH when glitch fires, CPU clears LOW on next ARM
+    // GLITCH_FIRED (GP22): PIO0 sets HIGH when glitch fires, CPU clears LOW on next ARM
     gpio_init(PIN_GLITCH_FIRED);
     gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
     gpio_put(PIN_GLITCH_FIRED, 0);  // Start LOW
@@ -168,12 +172,20 @@ bool glitch_arm(void) {
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
 
-    // Remove trigger programs only if previously loaded
-    if (trigger_programs_loaded) {
+    // Remove only the trigger programs that were actually loaded
+    if (edge_rising_loaded) {
         pio_remove_program(glitch_pio, &gpio_edge_detect_rising_program, offset_edge_detect_rising);
-        pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
-        pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+        edge_rising_loaded = false;
     }
+    if (edge_falling_loaded) {
+        pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
+        edge_falling_loaded = false;
+    }
+    if (uart_decoder_loaded) {
+        pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+        uart_decoder_loaded = false;
+    }
+    trigger_programs_loaded = false;
 
     // Reload core programs if ARM TRACE removed them
     if (core_programs_removed) {
@@ -225,10 +237,11 @@ bool glitch_arm(void) {
                                 gpio_edge_detect_rising_program_get_default_config(program_offset) :
                                 gpio_edge_detect_falling_program_get_default_config(program_offset);
         sm_config_set_in_pins(&c_edge, config.trigger_pin);   // IN pins for 'wait' instruction
-        sm_config_set_set_pins(&c_edge, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+        sm_config_set_set_pins(&c_edge, PIN_GLITCH_FIRED, 1);  // SET pins for GLITCH_FIRED
 
         // Initialize GP12 as output for PIO0 (will set HIGH when trigger fires)
         pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_consecutive_pindirs(glitch_pio, sm_edge_detect, PIN_GLITCH_FIRED, 1, true);
 
         // Clear and initialize edge detect SM
@@ -240,8 +253,10 @@ bool glitch_arm(void) {
         // Save offset for disarm cleanup
         if (config.trigger_edge == EDGE_RISING) {
             offset_edge_detect_rising = program_offset;
+            edge_rising_loaded = true;
         } else {
             offset_edge_detect_falling = program_offset;
+            edge_falling_loaded = true;
         }
     }
 
@@ -309,53 +324,36 @@ bool glitch_arm(void) {
 
         // Load UART decoder program dynamically
         offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);
+        uart_decoder_loaded = true;
 
         // Configure UART RX decoder state machine
         pio_sm_config c_uart = uart_rx_decoder_program_get_default_config(offset_uart_match);
 
-        // RP2350 GPIO Isolation Bit Handling:
-        // GP5 is configured for UART function by target_uart.c. The RP2350 has a GPIO
-        // isolation latch (ISO bit) that prevents changes to output control signals
-        // from reaching the pad. This bit must be explicitly cleared for the PIO to
-        // read GP5 while the hardware UART is also using it.
-        //
-        // According to RP2350 datasheet: "Input from the pin is visible to all
-        // peripherals regardless of the function select setting" - but only if the
-        // ISO bit is cleared. The SDK gpio_set_function() clears ISO for the selected
-        // function, but doesn't clear it globally for all peripherals reading the pin.
-        hw_clear_bits(&padsbank0_hw->io[5], PADS_BANK0_GPIO0_ISO_BITS);
+        uint8_t uart_pin = config.trigger_uart_pin;
 
-        // Configure GP5 as input for PIO monitoring (same pin as hardware UART RX)
-        sm_config_set_in_pins(&c_uart, 5);  // IN pins base = GP5 (for 'in pins, 1')
-        sm_config_set_jmp_pin(&c_uart, 5);  // JMP pin = GP5 (for 'wait pin 0')
-        sm_config_set_in_shift(&c_uart, true, false, 32);  // Shift RIGHT, NO autopush
-        // Note: Using ISR directly for comparison, no autopush needed
-        sm_config_set_set_pins(&c_uart, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+        // Clear ISO bit so PIO can read the pin while UART hardware also uses it
+        hw_clear_bits(&padsbank0_hw->io[uart_pin], PADS_BANK0_GPIO0_ISO_BITS);
 
-        // Initialize GP12 as output for PIO0 (will set HIGH when trigger fires)
+        sm_config_set_in_pins(&c_uart, uart_pin);
+        sm_config_set_jmp_pin(&c_uart, uart_pin);
+        sm_config_set_in_shift(&c_uart, true, false, 32);
+        sm_config_set_set_pins(&c_uart, PIN_GLITCH_FIRED, 1);
+
         pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_consecutive_pindirs(glitch_pio, sm_uart_trigger, PIN_GLITCH_FIRED, 1, true);
 
-        // Clock at 8× baud rate for proper UART sampling
-        // System clock: 150 MHz, Target: 8 × 115200 = 921600 Hz
-        float clkdiv = 150000000.0f / (8.0f * 115200.0f);  // = 162.76
+        float clkdiv = 150000000.0f / (8.0f * 115200.0f);
         sm_config_set_clkdiv(&c_uart, clkdiv);
 
-        // Clear and initialize state machine
         pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
         pio_sm_restart(glitch_pio, sm_uart_trigger);
         pio_sm_init(glitch_pio, sm_uart_trigger, offset_uart_match, &c_uart);
 
-        // Load trigger byte into FIFO
-        // With right shift autopush at 8 bits, byte ends in [24:31]
-        // So send trigger byte in same position for comparison
-        uint32_t trigger_word = ((uint32_t)config.trigger_byte) << 24;  // Byte in bits [24:31]
+        uint32_t trigger_word = ((uint32_t)config.trigger_byte) << 24;
         pio_sm_put_blocking(glitch_pio, sm_uart_trigger, trigger_word);
 
-        // Clear IRQ flag before enabling to avoid false trigger
         pio_interrupt_clear(glitch_pio, GLITCH_IRQ_NUM);
-
-        // Enable the UART decoder - pulse generator is now ready to receive IRQ
         pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
     }
 
@@ -383,7 +381,7 @@ bool glitch_arm(void) {
 }
 
 // ARM TRACE: trigger detection only, no pulse generator.
-// GP12 (GLITCH_FIRED) goes HIGH on trigger — trace uses GPIO ISR on GP12.
+// GLITCH_FIRED goes HIGH on trigger — trace uses GPIO ISR.
 bool glitch_arm_trace(void) {
     if (flags.armed) {
         return false;
@@ -400,12 +398,20 @@ bool glitch_arm_trace(void) {
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
 
-    // Remove trigger programs only if previously loaded
-    if (trigger_programs_loaded) {
+    // Remove only the trigger programs that were actually loaded
+    if (edge_rising_loaded) {
         pio_remove_program(glitch_pio, &gpio_edge_detect_rising_program, offset_edge_detect_rising);
-        pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
-        pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+        edge_rising_loaded = false;
     }
+    if (edge_falling_loaded) {
+        pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
+        edge_falling_loaded = false;
+    }
+    if (uart_decoder_loaded) {
+        pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+        uart_decoder_loaded = false;
+    }
+    trigger_programs_loaded = false;
 
     // ARM TRACE doesn't need pulse generator or irq_trigger — remove to free PIO space
     if (!core_programs_removed) {
@@ -427,10 +433,13 @@ bool glitch_arm_trace(void) {
             return false;
         }
         uint program_offset = pio_add_program(glitch_pio, program);
-        if (config.trigger_edge == EDGE_RISING)
+        if (config.trigger_edge == EDGE_RISING) {
             offset_edge_detect_rising = program_offset;
-        else
+            edge_rising_loaded = true;
+        } else {
             offset_edge_detect_falling = program_offset;
+            edge_falling_loaded = true;
+        }
 
         pio_sm_config c_edge = (config.trigger_edge == EDGE_RISING) ?
                                 gpio_edge_detect_rising_program_get_default_config(program_offset) :
@@ -439,6 +448,7 @@ bool glitch_arm_trace(void) {
         sm_config_set_set_pins(&c_edge, PIN_GLITCH_FIRED, 1);
 
         pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_consecutive_pindirs(glitch_pio, sm_edge_detect, PIN_GLITCH_FIRED, 1, true);
 
         pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
@@ -452,13 +462,16 @@ bool glitch_arm_trace(void) {
             return false;
         }
         offset_uart_match = pio_add_program(glitch_pio, &uart_rx_decoder_program);
+        uart_decoder_loaded = true;
         pio_sm_config c_uart = uart_rx_decoder_program_get_default_config(offset_uart_match);
-        hw_clear_bits(&padsbank0_hw->io[5], PADS_BANK0_GPIO0_ISO_BITS);
-        sm_config_set_in_pins(&c_uart, 5);
-        sm_config_set_jmp_pin(&c_uart, 5);
+        uint8_t uart_pin = config.trigger_uart_pin;
+        hw_clear_bits(&padsbank0_hw->io[uart_pin], PADS_BANK0_GPIO0_ISO_BITS);
+        sm_config_set_in_pins(&c_uart, uart_pin);
+        sm_config_set_jmp_pin(&c_uart, uart_pin);
         sm_config_set_in_shift(&c_uart, true, false, 32);
         sm_config_set_set_pins(&c_uart, PIN_GLITCH_FIRED, 1);
         pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+        hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_consecutive_pindirs(glitch_pio, sm_uart_trigger, PIN_GLITCH_FIRED, 1, true);
         float clkdiv = 150000000.0f / (8.0f * 115200.0f);
         sm_config_set_clkdiv(&c_uart, clkdiv);
@@ -495,8 +508,8 @@ void glitch_suspend_trigger(void) {
 void glitch_resume_trigger(void) {
     if (!flags.armed) return;
     if (config.trigger == TRIGGER_UART) {
-        // Re-clear ISO bit on GP5 — target_uart_init may have re-set it
-        hw_clear_bits(&padsbank0_hw->io[5], PADS_BANK0_GPIO0_ISO_BITS);
+        // Re-clear ISO bit — target_uart_init may have re-set it
+        hw_clear_bits(&padsbank0_hw->io[config.trigger_uart_pin], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
     } else if (config.trigger == TRIGGER_GPIO) {
         pio_sm_set_enabled(glitch_pio, sm_edge_detect, true);
@@ -557,10 +570,11 @@ bool glitch_execute(void) {
     // Use sm_flag_output (SM2) to trigger
     // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
     pio_sm_config c_irq = irq_trigger_program_get_default_config(offset_irq_trigger);
-    sm_config_set_set_pins(&c_irq, PIN_GLITCH_FIRED, 1);  // SET pins for GP12 (GLITCH_FIRED)
+    sm_config_set_set_pins(&c_irq, PIN_GLITCH_FIRED, 1);  // SET pins for GLITCH_FIRED
 
-    // Initialize GP12 as output for PIO0 (will set HIGH when GLITCH command fires)
+    // Initialize GLITCH_FIRED as output for PIO0 (will set HIGH when GLITCH command fires)
     pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
+    hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
     pio_sm_set_consecutive_pindirs(glitch_pio, sm_flag_output, PIN_GLITCH_FIRED, 1, true);
 
     pio_sm_init(glitch_pio, sm_flag_output, offset_irq_trigger, &c_irq);
@@ -607,8 +621,10 @@ uint32_t glitch_get_count(void) {
     // Check if PIO-triggered glitch has fired (for UART/GPIO triggers)
     // When pulse generator fires, it consumes all FIFO data
     // If FIFO is empty and we were armed, a glitch fired
-    if (flags.armed && (config.trigger == TRIGGER_UART || config.trigger == TRIGGER_GPIO)) {
+    if (flags.armed && !core_programs_removed &&
+        (config.trigger == TRIGGER_UART || config.trigger == TRIGGER_GPIO)) {
         // Check if pulse generator FIFO is empty (means it fired)
+        // Skip when core_programs_removed (ARM TRACE mode — no pulse generator loaded)
         if (pio_sm_is_tx_fifo_empty(glitch_pio, sm_pulse_gen)) {
             // Glitch fired! Increment count and disarm
             glitch_count++;
@@ -626,21 +642,6 @@ uint32_t glitch_get_count(void) {
     return glitch_count;
 }
 
-
-void glitch_debug_pio(void) {
-    printf("PIO0 CTRL=0x%08lX (SM enable bits)\n", glitch_pio->ctrl);
-    printf("PIO0 FSTAT=0x%08lX (FIFO status)\n", glitch_pio->fstat);
-    printf("PIO0 IRQ=0x%02X\n", glitch_pio->irq);
-    printf("SM1 pulse FIFO empty=%d  SM2 uart FIFO empty=%d\n",
-           pio_sm_is_tx_fifo_empty(glitch_pio, sm_pulse_gen),
-           pio_sm_is_tx_fifo_empty(glitch_pio, sm_uart_trigger));
-    printf("SM2 PC=%u (uart_match offset=%u)\n",
-           pio_sm_get_pc(glitch_pio, sm_uart_trigger), offset_uart_match);
-    printf("GP5 raw=%d  GP12=%d\n", gpio_get(5), gpio_get(PIN_GLITCH_FIRED));
-    uint32_t pad5 = padsbank0_hw->io[5];
-    printf("GP5 pad=0x%08lX (ISO=%lu, IE=%lu)\n", pad5,
-           (pad5 >> 8) & 1, (pad5 >> 6) & 1);
-}
 
 void glitch_update_flags(void) {
     // Update flag outputs if configured
@@ -702,8 +703,8 @@ void clock_enable(void) {
     // Configure boost-capable clock generator
     pio_sm_config c = clock_generator_with_boost_program_get_default_config(offset_clock_gen_boost);
     sm_config_set_set_pins(&c, clock_config.pin, 1);  // SET pins for clock output
-    sm_config_set_jmp_pin(&c, PIN_GLITCH_FIRED);      // JMP pin = GP12 (GLITCH_FIRED signal)
-    sm_config_set_in_pins(&c, PIN_GLITCH_FIRED);      // IN pins for WAIT instruction on GP12
+    sm_config_set_jmp_pin(&c, PIN_GLITCH_FIRED);      // JMP pin = GLITCH_FIRED signal
+    sm_config_set_in_pins(&c, PIN_GLITCH_FIRED);      // IN pins for WAIT on GLITCH_FIRED
     sm_config_set_clkdiv(&c, 1.0);  // Full speed
 
     // Clear ISO bit so PIO1 can read GP12 (set by PIO0, but readable by PIO1)

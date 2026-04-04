@@ -44,7 +44,8 @@ start:
 .wrap_target
 start:
     mov isr, null       ; Clear ISR before receiving new byte
-    wait 0 pin 0        ; Wait for start bit
+    wait 1 pin 0        ; Wait for line idle (HIGH) — skips parity bit in 8E1
+    wait 0 pin 0        ; Wait for start bit (LOW)
     set x, 7 [10]       ; Preload bit counter, delay to eye of first data bit
 bitloop:
     in pins, 1          ; Shift data bit into ISR (right shift)

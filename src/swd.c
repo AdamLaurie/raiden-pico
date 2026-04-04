@@ -312,15 +312,14 @@ bool swd_connect_under_reset(void) {
         return false;
     }
 
-    // Step 3: Init AHB-AP (power cycle debug domain)
-    if (!ahb_initialized) {
-        if (!swd_init_ahb_ap()) {
-            printf("[SWD] CUR: AHB-AP init failed\r\n");
-            swd_nrst_release();
-            return false;
-        }
-        ahb_initialized = true;
+    // Step 3: Always re-init AHB-AP after reset (AP state may be stale)
+    ahb_initialized = false;
+    if (!swd_init_ahb_ap()) {
+        printf("[SWD] CUR: AHB-AP init failed\r\n");
+        swd_nrst_release();
+        return false;
     }
+    ahb_initialized = true;
 
     // Step 4: Enable debug (C_DEBUGEN) and request halt (C_HALT)
     mem_write32(DHCSR, DBGKEY | 0x3);

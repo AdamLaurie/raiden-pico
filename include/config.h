@@ -20,7 +20,7 @@
 #define PIN_GLITCH_OUT_INV 11  // Glitch pulse output (inverted)
 #define PIN_CLOCK 6            // Clock generator output
 #define PIN_ARMED 16           // ARMED status (CPU-controlled, HIGH when armed)
-#define PIN_GLITCH_FIRED 12    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
+#define PIN_GLITCH_FIRED 22    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
 
 // Platform Types
 typedef enum {
@@ -105,6 +105,7 @@ typedef struct {
     uint8_t trigger_pin;
     edge_type_t trigger_edge;
     uint8_t trigger_byte;
+    uint8_t trigger_uart_pin;  // GPIO pin for UART trigger snooping (GP4=TX, GP5=RX)
     // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
 } glitch_config_t;
 

@@ -139,11 +139,14 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `TRIGGER GPIO RISING`
 - Use case: Trigger from external signal or target GPIO
 
-**`TRIGGER UART <byte>`** - Configure UART byte trigger
-- Trigger when specific byte is received from target UART
+**`TRIGGER UART <byte> [TX|RX]`** - Configure UART byte trigger
+- Trigger when specific byte is seen on target UART
 - Byte value in hex (0-FF)
-- Example: `TRIGGER UART 0D` (trigger on '\r')
-- Use case: Trigger at specific point in target's execution
+- `TX` = sniff Raiden TX (GP4, bytes sent to target)
+- `RX` = sniff Raiden RX (GP5, bytes received from target, default)
+- Example: `TRIGGER UART 0D` (trigger on '\r' from target)
+- Example: `TRIGGER UART EE TX` (trigger on 0xEE sent to target)
+- PIO-based decoder works with 8N1, 8E1, or any parity mode
 
 #### Platform Control
 
@@ -191,6 +194,73 @@ Raiden Pico supports multiple glitching platforms with different control require
 - Generates clock signal on GP6
 - Example: `CLOCK 12000000 ON` (12MHz clock)
 - Example: `CLOCK OFF` (disable clock)
+
+#### ADC Trace (Shunt Current Capture)
+
+Capture target power consumption via a shunt resistor on GP27/ADC1. Place a 1-10 ohm resistor in series with the target's VDD supply and connect GP27 across it (high side to ADC, low side to GND). A 10 ohm shunt gives good sensitivity for low-power targets like STM32F1 (~20-50mA); use 1 ohm for higher-current targets to stay within the ADC's 0-3.3V range. The ADC samples at ~500ksps (~2us/sample) into a circular DMA buffer, triggered by the same PIO trigger used for glitching. This allows profiling the target's current draw around security-critical operations like RDP checks.
+
+**`TRACE [samples] [pre%]`** - Start ADC trace
+- Default: 4096 samples, 50% pre-trigger
+- Example: `TRACE 8192 25` (8192 samples, 25% pre-trigger)
+
+**`TRACE STATUS`** - Check trace state (IDLE/RUNNING/COMPLETE)
+
+**`TRACE DUMP`** - Dump raw ADC samples (hex, repeatable)
+- Can be called multiple times without clearing buffer
+
+**`TRACE RESET`** - Discard trace buffer and reset to IDLE
+
+**`TRACE RATE <clkdiv>`** - Set ADC sample rate
+- `clkdiv=0` (default): ~2us/sample (~500ksps), best for short captures
+- `clkdiv=50`: ~100us/sample, for medium-range captures
+- `clkdiv=500`: ~1ms/sample, for long-range captures (~4 seconds with 4096 samples)
+- Example: `TRACE RATE 500` then `TRACE 4096 50` captures ~4s of data
+
+**`ARM TRACE`** / **`TRACE ARM`** - Arm trigger for trace-only capture
+- Like `ARM ON` but only captures ADC data, no glitch pulse generated
+- Trigger fires GP22 which stops DMA capture
+
+##### Workflow
+
+```bash
+# Configure trigger (e.g., UART byte match)
+TRIGGER UART 79 RX
+
+# Start trace buffer
+TRACE 4096 50
+
+# Arm for trace-only (no glitch output)
+ARM TRACE
+
+# Send command to target (triggers capture)
+TARGET SEND 11EE
+
+# Check and dump
+TRACE STATUS
+TRACE DUMP
+
+# Clean up
+ARM OFF
+TRACE RESET
+```
+
+##### Dual Trace: Finding the Glitch Window
+
+By running two traces with different trigger bytes, you can measure the exact time window between sending a command and receiving the response — the window during which the target executes security-critical code. Multiple runs with median averaging reject periodic noise (e.g., watchdog resets) while preserving the true power signature.
+
+![Dual Trace Example](examples/dual_trace_stm32f1.png)
+
+*Example: STM32F1 Read Memory command (15-run median). TX trace triggers on 0xEE (last command byte sent), RX trace triggers on 0x79 (ACK after rdp_check). The overlay shows the 98µs glitch window (14,700 Raiden cycles at 150MHz) between command and response — the interval where the RDP check executes. Top axis shows Raiden PIO cycles for direct use as the glitch PAUSE parameter.*
+
+See [`scripts/stm32_dual_trace.py`](scripts/stm32_dual_trace.py) for the full automation script (multi-run median with power cycling), and [`scripts/stm32_single_trace.py`](scripts/stm32_single_trace.py) for single-trigger capture.
+
+##### Periodic Artifact in Single-Run Traces
+
+Single-run traces contain large periodic current dips (~every 4-5 seconds) unrelated to target code execution — they appear identically whether the STM32 core is running or halted via SWD. The source is unknown (possibly IWDG watchdog resets or USB power regulation). These dips corrupt single-run measurements and make cross-correlation alignment unreliable, which is why the dual trace script uses median averaging across multiple power-cycled runs to reject them.
+
+![Periodic Artifact](examples/longrange_periodic_artifact.png)
+
+*Long-range ADC capture (~43 seconds) showing the periodic artifact. These dips are 200-300mV deep and occur regardless of target execution state.*
 
 #### Target Control
 
@@ -623,7 +693,9 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 13** - BOOT0 control
 - **GPIO 14** - BOOT1 control
 - **GPIO 15** - nRST (shared with Target Reset)
+- **GPIO 22** - Glitch fired / trace trigger signal (PIO output)
 - **GPIO 26** - ADC power monitor (voltage sense for glitch detection)
+- **GPIO 27** - ADC shunt current monitor (trace capture via ADC1)
 
 ### SWD/JTAG Debug Interface
 
