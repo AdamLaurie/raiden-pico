@@ -973,6 +973,7 @@ static void nrst_irq_arm(void) {
 }
 
 static void nrst_irq_disarm(void) {
+    gpio_set_irq_enabled(reset_pin, GPIO_IRQ_EDGE_FALL, false);
     gpio_irq_unregister(reset_pin, nrst_irq_handler);
 }
 

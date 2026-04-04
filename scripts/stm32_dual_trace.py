@@ -3,7 +3,7 @@
 STM32F1 dual trace: measure glitch window on real bootloader with median averaging.
 
 Talks to the real STM32F1 system bootloader (not an SRAM payload) and captures
-ADC shunt traces triggered on TX 0xEE (Read Memory command byte) and RX 0x79
+ADC shunt traces triggered on TX 0xEE (Read Memory command byte) and RX 0x{RX_BYTE}
 (ACK after rdp_check). Multiple runs with median averaging reject periodic
 noise (watchdog resets, etc.) while preserving the true power signature.
 
@@ -24,11 +24,13 @@ parser.add_argument('--runs', type=int, default=15, help='Runs per trigger type'
 parser.add_argument('--samples', type=int, default=4096, help='ADC samples per trace')
 parser.add_argument('--pre', type=int, default=50, help='Pre-trigger percentage')
 parser.add_argument('--output', default=None, help='Output PNG path (default: /tmp/...)')
+parser.add_argument('--rx-byte', default='79', help='RX trigger byte hex (79=ACK, 1F=NACK for RDP1)')
 args = parser.parse_args()
 
 RUNS = args.runs
 TRACE_SAMPLES = args.samples
 PRE_PCT = args.pre
+RX_BYTE = args.rx_byte.upper()
 
 ser = serial.Serial(args.port, 115200, timeout=2)
 time.sleep(1)
@@ -178,8 +180,8 @@ cmd('target stm32f1')
 print(f'=== Collecting {RUNS} TX 0xEE traces ===')
 tx_runs = collect_runs('trigger uart EE TX', 'TX', RUNS)
 
-print(f'\n=== Collecting {RUNS} RX 0x79 traces ===')
-rx_runs = collect_runs('trigger uart 79 RX', 'RX', RUNS)
+print(f'\n=== Collecting {RUNS} RX 0x{RX_BYTE} traces ===')
+rx_runs = collect_runs(f'trigger uart {RX_BYTE} RX', 'RX', RUNS)
 
 # Power off target when done
 cmd('target power off', t=0.3, verbose=False)
@@ -236,9 +238,9 @@ ax.grid(True, alpha=0.3)
 # Plot 2: RX median
 ax = axes[1]
 ax.plot(rx_t, rx_v, linewidth=0.5, color='#4CAF50', label=f'RX median ({len(rx_runs)} runs)')
-ax.axvline(x=0, color='green', linestyle='--', linewidth=1.5, label='RX 0x79')
+ax.axvline(x=0, color='green', linestyle='--', linewidth=1.5, label=f'RX 0x{RX_BYTE}')
 ax.set_ylabel('Shunt V')
-ax.set_title(f'RX 0x79 trigger \u2014 {len(rx_runs)} runs, median')
+ax.set_title(f'RX 0x{RX_BYTE} trigger \u2014 {len(rx_runs)} runs, median')
 ax.legend()
 ax.grid(True, alpha=0.3)
 
@@ -267,7 +269,7 @@ ax.plot(tx_t[tx_mask], tx_v[tx_mask], linewidth=0.8, color='#2196F3', alpha=0.7,
 ax.plot(rx_t_aligned[rx_mask], rx_v[rx_mask], linewidth=0.8, color='#4CAF50', alpha=0.7, label='RX median (shifted)')
 ax.axvline(x=0, color='red', linestyle='--', linewidth=1.5, alpha=0.8, label='TX 0xEE')
 ax.axvline(x=rx_trigger_us, color='green', linestyle='--', linewidth=1.5, alpha=0.8,
-           label=f'RX 0x79 (+{rx_trigger_us:.0f}us)')
+           label=f'RX 0x{RX_BYTE} (+{rx_trigger_us:.0f}us)')
 
 if rx_trigger_us > 0:
     ax.axvspan(0, rx_trigger_us, alpha=0.1, color='orange',
@@ -294,9 +296,9 @@ ax.annotate(f'PAUSE = {rx_trigger_cycles:.0f}\n({rx_trigger_us:.0f}us)',
             arrowprops=dict(arrowstyle='->', color='#2E7D32', lw=1.5))
 
 print(f'Cross-correlation lag: {lag_samples} samples = {lag_us:.0f}us')
-print(f'Glitch window: TX 0xEE \u2192 RX 0x79 = {rx_trigger_us:.0f}us = {rx_trigger_cycles:.0f} Raiden cycles')
+print(f'Glitch window: TX 0xEE \u2192 RX 0x{RX_BYTE} = {rx_trigger_us:.0f}us = {rx_trigger_cycles:.0f} Raiden cycles')
 
 plt.tight_layout()
 out = args.output or f'/tmp/real_bl_median_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png'
-plt.savefig(out, dpi=150)
+plt.savefig(out, dpi=600)
 print(f'\nPlot saved to {out}')
