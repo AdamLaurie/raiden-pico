@@ -290,8 +290,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 15, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 16, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -457,6 +457,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("SWD READ <addr> [n]    - Read memory (hex dump)\r\n");
         uart_cli_send("SWD REGS               - Read core registers\r\n");
         uart_cli_send("SWD RESET [HOLD|RELEASE] - Target reset via nRST\r\n");
+        uart_cli_send("SWD SPEED [us]         - Get/set clock delay (0=max, def 1)\r\n");
         uart_cli_send("SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== JTAG Debug Interface (TCK=17, TMS=18, TDI=19, TDO=20, RTCK=21, TRST=15) ==\r\n");
@@ -1820,6 +1821,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
             uart_cli_send("  SWD RESET [HOLD|RELEASE] - Target reset via nRST\r\n");
             uart_cli_send("  SWD RESUME               - Resume target core\r\n");
+            uart_cli_send("  SWD SPEED [us]               - Get/set clock delay (0=max, default 1)\r\n");
             uart_cli_send("  SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
             uart_cli_send("  SWD WRITE DP|AP <addr> <val> - Write debug/access port register\r\n");
             goto api_response;
@@ -1829,7 +1831,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         if (strcmp(parts->parts[1], "CONNECT") != 0 &&
             strcmp(parts->parts[1], "CONNECTRST") != 0 &&
             strcmp(parts->parts[1], "DISCONNECT") != 0 &&
-            strcmp(parts->parts[1], "BPTEST") != 0) {
+            strcmp(parts->parts[1], "BPTEST") != 0 &&
+            strcmp(parts->parts[1], "SPEED") != 0) {
             if (!swd_ensure_connected()) {
                 api_error("ERROR: SWD connection failed (check target power and wiring)\r\n");
                 goto api_response;
@@ -1857,6 +1860,26 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "DISCONNECT") == 0) {
             swd_deinit();
             uart_cli_send("OK: SWD disconnected (pins high-Z)\r\n");
+
+        } else if (strcmp(parts->parts[1], "SPEED") == 0) {
+            if (parts->count >= 3) {
+                uint32_t delay = strtoul(parts->parts[2], NULL, 0);
+                swd_set_speed(delay);
+                if (delay == 0) {
+                    uart_cli_send("OK: SWD speed set to 0 (MAX, no delay)\r\n");
+                } else {
+                    uart_cli_printf("OK: SWD speed set to %lu us (~%lu kHz)\r\n",
+                                    delay, 1000 / (2 * delay));
+                }
+            } else {
+                uint32_t delay = swd_get_speed();
+                if (delay == 0) {
+                    uart_cli_send("SWD clock delay: 0 (MAX, no delay)\r\n");
+                } else {
+                    uart_cli_printf("SWD clock delay: %lu us (~%lu kHz)\r\n",
+                                    delay, 1000 / (2 * delay));
+                }
+            }
 
         } else if (strcmp(parts->parts[1], "IDCODE") == 0) {
             // Auto-connect already ran; just read DPIDR

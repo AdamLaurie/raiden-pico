@@ -38,12 +38,6 @@ static void shared_gpio_irq_callback(uint gpio, uint32_t events) {
 }
 
 static void gpio_irq_register(uint gpio, uint32_t events, gpio_irq_fn_t fn) {
-    // Install shared callback once
-    if (!gpio_irq_callback_installed) {
-        gpio_set_irq_callback(shared_gpio_irq_callback);
-        irq_set_enabled(IO_IRQ_BANK0, true);
-        gpio_irq_callback_installed = true;
-    }
     // Check if already registered for this pin — update in place
     for (int i = 0; i < gpio_irq_handler_count; i++) {
         if (gpio_irq_handlers[i].gpio == gpio && gpio_irq_handlers[i].fn == fn) {
@@ -57,7 +51,11 @@ static void gpio_irq_register(uint gpio, uint32_t events, gpio_irq_fn_t fn) {
         gpio_irq_handlers[gpio_irq_handler_count].events_mask = events;
         gpio_irq_handlers[gpio_irq_handler_count].fn = fn;
         gpio_irq_handler_count++;
-        gpio_set_irq_enabled(gpio, events, true);
+        // Use _with_callback to properly install the shared callback + enable IRQ.
+        // On RP2350 gpio_set_irq_callback + irq_set_enabled alone can leave
+        // stale pending IRQs that block the ADC polling loop.
+        gpio_set_irq_enabled_with_callback(gpio, events, true, shared_gpio_irq_callback);
+        gpio_irq_callback_installed = true;
     }
 }
 
@@ -969,12 +967,13 @@ static void nrst_irq_handler(uint gpio, uint32_t events) {
 static void nrst_irq_arm(void) {
     nrst_irq_fired = false;
     nrst_irq_time = 0;
-    gpio_irq_register(reset_pin, GPIO_IRQ_EDGE_FALL, nrst_irq_handler);
+    // Use direct callback — shared dispatcher introduces timing issues
+    // that cause ADC polling loop to miss the power restore window
+    gpio_set_irq_enabled_with_callback(reset_pin, GPIO_IRQ_EDGE_FALL, true, nrst_irq_handler);
 }
 
 static void nrst_irq_disarm(void) {
     gpio_set_irq_enabled(reset_pin, GPIO_IRQ_EDGE_FALL, false);
-    gpio_irq_unregister(reset_pin, nrst_irq_handler);
 }
 
 // Result of a single power glitch
@@ -1203,7 +1202,7 @@ void target_power_sweep(void) {
     #define SWEEP_MAX 128
     #define ADC_LOG_SIZE 256
 
-    struct {
+    static struct {
         uint32_t thresh;
         uint16_t vmin_raw;
         int16_t good;           // -1 = read failed
@@ -1213,7 +1212,7 @@ void target_power_sweep(void) {
     } results[SWEEP_MAX];
     uint32_t result_count = 0;
 
-    uint16_t adc_log[ADC_LOG_SIZE];
+    static uint16_t adc_log[ADC_LOG_SIZE];
 
     /* Sweep from ~2.5V down; switch to fine steps after first BOR */
     uint32_t step = 100;  // ~0.08V coarse steps

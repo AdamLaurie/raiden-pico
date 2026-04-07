@@ -11,8 +11,9 @@
 #include "hardware/timer.h"
 #include <stdio.h>
 
-// Clock half-period in microseconds (5 = ~100kHz, 2 = ~250kHz)
-static uint32_t clk_delay_us = 2;
+// Clock half-period in microseconds (0 = max speed, 1 = ~500kHz, 2 = ~250kHz)
+// Default 1: max speed=0 is too fast for STM32F1 @ 8MHz HSI (AP reads fail)
+static uint32_t clk_delay_us = 1;
 
 static bool initialized = false;
 static bool connected = false;
@@ -42,7 +43,16 @@ static swdio_dir_t swdio_dir = SWDIO_FLOAT;
 // --- Low-level bit operations ---
 
 static inline void clk_delay(void) {
-    sleep_us(clk_delay_us);
+    if (clk_delay_us)
+        sleep_us(clk_delay_us);
+}
+
+void swd_set_speed(uint32_t delay_us) {
+    clk_delay_us = delay_us;
+}
+
+uint32_t swd_get_speed(void) {
+    return clk_delay_us;
 }
 
 static inline void swclk_set(void) {
@@ -544,7 +554,6 @@ static uint32_t ap_csw_base = 0;
 #define CSW_HNOSEC        (1U << 30)
 
 // Initialize AHB-AP for memory access.
-// Matches BMP's adiv5_dp_init (power cycle) + adiv5_new_ap (CSW setup).
 static bool swd_init_ahb_ap(void) {
     uint32_t stat;
 

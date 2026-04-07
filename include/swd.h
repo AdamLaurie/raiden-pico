@@ -33,6 +33,10 @@
 #define AP_DRW          0x0C    // Data Read/Write
 #define AP_IDR          0xFC    // Identification Register
 
+// Set/get SWD clock half-period delay in microseconds (0 = max speed)
+void swd_set_speed(uint32_t delay_us);
+uint32_t swd_get_speed(void);
+
 // Initialize SWD interface
 void swd_init(void);
 
