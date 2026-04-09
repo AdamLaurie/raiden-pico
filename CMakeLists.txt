@@ -23,7 +23,6 @@ add_executable(raiden_pico
     src/chipshot_uart.c
     src/target_uart.c
     src/grbl.c
-    src/stm32_pwner.c
     src/swd.c
     src/jtag.c
     src/stm32_target.c

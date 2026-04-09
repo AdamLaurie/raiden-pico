@@ -3,7 +3,6 @@
 #include "glitch.h"
 #include "target_uart.h"
 #include "grbl.h"
-#include "stm32_pwner.h"
 #include "swd.h"
 #include "jtag.h"
 #include "pico/stdlib.h"
@@ -248,21 +247,16 @@ void command_parser_execute(cmd_parts_t *parts) {
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
-        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "STM32", "SWD", "JTAG",
-        "TRACE"
+        "HELP", "REBOOT", "DEBUG", "API", "ERROR", "SWD", "JTAG",
+        "TRACE", "VERSION", "CLOCK", "GRBL"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 20, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 22, "command")) {
         goto api_response;
     }
 
     // Match sub-commands if present
     if (parts->count >= 2) {
-        if (strcmp(parts->parts[0], "PLATFORM") == 0) {
-            const char *platform_subcmds[] = {"SET", "VOLTAGE", "CHARGE", "HVPIN", "VPIN"};
-            if (!match_and_replace(&parts->parts[1], platform_subcmds, 5, "PLATFORM sub-command")) {
-                goto api_response;
-            }
-        } else if (strcmp(parts->parts[0], "CS") == 0) {
+        if (strcmp(parts->parts[0], "CS") == 0) {
             const char *chipshot_subcmds[] = {"ARM", "DISARM", "FIRE", "STATUS", "VOLTAGE", "PULSE", "RESET", "TRIGGER", "HVOUT", "FAULTS"};
             if (!match_and_replace(&parts->parts[1], chipshot_subcmds, 10, "CS sub-command")) {
                 goto api_response;
@@ -273,21 +267,6 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (!match_and_replace(&parts->parts[1], target_subcmds, 13, "TARGET sub-command")) {
                 goto api_response;
             }
-        } else if (strcmp(parts->parts[0], "SWEEP") == 0) {
-            const char *sweep_subcmds[] = {"START", "STOP", "STATUS", "RANGE"};
-            if (!match_and_replace(&parts->parts[1], sweep_subcmds, 4, "SWEEP sub-command")) {
-                goto api_response;
-            }
-        } else if (strcmp(parts->parts[0], "RESPONSE") == 0) {
-            const char *response_subcmds[] = {"GET", "CLEAR", "COUNT"};
-            if (!match_and_replace(&parts->parts[1], response_subcmds, 3, "RESPONSE sub-command")) {
-                goto api_response;
-            }
-        } else if (strcmp(parts->parts[0], "STM32") == 0) {
-            const char *stm32_subcmds[] = {"INIT", "ATTACK", "BOOT0", "STATUS", "ABORT"};
-            if (!match_and_replace(&parts->parts[1], stm32_subcmds, 5, "STM32 sub-command")) {
-                goto api_response;
-            }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
                                           "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED"};
@@ -295,13 +274,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
-            const char *jtag_subcmds[] = {"INIT", "DEINIT", "RESET", "IDCODE", "SCAN", "IR", "DR"};
-            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 7, "JTAG sub-command")) {
+            const char *jtag_subcmds[] = {"RESET", "TEST", "IDCODE", "SCAN", "IR", "DR"};
+            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 6, "JTAG sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TRACE") == 0 && parts->count >= 2) {
-            const char *trace_subcmds[] = {"START", "RESET", "STATUS", "DUMP", "ARM"};
-            match_and_replace(&parts->parts[1], trace_subcmds, 5, NULL);
+            const char *trace_subcmds[] = {"START", "RESET", "STATUS", "DUMP", "ARM", "RATE"};
+            match_and_replace(&parts->parts[1], trace_subcmds, 6, NULL);
         }
     }
 
@@ -349,12 +328,13 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
         uart_cli_send("CS DISARM                 - Disarm ChipSHOUTER\r\n");
         uart_cli_send("CS FIRE                   - Trigger ChipSHOUTER\r\n");
-        uart_cli_send("CS PULSE [<us>]           - Set/get ChipSHOUTER pulse width\r\n");
+        uart_cli_send("CS PULSE [<ns>]           - Set/get ChipSHOUTER pulse width\r\n");
         uart_cli_send("CS RESET                  - Reset ChipSHOUTER and verify errors cleared\r\n");
         uart_cli_send("CS STATUS                 - Get ChipSHOUTER status\r\n");
         uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
         uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
         uart_cli_send("CS VOLTAGE [<V>]          - Set/get ChipSHOUTER voltage\r\n");
+        uart_cli_send("CS HVOUT                  - Query HV output status\r\n");
         uart_cli_send("CS FAULTS                 - Get ChipSHOUTER fault status\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
@@ -372,6 +352,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT] - Get current glitch parameter(s)\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
         uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns @ 150MHz)\r\n");
+        uart_cli_send("SET BP <slot> <name|0xADDR> [HARD|SOFT] - Set FPB breakpoint\r\n");
+        uart_cli_send("SET BP LIST / CLEAR [slot|ALL]          - List/clear breakpoints\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_send("ARM [ON|OFF|TRACE]     - Arm/disarm/show (TRACE = trigger only, no glitch)\r\n");
@@ -381,13 +363,6 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
         uart_cli_send("RESET                  - Reset system\r\n");
         uart_cli_send("STATUS                 - Show current status\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== Platform Control ==\r\n");
-        uart_cli_send("PLATFORM CHARGE <ms>   - Set charge time\r\n");
-        uart_cli_send("PLATFORM HVPIN <pin>   - Set HV enable pin\r\n");
-        uart_cli_send("PLATFORM SET <MANUAL|CHIPSHOUTER|EMFI|CROWBAR>\r\n");
-        uart_cli_send("PLATFORM VOLTAGE <mv>  - Set platform voltage\r\n");
-        uart_cli_send("PLATFORM VPIN <pin>    - Set voltage control pin\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
@@ -411,7 +386,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
         uart_cli_send("                   Examples: 3F, 68656C6C6F, \"hello\"\r\n");
         uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
-        uart_cli_send("                   (defaults: 115200, 12000, 10ms, 5 retries)\r\n");
+        uart_cli_send("                   (defaults: 115200, 12000, 500ms, 5 retries)\r\n");
         uart_cli_send("TARGET TIMEOUT [<ms>]  - Get/set transparent bridge timeout (default: 50ms)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Trigger Configuration ==\r\n");
@@ -421,7 +396,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TRIGGER UART <byte> [TX|RX] - UART byte trigger (TX=Raiden TX, RX=Raiden RX)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ADC Trace (GP27/ADC1 shunt current) ==\r\n");
+        uart_cli_send("TRACE                  - Show trace status\r\n");
         uart_cli_send("TRACE [samples] [pre%] - Start ADC trace (~2us/sample, default 4096/50%)\r\n");
+        uart_cli_send("TRACE ARM              - Arm trace (trigger only, no glitch)\r\n");
         uart_cli_send("TRACE STATUS           - Check trace state (IDLE/RUNNING/COMPLETE)\r\n");
         uart_cli_send("TRACE DUMP             - Dump raw ADC samples (hex)\r\n");
         uart_cli_send("TRACE RATE <clkdiv>    - Set ADC rate (0=2us, 50=100us, 500=1ms/sample)\r\n");
@@ -438,14 +415,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GRBL MOVE <X> <Y> [F]  - Move to absolute position (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL STEP <DX> <DY> [F]- Move relative distance (mm, feedrate mm/min)\r\n");
         uart_cli_send("GRBL POS               - Get current XYZ position\r\n");
-        uart_cli_send("\r\n");
-        uart_cli_send("== STM32F1 RDP Bypass ==\r\n");
-        uart_cli_send("STM32 INIT             - Initialize STM32 pwner module\r\n");
-        uart_cli_send("STM32 ATTACK           - Execute RDP bypass power glitch attack\r\n");
-        uart_cli_send("                         (requires exploit firmware in target SRAM)\r\n");
-        uart_cli_send("STM32 BOOT0 [pin]      - Get/set BOOT0 control pin (default GP3)\r\n");
-        uart_cli_send("STM32 STATUS           - Show attack state and bytes received\r\n");
-        uart_cli_send("STM32 ABORT            - Abort current attack operation\r\n");
+        uart_cli_send("GRBL RESET             - Soft reset Grbl controller\r\n");
+        uart_cli_send("GRBL TEST              - Test UART loopback\r\n");
+        uart_cli_send("GRBL DEBUG             - Debug RX FIFO status\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== SWD Debug Interface (GP17=SWCLK, GP18=SWDIO) ==\r\n");
         uart_cli_send("SWD                    - Show full SWD command list\r\n");
@@ -456,7 +428,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("SWD OPT / RDP          - Read option bytes / RDP level\r\n");
         uart_cli_send("SWD READ <addr> [n]    - Read memory (hex dump)\r\n");
         uart_cli_send("SWD REGS               - Read core registers\r\n");
-        uart_cli_send("SWD RESET [HOLD|RELEASE] - Target reset via nRST\r\n");
+        uart_cli_send("SWD RESET [ms|HOLD|RELEASE] - Target reset via nRST (default 100ms)\r\n");
+        uart_cli_send("SWD SETREG <reg> <val> - Write core register\r\n");
         uart_cli_send("SWD SPEED [us]         - Get/set clock delay (0=max, def 1)\r\n");
         uart_cli_send("SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
         uart_cli_send("\r\n");
@@ -688,6 +661,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[1], "COUNT") == 0) {
                 glitch_set_count(value);
                 uart_cli_printf("OK: COUNT set to %u\r\n", value);
+            } else {
+                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT)\r\n", parts->parts[1]);
             }
         }
 
@@ -712,6 +687,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
             } else if (strcmp(parts->parts[1], "COUNT") == 0) {
                 uart_cli_printf("%u\r\n", cfg->count);
+            } else {
+                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT)\r\n", parts->parts[1]);
             }
         }
 
@@ -806,6 +783,10 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (set_freq && set_enable && enable) {
                 uart_cli_printf("Clock running at %u Hz\r\n", clock_get_frequency());
             }
+
+            if (!set_freq && !set_enable) {
+                api_error("ERROR: Usage: CLOCK <freq> [ON|OFF] or CLOCK ON|OFF\r\n");
+            }
         }
 
     } else if (strcmp(parts->parts[0], "GLITCH") == 0) {
@@ -877,9 +858,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
-        uart_cli_send("== STM32 Attack ==\r\n");
-        uart_cli_printf("GP%u - BOOT0 Control\r\n", STM32_BOOT0_PIN);
-        uart_cli_printf("GP%u - BOOT1 Control\r\n", STM32_BOOT1_PIN);
+        uart_cli_send("GP13 - BOOT0 Control\r\n");
+        uart_cli_send("GP14 - BOOT1 Control\r\n");
         uart_cli_send("GP26 - ADC Power Monitor (voltage sense for glitch detection)\r\n");
         uart_cli_send("GP27 - ADC Shunt Current Monitor (timing measurement)\r\n");
         uart_cli_send("\r\n");
@@ -966,6 +946,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             glitch_set_trigger_type(TRIGGER_UART);
             glitch_get_config()->trigger_uart_pin = uart_pin;
             uart_cli_printf("OK: UART trigger on %s byte 0x%02X (%u)\r\n", pin_name, byte, byte);
+        } else {
+            api_error_printf("ERROR: Unknown trigger type '%s' (use NONE/GPIO/UART)\r\n", parts->parts[1]);
         }
 
     } else if (strcmp(parts->parts[0], "TARGET") == 0) {
@@ -1030,11 +1012,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
             }
 
-            // For STM32, set BOOT0 HIGH before reset
+            // For STM32, set BOOT0 HIGH before reset (bootloader mode)
             bool is_stm32 = target_is_stm32(target_get_type());
             if (is_stm32) {
-                extern void stm32_pwner_set_boot0(bool high);
-                stm32_pwner_set_boot0(true);
+                gpio_init(13);  // GP13 = BOOT0
+                gpio_set_dir(13, GPIO_OUT);
+                gpio_put(13, 1);
+                uart_cli_send("OK: BOOT0 = HIGH\r\n");
             }
 
             // Try up to specified times to sync with target
@@ -1138,8 +1122,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             // Always configure the pin (with defaults or specified values)
             target_reset_config(pin, period, active_high);
 
-            // If no parameters given, also execute the reset
-            if (!has_params) {
+            if (has_params) {
+                uart_cli_printf("OK: Reset configured: GP%u, %u ms, active %s\r\n",
+                                pin, period, active_high ? "HIGH" : "LOW");
+            } else {
+                // No parameters given — also execute the reset
                 target_reset_execute();
             }
         } else if (strcmp(parts->parts[1], "TIMEOUT") == 0) {
@@ -1310,6 +1297,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                     }
                 }
             }
+        } else {
+            api_error_printf("ERROR: Unknown TARGET command '%s'\r\n", parts->parts[1]);
         }
 
     } else if (strcmp(parts->parts[0], "CS") == 0) {
@@ -1566,6 +1555,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else {
                 uart_cli_send("No response from ChipSHOUTER\r\n");
             }
+        } else {
+            api_error_printf("ERROR: Unknown CS command '%s'\r\n", parts->parts[1]);
         }
 
     } else if (strcmp(parts->parts[0], "API") == 0) {
@@ -1736,78 +1727,13 @@ void command_parser_execute(cmd_parts_t *parts) {
             api_error("ERROR: Unknown GRBL command\r\n");
         }
 
-    } else if (strcmp(parts->parts[0], "STM32") == 0) {
-        // STM32F1 RDP Bypass attack commands
-        if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: STM32 <INIT|ATTACK|BOOT0|STATUS|ABORT>\r\n");
-            goto api_response;
-        }
-
-        if (strcmp(parts->parts[1], "INIT") == 0) {
-            stm32_pwner_init();
-        } else if (strcmp(parts->parts[1], "ATTACK") == 0) {
-            uart_cli_send("Starting STM32 RDP bypass attack...\r\n");
-            stm32_result_t result = stm32_pwner_attack();
-            if (result == STM32_OK) {
-                uart_cli_send("Attack initiated - now dumping flash\r\n");
-                uart_cli_send("Use STM32 STATUS to check progress\r\n");
-            } else {
-                uart_cli_printf("Attack failed: %s\r\n", stm32_result_str(result));
-            }
-        } else if (strcmp(parts->parts[1], "BOOT0") == 0) {
-            if (parts->count < 3) {
-                uart_cli_printf("BOOT0 pin: GP%u\r\n", stm32_pwner_get_boot0_pin());
-            } else if (strcmp(parts->parts[2], "HIGH") == 0) {
-                stm32_pwner_set_boot0(true);
-            } else if (strcmp(parts->parts[2], "LOW") == 0) {
-                stm32_pwner_set_boot0(false);
-            } else {
-                uint8_t pin = atoi(parts->parts[2]);
-                stm32_pwner_set_boot0_pin(pin);
-            }
-        } else if (strcmp(parts->parts[1], "BOOT1") == 0) {
-            if (parts->count < 3) {
-                uart_cli_printf("BOOT1 pin: GP%u\r\n", stm32_pwner_get_boot1_pin());
-            } else if (strcmp(parts->parts[2], "HIGH") == 0) {
-                stm32_pwner_set_boot1(true);
-            } else if (strcmp(parts->parts[2], "LOW") == 0) {
-                stm32_pwner_set_boot1(false);
-            } else {
-                uint8_t pin = atoi(parts->parts[2]);
-                stm32_pwner_set_boot1_pin(pin);
-            }
-        } else if (strcmp(parts->parts[1], "STATUS") == 0) {
-            stm32_state_t state = stm32_pwner_get_state();
-            uint32_t bytes = stm32_pwner_get_bytes_received();
-
-            uart_cli_send("== STM32 Pwner Status ==\r\n");
-            const char *state_str;
-            switch (state) {
-                case STM32_STATE_IDLE: state_str = "IDLE"; break;
-                case STM32_STATE_ARMED: state_str = "ARMED"; break;
-                case STM32_STATE_GLITCHING: state_str = "GLITCHING"; break;
-                case STM32_STATE_WAITING_MAGIC: state_str = "WAITING_MAGIC"; break;
-                case STM32_STATE_DUMPING: state_str = "DUMPING"; break;
-                case STM32_STATE_COMPLETE: state_str = "COMPLETE"; break;
-                case STM32_STATE_ERROR: state_str = "ERROR"; break;
-                default: state_str = "UNKNOWN"; break;
-            }
-            uart_cli_printf("State:          %s\r\n", state_str);
-            uart_cli_printf("Bytes received: %u\r\n", bytes);
-            uart_cli_printf("BOOT0 pin:      GP%u\r\n", stm32_pwner_get_boot0_pin());
-            uart_cli_printf("BOOT1 pin:      GP%u\r\n", stm32_pwner_get_boot1_pin());
-        } else if (strcmp(parts->parts[1], "ABORT") == 0) {
-            stm32_pwner_abort();
-        } else {
-            api_error("ERROR: Unknown STM32 command\r\n");
-        }
-
     } else if (strcmp(parts->parts[0], "SWD") == 0) {
         // SWD debug interface commands
         if (parts->count < 2) {
             uart_cli_send("SWD commands:\r\n");
             uart_cli_send("  SWD CONNECT              - Connect (line reset + JTAG-to-SWD)\r\n");
             uart_cli_send("  SWD CONNECTRST           - Connect under reset (hold nRST, halt)\r\n");
+            uart_cli_send("  SWD DISCONNECT           - Disconnect and release pins\r\n");
             uart_cli_send("  SWD FILL <addr|region> <val> [n] - Fill n words with pattern\r\n");
             uart_cli_send("  SWD FLASH ERASE <page>   - Erase flash page\r\n");
             uart_cli_send("  SWD HALT                 - Halt target core\r\n");
@@ -1819,11 +1745,13 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD READ <region> [n]    - Read FLASH|SRAM|BOOTROM (default: full)\r\n");
             uart_cli_send("  SWD READ DP|AP <addr>    - Read debug/access port register\r\n");
             uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
-            uart_cli_send("  SWD RESET [HOLD|RELEASE] - Target reset via nRST\r\n");
+            uart_cli_send("  SWD RESET [ms|HOLD|RELEASE] - Target reset via nRST (default 100ms)\r\n");
             uart_cli_send("  SWD RESUME               - Resume target core\r\n");
+            uart_cli_send("  SWD SETREG <reg> <val>   - Write core register (r0-r12,sp,lr,pc,...)\r\n");
             uart_cli_send("  SWD SPEED [us]               - Get/set clock delay (0=max, default 1)\r\n");
             uart_cli_send("  SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
             uart_cli_send("  SWD WRITE DP|AP <addr> <val> - Write debug/access port register\r\n");
+            uart_cli_send("  SWD BPTEST               - Run FPB breakpoint self-test\r\n");
             goto api_response;
         }
 
@@ -3094,7 +3022,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[1], "ARM") == 0) {
             if (glitch_arm_trace()) {
-                // armed
+                uart_cli_send("OK: Trace armed\r\n");
             } else {
                 uart_cli_send("ERROR: Failed to arm trace\r\n");
             }

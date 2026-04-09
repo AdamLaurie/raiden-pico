@@ -1,7 +1,6 @@
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
-#include "stm32_pwner.h"
 #include "stm32_breakpoints.h"
 #include "glitch.h"
 #include "hardware/uart.h"
@@ -1598,8 +1597,7 @@ void target_power_payload(float voltage, uint32_t max_attempts) {
     swd_deinit();
 
     // Step 2: Set BOOT0=1, BOOT1=1 for SRAM boot mode
-    // Drive GPIOs directly — stm32_pwner_set_boot1() triggers full module init
-    // which reinitializes power pin (GP10) as single output, breaking 3-pin gang
+    // Drive GPIOs directly
     #define BOOT0_PIN 13  // GP13
     #define BOOT1_PIN 14  // GP14
     uart_cli_send("[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)\r\n");
@@ -3799,12 +3797,12 @@ void target_power_timing(const char *name_or_addr, uint32_t samples, bool bootlo
 
     // === Step 1: Set BOOT0 pin ===
     uart_cli_send("[1] Configuring BOOT pins...\r\n");
-    gpio_init(STM32_BOOT0_PIN);
-    gpio_set_dir(STM32_BOOT0_PIN, GPIO_OUT);
-    gpio_put(STM32_BOOT0_PIN, bootloader_mode ? 1 : 0);
-    gpio_init(STM32_BOOT1_PIN);
-    gpio_set_dir(STM32_BOOT1_PIN, GPIO_OUT);
-    gpio_put(STM32_BOOT1_PIN, 0);
+    gpio_init(BOOT0_PIN);
+    gpio_set_dir(BOOT0_PIN, GPIO_OUT);
+    gpio_put(BOOT0_PIN, bootloader_mode ? 1 : 0);
+    gpio_init(BOOT1_PIN);
+    gpio_set_dir(BOOT1_PIN, GPIO_OUT);
+    gpio_put(BOOT1_PIN, 0);
 
     // === Step 2: Connect under reset (halts at reset vector via VC_CORERESET) ===
     uart_cli_send("[2] Connect under reset...\r\n");
