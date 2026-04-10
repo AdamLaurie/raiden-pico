@@ -17,8 +17,10 @@
 // GP4/GP5 used for Target UART1
 // GP8/GP9 used for Grbl UART1 (alternate)
 #define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
-#define PIN_GLITCH_OUT_INV 11  // Glitch pulse output (inverted)
+#define PIN_GLITCH_OUT_INV 7   // Glitch pulse output (inverted)
 #define PIN_CLOCK 6            // Clock generator output
+#define PIN_BOOT0 13           // STM32 BOOT0 control
+#define PIN_BOOT1 14           // STM32 BOOT1 control
 #define PIN_ARMED 16           // ARMED status (CPU-controlled, HIGH when armed)
 #define PIN_GLITCH_FIRED 22    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
 
@@ -106,7 +108,7 @@ typedef struct {
     edge_type_t trigger_edge;
     uint8_t trigger_byte;
     uint8_t trigger_uart_pin;  // GPIO pin for UART trigger snooping (GP4=TX, GP5=RX)
-    // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
+    // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 } glitch_config_t;
 
 // Platform Configuration

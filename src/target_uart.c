@@ -1598,8 +1598,8 @@ void target_power_payload(float voltage, uint32_t max_attempts) {
 
     // Step 2: Set BOOT0=1, BOOT1=1 for SRAM boot mode
     // Drive GPIOs directly
-    #define BOOT0_PIN 13  // GP13
-    #define BOOT1_PIN 14  // GP14
+    #define BOOT0_PIN PIN_BOOT0
+    #define BOOT1_PIN PIN_BOOT1
     uart_cli_send("[2] Setting BOOT0=HIGH, BOOT1=HIGH (SRAM boot mode)\r\n");
     gpio_init(BOOT0_PIN);
     gpio_set_dir(BOOT0_PIN, GPIO_OUT);

@@ -69,7 +69,7 @@ bitloop:
 ; Waits for IRQ 0, then pulls: PAUSE, COUNT, WIDTH, GAP
 ; Loops COUNT times emitting WIDTH (HIGH) and GAP (LOW) pulses
 ; SET pins controls PIN_GLITCH_OUT (GP2)
-; SIDE pins controls PIN_GLITCH_OUT_INV (GP11) - inverted in hardware
+; SIDE pins controls PIN_GLITCH_OUT_INV (GP7) - inverted in hardware
 .program pulse_generator
 .side_set 1
 .wrap_target

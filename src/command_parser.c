@@ -871,10 +871,6 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP20 - TDO (JTAG only)\r\n");
         uart_cli_send("GP21 - RTCK (JTAG adaptive clocking, optional)\r\n");
         uart_cli_send("\r\n");
-        uart_cli_send("== Platform Control ==\r\n");
-        uart_cli_send("GP6  - HV Enable (default, configurable)\r\n");
-        uart_cli_send("GP7  - Voltage PWM (default, configurable)\r\n");
-        uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
         uart_cli_send("GP25 - Status LED\r\n");
 
@@ -1015,9 +1011,9 @@ void command_parser_execute(cmd_parts_t *parts) {
             // For STM32, set BOOT0 HIGH before reset (bootloader mode)
             bool is_stm32 = target_is_stm32(target_get_type());
             if (is_stm32) {
-                gpio_init(13);  // GP13 = BOOT0
-                gpio_set_dir(13, GPIO_OUT);
-                gpio_put(13, 1);
+                gpio_init(PIN_BOOT0);
+                gpio_set_dir(PIN_BOOT0, GPIO_OUT);
+                gpio_put(PIN_BOOT0, 1);
                 uart_cli_send("OK: BOOT0 = HIGH\r\n");
             }
 

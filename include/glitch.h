@@ -25,7 +25,7 @@ void glitch_set_trigger_type(trigger_type_t type);
 void glitch_set_trigger_pin(uint8_t pin, edge_type_t edge);
 void glitch_set_trigger_byte(uint8_t byte);
 
-// Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
+// Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 
 // Arm/disarm system
 bool glitch_arm(void);

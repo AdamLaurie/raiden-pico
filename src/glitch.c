@@ -72,7 +72,7 @@ void glitch_init(void) {
     config.trigger_edge = EDGE_RISING;
     config.trigger_byte = 0x00;
     config.trigger_uart_pin = 5;  // Default: GP5 (target RX = STM32 TX)
-    // Glitch output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP11)
+    // Glitch output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 
     // Initialize flags
     memset(&flags, 0, sizeof(flags));
