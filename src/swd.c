@@ -225,7 +225,39 @@ void swd_init(void) {
     current_select = 0xFFFFFFFF;
 }
 
+// Forward declarations for swd_deinit
+static bool mem_write32(uint32_t addr, uint32_t val);
+static bool mem_read32(uint32_t addr, uint32_t *val);
+static bool swd_init_ahb_ap(void);
+
 void swd_deinit(void) {
+    if (!initialized) return;
+
+    if (connected) {
+        // Clear vector catch so nRST doesn't halt at reset vector
+        mem_write32(0xE000EDFC, 0);  // DEMCR = 0
+
+        // Resume target (clear C_HALT, keep C_DEBUGEN)
+        mem_write32(0xE000EDF0, 0xA05F0001);  // DHCSR = DBGKEY | C_DEBUGEN
+
+        // Disable debug entirely
+        mem_write32(0xE000EDF0, 0xA05F0000);  // DHCSR = DBGKEY only (C_DEBUGEN cleared)
+
+        // Clear sticky errors
+        swd_write_dp(DP_ABORT, 0x1E);
+
+        // Power down debug domain
+        swd_write_dp(DP_CTRL_STAT, 0);
+
+        // Wait for power-down acknowledge
+        for (int i = 0; i < 50; i++) {
+            uint32_t stat;
+            if (swd_read_dp(DP_CTRL_STAT, &stat) && !(stat & 0xA0000000))
+                break;
+            sleep_ms(1);
+        }
+    }
+
     gpio_set_dir(SWD_SWCLK_PIN, GPIO_IN);
     gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
     initialized = false;
@@ -300,10 +332,7 @@ bool swd_ensure_connected(void) {
     return swd_connect();
 }
 
-// Forward declarations for helpers used in connect_under_reset and set_rdp
-static bool mem_read32(uint32_t addr, uint32_t *val);
-static bool mem_write32(uint32_t addr, uint32_t val);
-static bool swd_init_ahb_ap(void);
+// (Forward declarations moved above swd_deinit)
 
 bool swd_connect_under_reset(void) {
     // BMP-style connect-under-reset with VC_CORERESET vector catch.

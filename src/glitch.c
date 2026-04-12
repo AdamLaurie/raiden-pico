@@ -499,23 +499,6 @@ bool glitch_arm_trace(void) {
     return true;
 }
 
-void glitch_suspend_trigger(void) {
-    if (!flags.armed) return;
-    pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
-    pio_sm_set_enabled(glitch_pio, sm_uart_trigger, false);
-}
-
-void glitch_resume_trigger(void) {
-    if (!flags.armed) return;
-    if (config.trigger == TRIGGER_UART) {
-        // Re-clear ISO bit — target_uart_init may have re-set it
-        hw_clear_bits(&padsbank0_hw->io[config.trigger_uart_pin], PADS_BANK0_GPIO0_ISO_BITS);
-        pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
-    } else if (config.trigger == TRIGGER_GPIO) {
-        pio_sm_set_enabled(glitch_pio, sm_edge_detect, true);
-    }
-}
-
 void glitch_disarm(void) {
     if (!flags.armed) {
         return;
@@ -542,6 +525,21 @@ void glitch_disarm(void) {
 
     // No need to restore GP5 - PIO was just snooping, UART function never changed
     // Output pins are controlled by PIO, will return to idle state automatically
+
+    // Free trigger programs so PIO space is available for next arm with different trigger type
+    if (edge_rising_loaded) {
+        pio_remove_program(glitch_pio, &gpio_edge_detect_rising_program, offset_edge_detect_rising);
+        edge_rising_loaded = false;
+    }
+    if (edge_falling_loaded) {
+        pio_remove_program(glitch_pio, &gpio_edge_detect_falling_program, offset_edge_detect_falling);
+        edge_falling_loaded = false;
+    }
+    if (uart_decoder_loaded) {
+        pio_remove_program(glitch_pio, &uart_rx_decoder_program, offset_uart_match);
+        uart_decoder_loaded = false;
+    }
+    trigger_programs_loaded = false;
 
     // Reload core programs if ARM TRACE removed them
     if (core_programs_removed) {

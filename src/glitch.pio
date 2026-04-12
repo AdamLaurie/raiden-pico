@@ -33,17 +33,16 @@ start:
 .wrap
 
 ; UART RX with byte matching - NO autopush, direct ISR comparison
-; SM clock = 8× baud rate, IN pin 0 = GP28 (jumpered from GP5)
-; RP2350B BUG: PIO and UART peripheral cannot share GPIO - requires GP5→GP28 jumper
+; SM clock = 8× baud rate, IN pin = UART TX/RX GPIO (ISO bit cleared for PIO snooping)
 ; Shift right to receive LSB-first UART data
-; SET pin pulses GP9 (boost semaphore) to signal PIO1 clock boost
+; SET pin pulses GP22 (GLITCH_FIRED) to signal PIO1 clock boost
 .program uart_rx_decoder
     pull block          ; Get trigger byte from FIFO
     mov y, osr          ; Store trigger byte in Y
 
 .wrap_target
 start:
-    mov isr, null       ; Clear ISR before receiving new byte
+    push noblock        ; Clear ISR + reset shift count (FIFO data discarded)
     wait 1 pin 0        ; Wait for line idle (HIGH) — skips parity bit in 8E1
     wait 0 pin 0        ; Wait for start bit (LOW)
     set x, 7 [10]       ; Preload bit counter, delay to eye of first data bit

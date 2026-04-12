@@ -35,11 +35,6 @@ void glitch_disarm(void);
 // GP12 (GLITCH_FIRED) goes HIGH on trigger, no pulse output
 bool glitch_arm_trace(void);
 
-// Temporarily suspend/resume trigger detection (e.g. during TARGET SYNC)
-// Prevents PIO UART decoder from matching bytes while armed
-void glitch_suspend_trigger(void);
-void glitch_resume_trigger(void);
-
 // Execute a glitch
 bool glitch_execute(void);
 

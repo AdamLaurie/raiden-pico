@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "config_none: No external hardware needed",
+    "config_sweep: Target power + ADC26 wiring required",
+    "config_trace: Shunt resistor + ADC1 wiring required",
+    "config_swd: STM32 target via SWD required",
+    "config_swd_rdp: Destructive RDP tests (mass erases flash)",
+    "destructive: Test modifies target state permanently",
+]
+addopts = "--strict-markers"

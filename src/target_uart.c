@@ -391,9 +391,6 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
         uart_getc(TARGET_UART_ID);
     }
 
-    // Suspend trigger detection so PIO UART decoder doesn't match the ACK byte
-    glitch_suspend_trigger();
-
     // Target-specific bootloader entry
     switch (current_target_type) {
         case TARGET_LPC:
@@ -491,7 +488,6 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
                         break;
                     } else if (byte == 0x1F) {
                         uart_cli_send("ERROR: NACK received - bootloader rejected sync\r\n");
-                        glitch_resume_trigger();
                         return false;
                     }
                 }
@@ -500,7 +496,6 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 
             if (!got_response) {
                 uart_cli_send("ERROR: No response from bootloader (check BOOT0 pin and connections)\r\n");
-                glitch_resume_trigger();
                 return false;
             }
             break;
@@ -508,12 +503,8 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 
         default:
             uart_cli_send("ERROR: Unknown target type\r\n");
-            glitch_resume_trigger();
             return false;
     }
-
-    // Resume trigger detection now that sync is complete
-    glitch_resume_trigger();
 
     // Re-enable UART RX interrupts for normal trigger operation
     uart_set_irq_enables(TARGET_UART_ID, true, false);
@@ -1729,8 +1720,13 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
         return;
 
     if (!sweep_calibrated) {
-        uart_cli_send("ERROR: Run TARGET GLITCH SWEEP first for calibration\r\n");
-        return;
+        uart_cli_send("No sweep calibration — running SWEEP first...\r\n\r\n");
+        target_power_sweep();
+        if (!sweep_calibrated) {
+            uart_cli_send("ERROR: Sweep failed to find optimal threshold\r\n");
+            return;
+        }
+        uart_cli_send("\r\nSweep complete, continuing with BYPASS...\r\n\r\n");
     }
 
     uint32_t sram_base = info->sram_base;
@@ -3263,8 +3259,13 @@ void target_power_glitch_regdump(uint32_t max_attempts) {
         return;
 
     if (!sweep_calibrated) {
-        uart_cli_send("ERROR: Run TARGET GLITCH SWEEP first for calibration\r\n");
-        return;
+        uart_cli_send("No sweep calibration — running SWEEP first...\r\n\r\n");
+        target_power_sweep();
+        if (!sweep_calibrated) {
+            uart_cli_send("ERROR: Sweep failed to find optimal threshold\r\n");
+            return;
+        }
+        uart_cli_send("\r\nSweep complete, continuing with GLITCH_REGDUMP...\r\n\r\n");
     }
 
     uint32_t sram_base = info->sram_base;

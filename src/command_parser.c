@@ -263,8 +263,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 13, "TARGET sub-command")) {
+                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 15, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -366,13 +366,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
+        uart_cli_send("TARGET BOOT0 [HIGH|LOW]  - Set BOOT0 pin (GP13)\r\n");
+        uart_cli_send("TARGET BOOT1 [HIGH|LOW]  - Set BOOT1 pin (GP14)\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE [ms]]  - Control target power (GP10/11/12)\r\n");
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
-        uart_cli_send("TARGET GLITCH BYPASS [n] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
@@ -976,17 +978,42 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "STM32L4") == 0) {
             target_set_type(TARGET_STM32L4);
             uart_cli_send("OK: Target type set to STM32L4 (Cortex-M4, 256KB flash)\r\n");
-        } else if (strcmp(parts->parts[1], "BOOTLOADER") == 0) {
-            uint32_t baud = 115200;      // Default baud
-            uint32_t crystal_khz = 12000; // Default 12MHz crystal
-            if (parts->count >= 3) {
-                baud = atoi(parts->parts[2]);
+        } else if (strcmp(parts->parts[1], "BOOT0") == 0) {
+            gpio_init(PIN_BOOT0);
+            gpio_set_dir(PIN_BOOT0, GPIO_OUT);
+            if (parts->count >= 3 && strcmp(parts->parts[2], "LOW") == 0) {
+                gpio_put(PIN_BOOT0, 0);
+                uart_cli_send("OK: BOOT0 (GP13) = LOW\r\n");
+            } else {
+                gpio_put(PIN_BOOT0, 1);
+                uart_cli_send("OK: BOOT0 (GP13) = HIGH\r\n");
             }
-            if (parts->count >= 4) {
-                crystal_khz = atoi(parts->parts[3]);
+        } else if (strcmp(parts->parts[1], "BOOT1") == 0) {
+            gpio_init(PIN_BOOT1);
+            gpio_set_dir(PIN_BOOT1, GPIO_OUT);
+            if (parts->count >= 3 && strcmp(parts->parts[2], "LOW") == 0) {
+                gpio_put(PIN_BOOT1, 0);
+                uart_cli_send("OK: BOOT1 (GP14) = LOW\r\n");
+            } else {
+                gpio_put(PIN_BOOT1, 1);
+                uart_cli_send("OK: BOOT1 (GP14) = HIGH\r\n");
             }
-            target_enter_bootloader(baud, crystal_khz);
-        } else if (strcmp(parts->parts[1], "SYNC") == 0) {
+        } else if (strcmp(parts->parts[1], "BOOTLOADER") == 0 ||
+                   strcmp(parts->parts[1], "SYNC") == 0) {
+            // Release SWD debug port so target can reset into bootloader
+            extern void swd_deinit(void);
+            extern bool swd_is_connected(void);
+            bool was_swd = swd_is_connected();
+            swd_deinit();
+
+            // If SWD was active, power-cycle to fully clear Cortex-M debug state
+            // (nRST alone doesn't clear debug halt on Cortex-M3)
+            if (was_swd) {
+                extern void target_power_cycle(uint32_t time_ms);
+                target_power_cycle(100);
+                sleep_ms(100);
+            }
+
             uint32_t baud = 115200;       // Default baud
             uint32_t crystal_khz = 12000; // Default 12MHz crystal
             uint32_t reset_delay_ms = 500; // Default 500ms delay for bootloader to initialize
