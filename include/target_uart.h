@@ -53,6 +53,9 @@ void target_reset_execute(void);
 // Check if initialized
 bool target_is_initialized(void);
 
+// Check if bootloader is synced
+bool target_is_bl_synced(void);
+
 // Debug mode control
 void target_set_debug(bool enable);
 bool target_get_debug(void);
@@ -75,6 +78,17 @@ void target_power_literal(void);
 void target_power_regdump(void);
 void target_power_glitch_regdump(uint32_t max_attempts);
 void target_power_resettest(void);
+
+// STM32 USART bootloader commands (AN3155)
+void stm32_bl_get(void);
+void stm32_bl_get_version(void);
+void stm32_bl_gid(void);
+void stm32_bl_read(uint32_t addr, uint32_t count);
+void stm32_bl_write(uint32_t addr, const uint8_t *data, uint32_t len);
+void stm32_bl_go(uint32_t addr);
+void stm32_bl_erase(int page, bool mass_erase);
+void stm32_bl_readout_unprotect(void);
+void stm32_bl_readout_protect(void);
 
 // Breakpoint timing measurement via DWT cycle counter + ADC shunt current
 // name_or_addr: breakpoint name or "0xADDR", NULL to list breakpoints

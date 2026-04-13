@@ -229,6 +229,7 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 // UART configuration
 static uint32_t target_baud = 115200;
 static bool target_initialized = false;
+static bool bootloader_synced = false;
 
 // Target type
 static target_type_t current_target_type = TARGET_NONE;
@@ -367,6 +368,7 @@ static bool wait_for_response(const char *expected, uint32_t timeout_ms) {
 
 void target_set_type(target_type_t type) {
     current_target_type = type;
+    bootloader_synced = false;
 }
 
 target_type_t target_get_type(void) {
@@ -509,8 +511,395 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
     // Re-enable UART RX interrupts for normal trigger operation
     uart_set_irq_enables(TARGET_UART_ID, true, false);
 
+    bootloader_synced = true;
     uart_cli_printf("OK: Bootloader mode active at %u baud on GP4/GP5\r\n", baud);
     return true;
+}
+
+// ── STM32 USART Bootloader Protocol (AN3155) ───────────────────────────
+
+#define BL_ACK  0x79
+#define BL_NACK 0x1F
+
+static void stm32_bl_begin(void) {
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+    while (uart_is_readable(TARGET_UART_ID))
+        uart_getc(TARGET_UART_ID);
+}
+
+static void stm32_bl_end(void) {
+    uart_set_irq_enables(TARGET_UART_ID, true, false);
+}
+
+static int stm32_bl_wait_ack(uint32_t timeout_ms) {
+    uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
+    while (time_us_64() < deadline) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            uint8_t b = uart_getc(TARGET_UART_ID);
+            if (debug_mode)
+                uart_cli_printf("[BL RX] %02X\r\n", b);
+            if (b == BL_ACK || b == BL_NACK)
+                return b;
+        }
+    }
+    return -1;
+}
+
+static int stm32_bl_send_cmd(uint8_t cmd) {
+    uart_putc_raw(TARGET_UART_ID, cmd);
+    uart_putc_raw(TARGET_UART_ID, cmd ^ 0xFF);
+    uart_tx_wait_blocking(TARGET_UART_ID);
+    return stm32_bl_wait_ack(1000);
+}
+
+static int stm32_bl_send_addr(uint32_t addr) {
+    uint8_t buf[5];
+    buf[0] = (addr >> 24) & 0xFF;
+    buf[1] = (addr >> 16) & 0xFF;
+    buf[2] = (addr >> 8) & 0xFF;
+    buf[3] = addr & 0xFF;
+    buf[4] = buf[0] ^ buf[1] ^ buf[2] ^ buf[3];
+    for (int i = 0; i < 5; i++)
+        uart_putc_raw(TARGET_UART_ID, buf[i]);
+    uart_tx_wait_blocking(TARGET_UART_ID);
+    return stm32_bl_wait_ack(1000);
+}
+
+static int stm32_bl_recv_bytes(uint8_t *buf, uint32_t count, uint32_t timeout_ms) {
+    uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
+    uint32_t received = 0;
+    while (received < count && time_us_64() < deadline) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            buf[received++] = uart_getc(TARGET_UART_ID);
+        }
+    }
+    return received;
+}
+
+// Parse hex string into byte buffer, returns byte count or -1 on error
+static int parse_hex_to_buf(const char *hex, uint8_t *buf, int max_len) {
+    int len = 0;
+    const char *p = hex;
+    while (*p && len < max_len) {
+        // Skip optional 0x prefix at start
+        if (p == hex && p[0] == '0' && (p[1] == 'X' || p[1] == 'x'))
+            p += 2;
+        uint8_t hi, lo;
+        if (*p >= '0' && *p <= '9') hi = *p - '0';
+        else if (*p >= 'A' && *p <= 'F') hi = *p - 'A' + 10;
+        else if (*p >= 'a' && *p <= 'f') hi = *p - 'a' + 10;
+        else return -1;
+        p++;
+        if (!*p) return -1; // odd number of hex chars
+        if (*p >= '0' && *p <= '9') lo = *p - '0';
+        else if (*p >= 'A' && *p <= 'F') lo = *p - 'A' + 10;
+        else if (*p >= 'a' && *p <= 'f') lo = *p - 'a' + 10;
+        else return -1;
+        p++;
+        buf[len++] = (hi << 4) | lo;
+    }
+    return len;
+}
+
+void stm32_bl_get(void) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x00);
+    if (r == BL_NACK) { uart_cli_send("ERROR: GET command rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    uint8_t n;
+    if (stm32_bl_recv_bytes(&n, 1, 1000) != 1) { uart_cli_send("ERROR: Timeout reading byte count\r\n"); stm32_bl_end(); return; }
+
+    uint8_t version;
+    if (stm32_bl_recv_bytes(&version, 1, 1000) != 1) { uart_cli_send("ERROR: Timeout reading version\r\n"); stm32_bl_end(); return; }
+
+    uint8_t cmds[32];
+    uint32_t cmd_count = n; // n bytes of commands follow (version already read)
+    if (cmd_count > 32) cmd_count = 32;
+    int got = stm32_bl_recv_bytes(cmds, cmd_count, 2000);
+
+    stm32_bl_wait_ack(1000); // final ACK
+
+    uart_cli_printf("Bootloader version: %u.%u\r\n", version >> 4, version & 0xF);
+    uart_cli_send("Supported commands:\r\n");
+    for (int i = 0; i < got; i++) {
+        const char *name = "???";
+        switch (cmds[i]) {
+            case 0x00: name = "GET"; break;
+            case 0x01: name = "Get Version"; break;
+            case 0x02: name = "Get ID"; break;
+            case 0x11: name = "Read Memory"; break;
+            case 0x21: name = "Go"; break;
+            case 0x31: name = "Write Memory"; break;
+            case 0x43: name = "Erase"; break;
+            case 0x44: name = "Extended Erase"; break;
+            case 0x63: name = "Write Protect"; break;
+            case 0x73: name = "Write Unprotect"; break;
+            case 0x82: name = "Readout Protect"; break;
+            case 0x92: name = "Readout Unprotect"; break;
+        }
+        uart_cli_printf("  0x%02X  %s\r\n", cmds[i], name);
+    }
+    stm32_bl_end();
+}
+
+void stm32_bl_get_version(void) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x01);
+    if (r == BL_NACK) { uart_cli_send("ERROR: Get Version command rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    uint8_t data[3];
+    if (stm32_bl_recv_bytes(data, 3, 1000) != 3) {
+        uart_cli_send("ERROR: Timeout reading version\r\n"); stm32_bl_end(); return;
+    }
+
+    stm32_bl_wait_ack(1000); // final ACK
+
+    uart_cli_printf("Bootloader version: %u.%u\r\n", data[0] >> 4, data[0] & 0xF);
+    uart_cli_printf("Option byte 1:      0x%02X\r\n", data[1]);
+    uart_cli_printf("Option byte 2:      0x%02X\r\n", data[2]);
+    stm32_bl_end();
+}
+
+void stm32_bl_gid(void) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x02);
+    if (r == BL_NACK) { uart_cli_send("ERROR: GID command rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    uint8_t n;
+    if (stm32_bl_recv_bytes(&n, 1, 1000) != 1) { uart_cli_send("ERROR: Timeout\r\n"); stm32_bl_end(); return; }
+
+    uint8_t pid_bytes[4];
+    uint32_t pid_len = n + 1;
+    if (pid_len > 4) pid_len = 4;
+    if (stm32_bl_recv_bytes(pid_bytes, pid_len, 1000) != (int)pid_len) {
+        uart_cli_send("ERROR: Timeout reading PID\r\n"); stm32_bl_end(); return;
+    }
+
+    stm32_bl_wait_ack(1000); // final ACK
+
+    uint16_t pid = (pid_bytes[0] << 8) | pid_bytes[1];
+    uart_cli_printf("PID: 0x%04X", pid);
+    // Common STM32 PIDs
+    if (pid == 0x0410) uart_cli_send(" (STM32F103 medium-density)");
+    else if (pid == 0x0412) uart_cli_send(" (STM32F103 low-density)");
+    else if (pid == 0x0414) uart_cli_send(" (STM32F103 high-density)");
+    else if (pid == 0x0422) uart_cli_send(" (STM32F303/F302/F301)");
+    else if (pid == 0x0438) uart_cli_send(" (STM32F334)");
+    else if (pid == 0x0431) uart_cli_send(" (STM32F411)");
+    else if (pid == 0x0433) uart_cli_send(" (STM32F401)");
+    else if (pid == 0x0419) uart_cli_send(" (STM32F429/F439)");
+    else if (pid == 0x0435) uart_cli_send(" (STM32L43x/L44x)");
+    else if (pid == 0x0462) uart_cli_send(" (STM32L451/L452)");
+    uart_cli_send("\r\n");
+    stm32_bl_end();
+}
+
+void stm32_bl_read(uint32_t addr, uint32_t count) {
+    if (count == 0) count = 256;
+
+    uart_cli_printf("Reading %lu bytes from 0x%08lX:\r\n", count, addr);
+
+    stm32_bl_begin();
+    uint32_t total = 0;
+    while (total < count) {
+        uint32_t chunk = count - total;
+        if (chunk > 256) chunk = 256;
+
+        int r = stm32_bl_send_cmd(0x11);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Read rejected (RDP protected?)\r\n"); goto done; }
+        if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); goto done; }
+
+        r = stm32_bl_send_addr(addr + total);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Address rejected\r\n"); goto done; }
+        if (r < 0) { uart_cli_send("ERROR: Timeout on address\r\n"); goto done; }
+
+        // Send byte count: (N-1) and its checksum (complement)
+        uint8_t n = (uint8_t)(chunk - 1);
+        uart_putc_raw(TARGET_UART_ID, n);
+        uart_putc_raw(TARGET_UART_ID, n ^ 0xFF);
+        uart_tx_wait_blocking(TARGET_UART_ID);
+        r = stm32_bl_wait_ack(2000);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Count rejected (address may be in bootloader workspace)\r\n"); goto done; }
+        if (r < 0) { uart_cli_send("ERROR: Timeout on count\r\n"); goto done; }
+
+        // Receive data
+        uint8_t buf[256];
+        int got = stm32_bl_recv_bytes(buf, chunk, 5000);
+        if (got < (int)chunk) {
+            uart_cli_printf("ERROR: Timeout after %d of %lu bytes\r\n", got, chunk);
+            // Print what we got
+            chunk = got;
+        }
+
+        // Hex dump output (16 bytes per line with ASCII)
+        for (uint32_t i = 0; i < chunk; i += 16) {
+            uart_cli_printf("0x%08lX:", addr + total + i);
+            uint32_t line_len = chunk - i;
+            if (line_len > 16) line_len = 16;
+            for (uint32_t j = 0; j < line_len; j++)
+                uart_cli_printf(" %02X", buf[i + j]);
+            for (uint32_t j = line_len; j < 16; j++)
+                uart_cli_send("   ");
+            uart_cli_send("  ");
+            for (uint32_t j = 0; j < line_len; j++) {
+                char c = buf[i + j];
+                uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+            }
+            uart_cli_send("\r\n");
+        }
+        total += chunk;
+        if (got < (int)chunk) break;
+    }
+    uart_cli_printf("OK: Read %lu bytes\r\n", total);
+done:
+    stm32_bl_end();
+}
+
+void stm32_bl_write(uint32_t addr, const uint8_t *data, uint32_t len) {
+    if (len == 0) { uart_cli_send("ERROR: No data\r\n"); return; }
+
+    uart_cli_printf("Writing %lu bytes to 0x%08lX\r\n", len, addr);
+
+    stm32_bl_begin();
+    uint32_t total = 0;
+    while (total < len) {
+        uint32_t chunk = len - total;
+        if (chunk > 256) chunk = 256;
+
+        int r = stm32_bl_send_cmd(0x31);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Write rejected\r\n"); goto done; }
+        if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); goto done; }
+
+        r = stm32_bl_send_addr(addr + total);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Address rejected\r\n"); goto done; }
+        if (r < 0) { uart_cli_send("ERROR: Timeout on address\r\n"); goto done; }
+
+        // Send N (count-1), data bytes, and XOR checksum
+        uint8_t n = (uint8_t)(chunk - 1);
+        uint8_t chk = n;
+        uart_putc_raw(TARGET_UART_ID, n);
+        for (uint32_t i = 0; i < chunk; i++) {
+            uart_putc_raw(TARGET_UART_ID, data[total + i]);
+            chk ^= data[total + i];
+        }
+        uart_putc_raw(TARGET_UART_ID, chk);
+        uart_tx_wait_blocking(TARGET_UART_ID);
+
+        r = stm32_bl_wait_ack(5000);
+        if (r == BL_NACK) { uart_cli_printf("ERROR: Write rejected at offset %lu\r\n", total); goto done; }
+        if (r < 0) { uart_cli_printf("ERROR: Timeout at offset %lu\r\n", total); goto done; }
+
+        total += chunk;
+    }
+    uart_cli_printf("OK: Wrote %lu bytes\r\n", total);
+done:
+    stm32_bl_end();
+}
+
+void stm32_bl_go(uint32_t addr) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x21);
+    if (r == BL_NACK) { uart_cli_send("ERROR: GO rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    r = stm32_bl_send_addr(addr);
+    if (r == BL_NACK) { uart_cli_send("ERROR: Address rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: Timeout\r\n"); stm32_bl_end(); return; }
+
+    uart_cli_printf("OK: Jumping to 0x%08lX (bootloader exited)\r\n", addr);
+    stm32_bl_end();
+}
+
+void stm32_bl_erase(int page, bool mass_erase) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x43);
+    if (r == BL_NACK) {
+        // Try extended erase (0x44) for F4/L4 families
+        r = stm32_bl_send_cmd(0x44);
+        if (r == BL_NACK) { uart_cli_send("ERROR: Erase rejected\r\n"); stm32_bl_end(); return; }
+        if (r < 0) { uart_cli_send("ERROR: No response\r\n"); stm32_bl_end(); return; }
+
+        // Extended erase (0x44): 2-byte page numbers
+        if (mass_erase) {
+            uart_cli_send("Mass erase (extended)...\r\n");
+            uart_putc_raw(TARGET_UART_ID, 0xFF);
+            uart_putc_raw(TARGET_UART_ID, 0xFF);
+            uart_putc_raw(TARGET_UART_ID, 0x00); // checksum
+            uart_tx_wait_blocking(TARGET_UART_ID);
+        } else {
+            uart_cli_printf("Erasing page %d (extended)...\r\n", page);
+            uint8_t buf[5];
+            buf[0] = 0x00; buf[1] = 0x00; // N = 0 (1 page)
+            buf[2] = (page >> 8) & 0xFF;
+            buf[3] = page & 0xFF;
+            buf[4] = buf[0] ^ buf[1] ^ buf[2] ^ buf[3];
+            for (int i = 0; i < 5; i++)
+                uart_putc_raw(TARGET_UART_ID, buf[i]);
+            uart_tx_wait_blocking(TARGET_UART_ID);
+        }
+    } else if (r < 0) {
+        uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n");
+        stm32_bl_end(); return;
+    } else {
+        // Standard erase (0x43): 1-byte page numbers
+        if (mass_erase) {
+            uart_cli_send("Mass erase...\r\n");
+            uart_putc_raw(TARGET_UART_ID, 0xFF);
+            uart_putc_raw(TARGET_UART_ID, 0x00); // checksum
+            uart_tx_wait_blocking(TARGET_UART_ID);
+        } else {
+            uart_cli_printf("Erasing page %d...\r\n", page);
+            uint8_t n = 0; // erase 1 page
+            uint8_t pg = (uint8_t)page;
+            uart_putc_raw(TARGET_UART_ID, n);
+            uart_putc_raw(TARGET_UART_ID, pg);
+            uart_putc_raw(TARGET_UART_ID, n ^ pg); // checksum
+            uart_tx_wait_blocking(TARGET_UART_ID);
+        }
+    }
+
+    r = stm32_bl_wait_ack(30000); // erase can take a long time
+    if (r == BL_NACK) { uart_cli_send("ERROR: Erase failed\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: Erase timeout\r\n"); stm32_bl_end(); return; }
+
+    if (mass_erase)
+        uart_cli_send("OK: Mass erase complete\r\n");
+    else
+        uart_cli_printf("OK: Page %d erased\r\n", page);
+    stm32_bl_end();
+}
+
+void stm32_bl_readout_unprotect(void) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x92);
+    if (r == BL_NACK) { uart_cli_send("ERROR: Readout unprotect rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    uart_cli_send("Readout unprotect in progress (mass erase + reset)...\r\n");
+    r = stm32_bl_wait_ack(30000); // mass erase + system reset
+    if (r < 0)
+        uart_cli_send("OK: No final ACK (target reset — expected)\r\n");
+    else
+        uart_cli_send("OK: Readout unprotect complete\r\n");
+    stm32_bl_end();
+}
+
+void stm32_bl_readout_protect(void) {
+    stm32_bl_begin();
+    int r = stm32_bl_send_cmd(0x82);
+    if (r == BL_NACK) { uart_cli_send("ERROR: Readout protect rejected\r\n"); stm32_bl_end(); return; }
+    if (r < 0) { uart_cli_send("ERROR: No response (run TARGET SYNC first)\r\n"); stm32_bl_end(); return; }
+
+    uart_cli_send("Readout protect in progress (system reset)...\r\n");
+    r = stm32_bl_wait_ack(30000);
+    if (r < 0)
+        uart_cli_send("OK: No final ACK (target reset — expected)\r\n");
+    else
+        uart_cli_send("OK: Readout protection enabled\r\n");
+    stm32_bl_end();
 }
 
 void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
@@ -865,6 +1254,10 @@ void target_reset_execute(void) {
 
 bool target_is_initialized(void) {
     return target_initialized;
+}
+
+bool target_is_bl_synced(void) {
+    return bootloader_synced;
 }
 
 void target_set_debug(bool enable) {

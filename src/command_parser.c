@@ -263,8 +263,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 15, "TARGET sub-command")) {
+                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 16, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -390,6 +390,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
         uart_cli_send("                   (defaults: 115200, 12000, 500ms, 5 retries)\r\n");
         uart_cli_send("TARGET TIMEOUT [<ms>]  - Get/set transparent bridge timeout (default: 50ms)\r\n");
+        uart_cli_send("TARGET BL GET          - Bootloader version + supported commands\r\n");
+        uart_cli_send("TARGET BL GV           - Get version + option bytes\r\n");
+        uart_cli_send("TARGET BL GID          - Chip product ID\r\n");
+        uart_cli_send("TARGET BL READ <addr> [count] - Read memory (default 256 bytes)\r\n");
+        uart_cli_send("TARGET BL WRITE <addr> <hex>  - Write memory (hex byte string)\r\n");
+        uart_cli_send("TARGET BL GO <addr>    - Jump to address\r\n");
+        uart_cli_send("TARGET BL ERASE <page|ALL WIPE> - Erase flash page or mass erase\r\n");
+        uart_cli_send("TARGET BL RU WIPE      - Readout unprotect (mass erase + remove RDP)\r\n");
+        uart_cli_send("TARGET BL RP CONFIRM   - Readout protect (set RDP1)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Trigger Configuration ==\r\n");
         uart_cli_send("TRIGGER [NONE|GPIO|UART] - Configure/show trigger\r\n");
@@ -1035,6 +1044,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
             }
 
+            // Check target type before doing anything
+            if (target_get_type() == TARGET_NONE) {
+                api_error("ERROR: No target type set. Use TARGET <LPC|STM32F1|STM32F3|...> first\r\n");
+                goto api_response;
+            }
+
             // For STM32, set BOOT0 HIGH before reset (bootloader mode)
             bool is_stm32 = target_is_stm32(target_get_type());
             if (is_stm32) {
@@ -1190,6 +1205,141 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     target_power_cycle(cycle_time_ms);
+                }
+            }
+        } else if (strcmp(parts->parts[1], "BL") == 0) {
+            if (parts->count < 3) {
+                uart_cli_send("Usage: TARGET BL <command>\r\n");
+                uart_cli_send("  GET                  - Bootloader version + supported commands\r\n");
+                uart_cli_send("  GV                   - Get version + option bytes\r\n");
+                uart_cli_send("  GID                  - Chip product ID\r\n");
+                uart_cli_send("  READ <addr> [count]  - Read memory (default 256 bytes)\r\n");
+                uart_cli_send("  WRITE <addr> <hex>   - Write hex bytes to memory\r\n");
+                uart_cli_send("  GO <addr>            - Jump to address\r\n");
+                uart_cli_send("  ERASE <page|ALL WIPE> - Erase flash page or mass erase\r\n");
+                uart_cli_send("  RU WIPE              - Readout unprotect (mass erase!)\r\n");
+                uart_cli_send("  RP CONFIRM           - Readout protect (set RDP1)\r\n");
+                uart_cli_send("Requires: TARGET SYNC first\r\n");
+            } else {
+                const char *bl_cmds[] = {"GET", "GV", "GID", "READ", "WRITE", "GO", "ERASE", "RU", "RP"};
+                if (!match_and_replace(&parts->parts[2], bl_cmds, 9, "BL command")) {
+                    goto api_response;
+                }
+
+                // Auto-sync: if bootloader not synced, run TARGET SYNC automatically
+                if (!target_is_bl_synced()) {
+                    if (target_get_type() == TARGET_NONE) {
+                        api_error("ERROR: No target type set. Use TARGET <STM32F1|STM32F3|...> first\r\n");
+                        goto api_response;
+                    }
+                    uart_cli_send("Bootloader not synced — running TARGET SYNC...\r\n");
+
+                    extern void swd_deinit(void);
+                    extern bool swd_is_connected(void);
+                    if (swd_is_connected()) {
+                        swd_deinit();
+                        target_power_cycle(100);
+                        sleep_ms(100);
+                    }
+
+                    bool is_stm32 = target_is_stm32(target_get_type());
+                    if (is_stm32) {
+                        gpio_init(PIN_BOOT0);
+                        gpio_set_dir(PIN_BOOT0, GPIO_OUT);
+                        gpio_put(PIN_BOOT0, 1);
+                    }
+
+                    bool synced = false;
+                    for (uint32_t retry = 0; retry < 5; retry++) {
+                        if (retry > 0)
+                            uart_cli_printf("Retry %u/5...\r\n", retry);
+                        target_reset_execute();
+                        sleep_ms(500);
+                        if (target_enter_bootloader(115200, 12000)) {
+                            synced = true;
+                            break;
+                        }
+                        sleep_ms(100);
+                    }
+                    if (!synced) {
+                        api_error("ERROR: Auto-sync failed — check wiring and target power\r\n");
+                        goto api_response;
+                    }
+                }
+
+                if (strcmp(parts->parts[2], "GET") == 0) {
+                    stm32_bl_get();
+                } else if (strcmp(parts->parts[2], "GV") == 0) {
+                    stm32_bl_get_version();
+                } else if (strcmp(parts->parts[2], "GID") == 0) {
+                    stm32_bl_gid();
+                } else if (strcmp(parts->parts[2], "READ") == 0) {
+                    if (parts->count < 4) {
+                        api_error("ERROR: Usage: TARGET BL READ <addr> [count]\r\n");
+                        goto api_response;
+                    }
+                    uint32_t addr = strtoul(parts->parts[3], NULL, 16);
+                    uint32_t count = 256;
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &count)) {
+                            api_error("ERROR: Invalid count\r\n");
+                            goto api_response;
+                        }
+                    }
+                    stm32_bl_read(addr, count);
+                } else if (strcmp(parts->parts[2], "WRITE") == 0) {
+                    if (parts->count < 5) {
+                        api_error("ERROR: Usage: TARGET BL WRITE <addr> <hex_bytes>\r\n");
+                        goto api_response;
+                    }
+                    uint32_t addr = strtoul(parts->parts[3], NULL, 16);
+                    const char *hex = parts->parts[4];
+                    size_t hex_len = strlen(hex);
+                    if (hex_len == 0 || hex_len % 2 != 0 || hex_len > 512) {
+                        api_error("ERROR: Hex data must be even length, max 256 bytes\r\n");
+                        goto api_response;
+                    }
+                    uint8_t buf[256];
+                    uint32_t data_len = hex_len / 2;
+                    for (uint32_t i = 0; i < data_len; i++) {
+                        char byte_str[3] = {hex[i*2], hex[i*2+1], '\0'};
+                        buf[i] = (uint8_t)strtoul(byte_str, NULL, 16);
+                    }
+                    stm32_bl_write(addr, buf, data_len);
+                } else if (strcmp(parts->parts[2], "GO") == 0) {
+                    if (parts->count < 4) {
+                        api_error("ERROR: Usage: TARGET BL GO <addr>\r\n");
+                        goto api_response;
+                    }
+                    uint32_t addr = strtoul(parts->parts[3], NULL, 16);
+                    stm32_bl_go(addr);
+                } else if (strcmp(parts->parts[2], "ERASE") == 0) {
+                    if (parts->count < 4) {
+                        api_error("ERROR: Usage: TARGET BL ERASE <page> or TARGET BL ERASE ALL WIPE\r\n");
+                        goto api_response;
+                    }
+                    if (strcasecmp(parts->parts[3], "ALL") == 0) {
+                        if (parts->count < 5 || strcasecmp(parts->parts[4], "WIPE") != 0) {
+                            api_error("ERROR: Mass erase requires confirmation: TARGET BL ERASE ALL WIPE\r\n");
+                            goto api_response;
+                        }
+                        stm32_bl_erase(-1, true);
+                    } else {
+                        int page = (int)strtol(parts->parts[3], NULL, 0);
+                        stm32_bl_erase(page, false);
+                    }
+                } else if (strcmp(parts->parts[2], "RU") == 0) {
+                    if (parts->count < 4 || strcasecmp(parts->parts[3], "WIPE") != 0) {
+                        api_error("ERROR: Readout unprotect erases all flash! Confirm: TARGET BL RU WIPE\r\n");
+                        goto api_response;
+                    }
+                    stm32_bl_readout_unprotect();
+                } else if (strcmp(parts->parts[2], "RP") == 0) {
+                    if (parts->count < 4 || strcasecmp(parts->parts[3], "CONFIRM") != 0) {
+                        api_error("ERROR: Readout protect locks flash! Confirm: TARGET BL RP CONFIRM\r\n");
+                        goto api_response;
+                    }
+                    stm32_bl_readout_protect();
                 }
             }
         } else if (strcmp(parts->parts[1], "GLITCH") == 0) {
