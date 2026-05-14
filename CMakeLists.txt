@@ -1,7 +1,15 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Set board type before including SDK
-set(PICO_BOARD pico2 CACHE STRING "Board type")
+# Board variant selection: BOARD=pico2 (default) or BOARD=xxl (Olimex RP2350-XXL)
+set(BOARD "pico2" CACHE STRING "Board variant: pico2 or xxl")
+if(BOARD STREQUAL "xxl")
+    set(PICO_BOARD olimex_rp2350_xxl CACHE STRING "Board type" FORCE)
+    set(BOARD_NAME "Olimex RP2350-XXL")
+else()
+    set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
+    set(BOARD_NAME "Raspberry Pi Pico 2")
+endif()
+message(STATUS "Building for ${BOARD_NAME} (PICO_BOARD=${PICO_BOARD})")
 
 # Pull in SDK (must be before project)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
@@ -63,8 +71,8 @@ pico_add_extra_outputs(raiden_pico)
 
 # Add flash target
 add_custom_target(flash
-    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/flash.sh
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/flash.sh ${CMAKE_CURRENT_BINARY_DIR}
     DEPENDS raiden_pico
-    COMMENT "Flashing firmware to Pico2"
+    COMMENT "Flashing firmware to ${BOARD_NAME}"
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )

@@ -884,6 +884,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
         uart_cli_send("GP25 - Status LED\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== External Reset (suggested) ==\r\n");
+        uart_cli_send("EN   - Tie to FTDI DTR (on /dev/ttyUSB0) for host-driven reset.\r\n");
+        uart_cli_send("       Use scripts/reset_pico.py to pulse DTR low ~100ms.\r\n");
+        uart_cli_send("       Useful when the CLI is hung and REBOOT BL won't respond.\r\n");
 
     } else if (strcmp(parts->parts[0], "TRIGGER") == 0) {
         glitch_config_t *cfg = glitch_get_config();

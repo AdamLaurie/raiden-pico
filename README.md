@@ -71,6 +71,36 @@ REBOOT BL
 # Then copy the UF2 file to the mounted drive
 ```
 
+### Hardware Reset via FTDI (optional but recommended)
+
+If the firmware ever hangs and stops responding to `REBOOT BL`, you can
+reset the Pico 2 from the host by wiring an FTDI breakout's DTR line to
+the Pico 2's `EN` (RUN) pin (share GND too):
+
+```
+FTDI DTR  →  Pico 2 EN
+FTDI GND  →  Pico 2 GND
+```
+
+Then pulse it from the host:
+```bash
+python3 scripts/reset_pico.py                          # default: /dev/ttyUSB0, 100ms
+python3 scripts/reset_pico.py --wait                   # also confirm ttyACM0 comes back
+python3 scripts/reset_pico.py --port /dev/ttyUSB1      # use a different FTDI port
+python3 scripts/reset_pico.py --ms 200                 # longer reset pulse
+python3 scripts/reset_pico.py --port /dev/ttyUSB1 --ms 200 --wait
+```
+
+Arguments:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--port <dev>` | `/dev/ttyUSB0` | FTDI serial device whose DTR pin is wired to EN |
+| `--ms <n>`     | `100`          | DTR-low pulse duration in milliseconds |
+| `--wait`       | off            | After resetting, wait for `/dev/ttyACM0` to enumerate and confirm with `VERSION` |
+
+`PINS` in the CLI mentions this under "External Reset (suggested)".
+
 ## Usage
 
 ### Connecting

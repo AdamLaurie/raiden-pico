@@ -4,7 +4,9 @@
 # Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 PROJECT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
-BUILD_DIR="$PROJECT_DIR/build"
+
+# Build dir can be passed as $1 (cmake passes ${CMAKE_CURRENT_BINARY_DIR}), defaults to build/
+BUILD_DIR="${1:-$PROJECT_DIR/build}"
 UF2_FILE="$BUILD_DIR/raiden_pico.uf2"
 MOUNT_POINT="/media/${USER}/RP2350"
 
