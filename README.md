@@ -12,7 +12,7 @@ All the code and test scripts in this project were written and tested by [Claude
 
 The inspiration for the project came from discussions here: [Prompt||GTFO](https://www.knostic.ai/blog/prompt-gtfo-season-1).
 
-Full story in my [unpromted con talk "AI Go Beep Boop!"](https://www.youtube.com/watch?v=_tqqnkemYsg).
+Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.com/watch?v=_tqqnkemYsg).
 
 \* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope. I have not read a single line of code produced, only ran and tested it, so I cannot speak for the quality of the coding! YMMV!
 
