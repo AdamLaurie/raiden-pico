@@ -10,6 +10,9 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 
+# But do track hand-written payload Makefiles
+!stm32_payloads/**/Makefile
+
 # Build outputs
 *.elf
 *.bin
