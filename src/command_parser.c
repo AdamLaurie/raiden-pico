@@ -862,6 +862,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GP8  - Grbl UART TX (UART1 alternate)\r\n");
         uart_cli_send("GP9  - Grbl UART RX (UART1 alternate)\r\n");
+        uart_cli_send("CNC3018 Woodpecker offline header wiring:\r\n");
+        uart_cli_send("  Pico GND -> controller pin 3 or 4 (GND)\r\n");
+        uart_cli_send("  Pico GP8 -> controller pin 8 (controller RX)\r\n");
+        uart_cli_send("  Pico GP9 <- controller pin 6 (controller TX)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");

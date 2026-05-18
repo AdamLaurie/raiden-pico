@@ -719,6 +719,11 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 
 **Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
 
+**CNC3018 Woodpecker controller wiring** (offline controller 8-pin header):
+- Pico GND → controller pin 3 or 4 (GND)
+- Pico GP8 (TX) → controller pin 8 (RX)
+- Pico GP9 (RX) → controller pin 6 (TX)
+
 ### STM32 Attack / RDP Bypass
 
 - **GPIO 10/11/12** - Target Power (ganged, default ON, 12mA drive each)
