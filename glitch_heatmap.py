@@ -37,16 +37,38 @@ parser.add_argument('--reverse', '-r', action='store_true',
                     help='Reverse spiral: start from center, end at (0,0)')
 parser.add_argument('--forward', '-f', action='store_true',
                     help='Forward spiral: start from (0,0), end at center (default)')
-parser.add_argument('--start-x', type=int, default=None,
-                    help='Starting X position (overrides default)')
-parser.add_argument('--start-y', type=int, default=None,
-                    help='Starting Y position (overrides default)')
+parser.add_argument('--start', type=int, nargs=2, default=None, metavar=('X','Y'),
+                    help='Bottom-left corner of scan window AND spiral start (e.g. --start 8 9)')
+parser.add_argument('--end', type=int, nargs=2, default=None, metavar=('X','Y'),
+                    help='Top-right corner of scan window (e.g. --end 12 12)')
+parser.add_argument('--start-x', type=int, default=None, help='Starting X position (overrides --start x)')
+parser.add_argument('--start-y', type=int, default=None, help='Starting Y position (overrides --start y)')
+parser.add_argument('--x-min', type=int, default=None, help='Restrict scan to X >= this (overrides --start x)')
+parser.add_argument('--x-max', type=int, default=None, help='Restrict scan to X <= this (overrides --end x)')
+parser.add_argument('--y-min', type=int, default=None, help='Restrict scan to Y >= this (overrides --start y)')
+parser.add_argument('--y-max', type=int, default=None, help='Restrict scan to Y <= this (overrides --end y)')
+parser.add_argument('--trigger-byte', default='0D',
+                    help='UART trigger byte in hex (default 0D = CR). E.g. --trigger-byte 39 to fire on "9" in the "19\\r" response')
 args = parser.parse_args()
 
 # Determine direction (default is forward)
 REVERSE_SPIRAL = args.reverse and not args.forward
-START_X = args.start_x
-START_Y = args.start_y
+
+# --start/--end fill in both the bounding box and the spiral start point.
+# Individual --x-min/--x-max/--y-min/--y-max/--start-x/--start-y still override.
+sx, sy = args.start if args.start else (None, None)
+ex, ey = args.end   if args.end   else (None, None)
+
+START_X = args.start_x if args.start_x is not None else sx
+START_Y = args.start_y if args.start_y is not None else sy
+X_MIN   = args.x_min   if args.x_min   is not None else sx
+Y_MIN   = args.y_min   if args.y_min   is not None else sy
+X_MAX   = args.x_max   if args.x_max   is not None else ex
+Y_MAX   = args.y_max   if args.y_max   is not None else ey
+
+# Normalise trigger byte to a "0xXX" form for the Pico CLI
+TRIGGER_BYTE_HEX = args.trigger_byte.lower().lstrip('0x').lstrip('0X') or '0'
+TRIGGER_BYTE_HEX = f"0x{int(TRIGGER_BYTE_HEX, 16):02X}"
 
 # Grid size
 SIZE = 24  # 25x25 grid (0-24)
@@ -71,6 +93,10 @@ visited = {}  # (x, y) -> {'hit_rate': 0.0-1.0, 'voltage': V}
 current_pos = (0, 0)
 update_queue = queue.Queue()
 server_ready = threading.Event()
+
+# Progress / ETA tracking — set by main loop, consumed by broadcast_* helpers
+total_points = (SIZE + 1) * (SIZE + 1)
+scan_start_time = None
 
 # CSV log file
 CSV_FILE = f"glitch_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -354,6 +380,28 @@ HTML_PAGE = '''<!DOCTYPE html>
         drawGrid(ctxHitRate, canvasHitRate);
         drawGrid(ctxVoltage, canvasVoltage);
 
+        function fmtDur(sec) {
+            if (sec == null || !isFinite(sec)) return '?';
+            sec = Math.round(sec);
+            if (sec < 60) return sec + 's';
+            const m = Math.floor(sec / 60), s = sec % 60;
+            if (m < 60) return m + 'm' + (s ? s + 's' : '');
+            const h = Math.floor(m / 60), mm = m % 60;
+            return h + 'h' + (mm ? mm + 'm' : '');
+        }
+        function fmtEta(sec) {
+            if (sec == null || !isFinite(sec)) return '?';
+            const t = new Date(Date.now() + sec * 1000);
+            return fmtDur(sec) + ' (~' + t.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) + ')';
+        }
+        function progressSuffix(d) {
+            const total = d.total != null ? d.total : '?';
+            let s = ' - ' + d.count + ' / ' + total + ' positions';
+            if (d.avgSec != null)  s += ' | avg ' + fmtDur(d.avgSec) + '/test';
+            if (d.etaSec != null && d.count < (d.total || 0)) s += ' | ETA ' + fmtEta(d.etaSec);
+            return s;
+        }
+
         const evtSource = new EventSource('/events');
 
         evtSource.onopen = function() {
@@ -374,7 +422,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 if (data.current) {
                     drawCurrent(data.current[0], data.current[1]);
                 }
-                status.textContent = `Tested: ${Object.keys(data.visited).length} / 625 positions`;
+                status.textContent = 'Tested: ' + Object.keys(data.visited).length + ' positions';
             }
             else if (data.type === 'move') {
                 if (prevPos) {
@@ -385,7 +433,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 }
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
-                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V - ${data.count} / 625 positions`;
+                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V` + progressSuffix(data);
             }
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
@@ -396,10 +444,11 @@ HTML_PAGE = '''<!DOCTYPE html>
                 const pct = (data.hitRate * 100).toFixed(0);
                 let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
-                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
+                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg}` + progressSuffix(data);
             }
             else if (data.type === 'complete') {
-                status.textContent = `Complete! Tested ${data.count} positions. Log: ${data.csvFile}`;
+                let total = data.elapsedSec != null ? ' in ' + fmtDur(data.elapsedSec) : '';
+                status.textContent = `Complete! Tested ${data.count} positions${total}. Log: ${data.csvFile}`;
                 status.style.color = '#00ff88';
             }
         };
@@ -463,6 +512,20 @@ def run_server():
     print("Web server running at http://localhost:8080", flush=True)
     server.serve_forever()
 
+def _progress_fields():
+    """Common progress/ETA fields included in every broadcast."""
+    done = len(visited)
+    total = total_points
+    fields = {'count': done, 'total': total}
+    if scan_start_time is not None and done > 0:
+        elapsed = time.time() - scan_start_time
+        avg = elapsed / done
+        remaining = max(total - done, 0)
+        fields['elapsedSec'] = elapsed
+        fields['avgSec'] = avg
+        fields['etaSec'] = avg * remaining
+    return fields
+
 def broadcast_move(x, y, voltage):
     global current_pos
     current_pos = (x, y)
@@ -471,8 +534,8 @@ def broadcast_move(x, y, voltage):
         'x': x,
         'y': y,
         'voltage': voltage,
-        'count': len(visited)
     }
+    update.update(_progress_fields())
     update_queue.put(update)
 
 def broadcast_result(x, y, hit_rate, voltage, optimized=False, start_voltage=None, special=None, threshold=None):
@@ -494,16 +557,18 @@ def broadcast_result(x, y, hit_rate, voltage, optimized=False, start_voltage=Non
         'startVoltage': start_voltage,
         'special': special,
         'threshold': threshold,
-        'count': len(visited)
     }
+    update.update(_progress_fields())
     update_queue.put(update)
 
 def broadcast_complete():
     update = {
         'type': 'complete',
         'count': len(visited),
-        'csvFile': CSV_FILE
+        'csvFile': CSV_FILE,
     }
+    if scan_start_time is not None:
+        update['elapsedSec'] = time.time() - scan_start_time
     update_queue.put(update)
 
 def save_html_snapshot(filename):
@@ -534,7 +599,7 @@ def save_html_snapshot(filename):
                 if (data.current) {
                     drawCurrent(data.current[0], data.current[1]);
                 }
-                status.textContent = `Tested: ${Object.keys(data.visited).length} / 625 positions`;
+                status.textContent = 'Tested: ' + Object.keys(data.visited).length + ' positions';
             }
             else if (data.type === 'move') {
                 if (prevPos) {
@@ -545,7 +610,7 @@ def save_html_snapshot(filename):
                 }
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
-                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V - ${data.count} / 625 positions`;
+                status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V` + progressSuffix(data);
             }
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
@@ -556,10 +621,11 @@ def save_html_snapshot(filename):
                 const pct = (data.hitRate * 100).toFixed(0);
                 let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
-                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg} - ${data.count} / 625 positions`;
+                status.textContent = `(${data.x}, ${data.y}): ${pct}% @ ${data.voltage}V${optMsg}${specialMsg}` + progressSuffix(data);
             }
             else if (data.type === 'complete') {
-                status.textContent = `Complete! Tested ${data.count} positions. Log: ${data.csvFile}`;
+                let total = data.elapsedSec != null ? ' in ' + fmtDur(data.elapsedSec) : '';
+                status.textContent = `Complete! Tested ${data.count} positions${total}. Log: ${data.csvFile}`;
                 status.style.color = '#00ff88';
             }
         };
@@ -574,7 +640,7 @@ def save_html_snapshot(filename):
             cellData[key] = info;
             drawCell(x, y, info.hitRate, info.special, info.threshold, info.voltage);
         }});
-        status.textContent = 'Snapshot: ' + Object.keys(staticData).length + ' / 625 positions tested';
+        status.textContent = 'Snapshot: ' + Object.keys(staticData).length + ' positions tested';
         status.style.color = '#00ff88';"""
     )
 
@@ -700,8 +766,8 @@ def run_glitch_test():
     if not check_and_reset_chipshouter():
         return 'cs_error'
 
-    # Setup UART trigger for 0x0D (carriage return)
-    send_cmd("TRIGGER UART 0x0D")
+    # Setup UART trigger
+    send_cmd(f"TRIGGER UART {TRIGGER_BYTE_HEX}")
     send_cmd("SET PAUSE 5000")
     send_cmd("SET WIDTH 150")
     send_cmd("SET COUNT 1")
@@ -1020,6 +1086,16 @@ def generate_spiral_points(size):
 # Generate spiral points
 spiral_points = generate_spiral_points(SIZE)
 
+# Apply bounding box if requested
+if any(v is not None for v in (X_MIN, X_MAX, Y_MIN, Y_MAX)):
+    xmin = X_MIN if X_MIN is not None else 0
+    xmax = X_MAX if X_MAX is not None else SIZE
+    ymin = Y_MIN if Y_MIN is not None else 0
+    ymax = Y_MAX if Y_MAX is not None else SIZE
+    spiral_points = [(x, y) for (x, y) in spiral_points
+                     if xmin <= x <= xmax and ymin <= y <= ymax]
+    print(f"Bounding box: x=[{xmin},{xmax}] y=[{ymin},{ymax}] -> {len(spiral_points)} points", flush=True)
+
 if REVERSE_SPIRAL:
     spiral_points.reverse()
     direction_str = f"REVERSE: center ({spiral_points[0]}) -> (0,0)"
@@ -1037,6 +1113,10 @@ if START_X is not None and START_Y is not None:
         print(f"WARNING: Start position ({START_X}, {START_Y}) not in grid, using default", flush=True)
 
 print(f"Spiral: {len(spiral_points)} points, {direction_str}", flush=True)
+
+# Hand actual scan size + start time over to broadcast helpers for ETA reporting
+total_points = len(spiral_points)
+scan_start_time = time.time()
 
 # Process each point
 for i, (x, y) in enumerate(spiral_points):
