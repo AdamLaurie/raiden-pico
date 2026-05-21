@@ -45,7 +45,10 @@ start:
     push noblock        ; Clear ISR + reset shift count (FIFO data discarded)
     wait 1 pin 0        ; Wait for line idle (HIGH) — skips parity bit in 8E1
     wait 0 pin 0        ; Wait for start bit (LOW)
-    set x, 7 [10]       ; Preload bit counter, delay to eye of first data bit
+    set x, 7 [9]        ; Preload bit counter, delay to eye of first data bit
+                        ; [9] (not [10]) leaves 1 PIO cycle of slack per byte
+                        ; iteration so back-to-back non-matching bytes don't
+                        ; drift the SM into the next byte's start bit.
 bitloop:
     in pins, 1          ; Shift data bit into ISR (right shift)
     jmp x-- bitloop [6] ; Loop 8 times, 8 cycles each
