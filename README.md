@@ -595,6 +595,43 @@ This attack is based on the original [stimpik](https://github.com/xobs/stimpik) 
 
 If `TARGET POWER SWEEP` shows nRST being triggered at every threshold but no SRAM retention (all reads fail), the power rail capacitance is too low — the voltage drops below the BOR threshold too quickly for SRAM to retain its contents. Add decoupling capacitors (10-100µF) across the target VDD/GND to slow the voltage decay. Conversely, if nRST never triggers, the capacitance is too high and the voltage doesn't drop fast enough — reduce or remove external capacitors on VDD. The goal is a sweep that shows a range of thresholds where nRST fires AND SRAM contents are fully retained.
 
+A healthy sweep on a well-decoupled STM32F103 looks like this — nRST fires at every threshold, SRAM is fully retained down to ~0.81V, and the BOR floor is found at ~0.76V where the first retention failure appears:
+
+```
+=== SRAM Retention Sweep Summary ===
+Thresh(V)  Vmin(V)  Glitch(us)  NRST  BOR(V)  Retained
+---------  ------   ----------  ----  ------  --------
+  2.50V     0.76V       24       Y   0.76V  256/256
+  2.42V     0.74V       18       Y   0.74V  256/256
+  2.34V     0.74V       15       Y   0.74V  256/256
+  2.26V     0.75V       15       Y   0.75V  256/256
+  2.18V     0.75V       15       Y   0.75V  256/256
+  2.10V     0.74V       15       Y   0.74V  256/256
+  2.02V     0.75V       16       Y   0.75V  256/256
+  1.94V     0.74V       15       Y   0.74V  256/256
+  1.86V     0.74V       16       Y   0.74V  256/256
+  1.78V     0.75V       16       Y   0.75V  256/256
+  1.69V     0.74V       16       Y   0.74V  256/256
+  1.61V     0.73V       16       Y   0.73V  256/256
+  1.53V     0.75V       15       Y   0.75V  256/256
+  1.45V     0.75V       15       Y   0.75V  256/256
+  1.37V     0.74V       15       Y   0.74V  256/256
+  1.29V     0.74V       15       Y   0.74V  256/256
+  1.21V     0.75V       15       Y   0.75V  256/256
+  1.13V     0.75V       16       Y   0.75V  256/256
+  1.05V     0.75V       14       Y   0.75V  256/256
+  0.97V     0.73V       15       Y   0.73V  256/256
+  0.89V     0.74V       15       Y   0.74V  256/256
+  0.81V     0.75V       14       Y   0.75V  256/256
+  0.73V     0.73V       42       Y   0.76V  FAIL
+
+BOR threshold: ~0.76V
+
+Calibration saved: optimal threshold=0.81V
+```
+
+The saved threshold (0.81V — the lowest still-retaining row) is what gets passed automatically to `TARGET POWER BYPASS`/`PAYLOAD` for the attack glitch.
+
 #### Wiring
 
 | Pico GPIO | STM32 Pin | Function |
