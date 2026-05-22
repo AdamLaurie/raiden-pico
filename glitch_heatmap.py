@@ -412,6 +412,9 @@ HTML_PAGE = '''<!DOCTYPE html>
             const data = JSON.parse(event.data);
 
             if (data.type === 'init') {
+                // Wipe any stale JS state from a previous SSE session
+                cellData = {};
+                prevPos = null;
                 drawGrid(ctxHitRate, canvasHitRate);
                 drawGrid(ctxVoltage, canvasVoltage);
                 Object.entries(data.visited).forEach(([key, info]) => {
@@ -589,6 +592,9 @@ def save_html_snapshot(filename):
             const data = JSON.parse(event.data);
 
             if (data.type === 'init') {
+                // Wipe any stale JS state from a previous SSE session
+                cellData = {};
+                prevPos = null;
                 drawGrid(ctxHitRate, canvasHitRate);
                 drawGrid(ctxVoltage, canvasVoltage);
                 Object.entries(data.visited).forEach(([key, info]) => {
