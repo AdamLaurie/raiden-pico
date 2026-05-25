@@ -1773,21 +1773,23 @@ void target_power_sweep(void) {
     }
 
     // Derive optimal glitch threshold from sweep results
-    // Find the lowest sweep threshold where BOR triggered AND SRAM fully survived
-    // This is the sweet spot: deep enough for BOR, shallow enough for SRAM
+    // Viable range = thresholds where BOR triggered AND SRAM fully survived.
+    // Lowest viable is the most aggressive (closest to SRAM corruption);
+    // highest viable barely trips BOR. Pick the midpoint for reliability.
     {
-        float best = 0;
+        float vmin = 0, vmax = 0;
         for (uint32_t i = 0; i < result_count; i++) {
             if (results[i].nrst && results[i].good == SRAM_TEST_WORDS) {
                 float v = results[i].thresh * 3.3f / 4095.0f;
-                if (best == 0 || v < best) best = v;
+                if (vmin == 0 || v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
             }
         }
-        if (best > 0) {
-            sweep_optimal_thresh = best;
+        if (vmin > 0) {
+            sweep_optimal_thresh = (vmin + vmax) / 2.0f;
             sweep_calibrated = true;
-            uart_cli_printf("\r\nCalibration saved: optimal threshold=%.2fV\r\n",
-                            sweep_optimal_thresh);
+            uart_cli_printf("\r\nCalibration saved: optimal threshold=%.2fV (midpoint of %.2f-%.2fV viable range)\r\n",
+                            sweep_optimal_thresh, vmin, vmax);
         }
     }
 
