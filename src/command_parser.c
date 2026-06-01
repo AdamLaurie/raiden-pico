@@ -2,6 +2,7 @@
 #include "uart_cli.h"
 #include "glitch.h"
 #include "target_uart.h"
+#include "lpc_target.h"
 #include "grbl.h"
 #include "swd.h"
 #include "jtag.h"
@@ -262,9 +263,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
-            const char *target_subcmds[] = {"LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
+            const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
                                               "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 16, "TARGET sub-command")) {
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 18, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -365,7 +366,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("STATUS                 - Show current status\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
+        uart_cli_send("TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
+        uart_cli_send("                       LPC/LPC2 = LPC2xxx ARM7 (CRP@0x1FC)\r\n");
+        uart_cli_send("                       LPC17    = LPC Cortex-M family (CRP@0x2FC)\r\n");
         uart_cli_send("TARGET BOOT0 [HIGH|LOW]  - Set BOOT0 pin (GP13)\r\n");
         uart_cli_send("TARGET BOOT1 [HIGH|LOW]  - Set BOOT1 pin (GP14)\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
@@ -397,8 +400,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BL WRITE <addr> <hex>  - Write memory (hex byte string)\r\n");
         uart_cli_send("TARGET BL GO <addr>    - Jump to address\r\n");
         uart_cli_send("TARGET BL ERASE <page|ALL WIPE> - Erase flash page or mass erase\r\n");
-        uart_cli_send("TARGET BL RU WIPE      - Readout unprotect (mass erase + remove RDP)\r\n");
-        uart_cli_send("TARGET BL RP CONFIRM   - Readout protect (set RDP1)\r\n");
+        uart_cli_send("TARGET BL RU WIPE      - Readout unprotect (mass erase + remove RDP) [STM32]\r\n");
+        uart_cli_send("TARGET BL RP CONFIRM   - Readout protect (set RDP1) [STM32]\r\n");
+        uart_cli_send("TARGET BL UNLOCK       - Unlock destructive commands [LPC]\r\n");
+        uart_cli_send("TARGET BL CRP          - Read+decode CRP word at 0x1FC [LPC]\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Trigger Configuration ==\r\n");
         uart_cli_send("TRIGGER [NONE|GPIO|UART] - Configure/show trigger\r\n");
@@ -549,8 +554,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== Target ==\r\n");
         target_type_t target_type = target_get_type();
         const char* target_type_str = "NONE";
-        if (target_type == TARGET_LPC) {
-            target_type_str = "LPC";
+        if (target_is_lpc(target_type)) {
+            target_type_str = lpc_get_target_info_for(target_type)->name;
         } else if (target_is_stm32(target_type)) {
             const stm32_target_info_t *info = stm32_get_target_info(target_type);
             target_type_str = info ? info->name : "STM32";
@@ -977,13 +982,17 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
             goto api_response;
         }
 
-        if (strcmp(parts->parts[1], "LPC") == 0) {
+        if (strcmp(parts->parts[1], "LPC") == 0 ||
+            strcmp(parts->parts[1], "LPC2") == 0) {
             target_set_type(TARGET_LPC);
-            uart_cli_send("OK: Target type set to LPC (NXP ISP protocol)\r\n");
+            uart_cli_send("OK: Target type set to LPC2xxx (ARM7TDMI-S, CRP at 0x000001FC)\r\n");
+        } else if (strcmp(parts->parts[1], "LPC17") == 0) {
+            target_set_type(TARGET_LPC_CM);
+            uart_cli_send("OK: Target type set to LPC Cortex-M family (LPC17xx/18xx/43xx/etc., CRP at 0x000002FC)\r\n");
         } else if (strcmp(parts->parts[1], "STM32F1") == 0) {
             target_set_type(TARGET_STM32F1);
             uart_cli_send("OK: Target type set to STM32F1 (Cortex-M3, 128KB flash)\r\n");
@@ -1219,26 +1228,79 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "BL") == 0) {
             if (parts->count < 3) {
                 uart_cli_send("Usage: TARGET BL <command>\r\n");
-                uart_cli_send("  GET                  - Bootloader version + supported commands\r\n");
-                uart_cli_send("  GV                   - Get version + option bytes\r\n");
-                uart_cli_send("  GID                  - Chip product ID\r\n");
+                uart_cli_send("  GET                  - Bootloader version (STM32: GET, LPC: K)\r\n");
+                uart_cli_send("  GV                   - Get version + option bytes [STM32 only]\r\n");
+                uart_cli_send("  GID                  - Chip product ID (STM32: GID, LPC: J)\r\n");
                 uart_cli_send("  READ <addr> [count]  - Read memory (default 256 bytes)\r\n");
                 uart_cli_send("  WRITE <addr> <hex>   - Write hex bytes to memory\r\n");
-                uart_cli_send("  GO <addr>            - Jump to address\r\n");
+                uart_cli_send("  GO <addr>            - Jump to address (LPC: append T for Thumb)\r\n");
                 uart_cli_send("  ERASE <page|ALL WIPE> - Erase flash page or mass erase\r\n");
-                uart_cli_send("  RU WIPE              - Readout unprotect (mass erase!)\r\n");
-                uart_cli_send("  RP CONFIRM           - Readout protect (set RDP1)\r\n");
+                uart_cli_send("  RU WIPE              - Readout unprotect [STM32 only]\r\n");
+                uart_cli_send("  RP CONFIRM           - Readout protect [STM32 only]\r\n");
+                uart_cli_send("  UNLOCK               - Unlock destructive cmds [LPC only]\r\n");
+                uart_cli_send("  CRP [STATUS]         - Read+decode CRP word at 0x1FC [LPC only]\r\n");
+                uart_cli_send("  CRP INFO             - List CRP levels + magic values [LPC only]\r\n");
+                uart_cli_send("  CRP CHECK <hex>      - Decode a hypothetical CRP word [LPC only]\r\n");
                 uart_cli_send("Requires: TARGET SYNC first\r\n");
             } else {
-                const char *bl_cmds[] = {"GET", "GV", "GID", "READ", "WRITE", "GO", "ERASE", "RU", "RP"};
-                if (!match_and_replace(&parts->parts[2], bl_cmds, 9, "BL command")) {
+                const char *bl_cmds[] = {"GET", "GV", "GID", "READ", "WRITE", "GO", "ERASE", "RU", "RP", "UNLOCK", "CRP"};
+                if (!match_and_replace(&parts->parts[2], bl_cmds, 11, "BL command")) {
                     goto api_response;
+                }
+
+                // Reject cross-target commands BEFORE auto-sync so they fail fast
+                // instead of timing out on a sync attempt for the wrong protocol.
+                {
+                    bool tgt_lpc = target_is_lpc(target_get_type());
+                    const char *cmd2 = parts->parts[2];
+                    if (tgt_lpc) {
+                        if (strcmp(cmd2, "GV") == 0) {
+                            api_error("ERROR: GV not applicable for LPC (use GET)\r\n");
+                            goto api_response;
+                        }
+                        if (strcmp(cmd2, "RU") == 0) {
+                            api_error("ERROR: RU not applicable for LPC (use ERASE ALL WIPE)\r\n");
+                            goto api_response;
+                        }
+                        if (strcmp(cmd2, "RP") == 0) {
+                            api_error("ERROR: RP not applicable for LPC (write CRP word via WRITE)\r\n");
+                            goto api_response;
+                        }
+                    } else if (target_get_type() != TARGET_NONE) {
+                        if (strcmp(cmd2, "UNLOCK") == 0) {
+                            api_error("ERROR: UNLOCK is LPC-only (STM32 has no explicit unlock)\r\n");
+                            goto api_response;
+                        }
+                        if (strcmp(cmd2, "CRP") == 0) {
+                            api_error("ERROR: CRP is LPC-only (STM32 uses RDP — see GV or RU/RP)\r\n");
+                            goto api_response;
+                        }
+                    }
+                }
+
+                // Pre-sync dispatch for informational commands that don't touch the target.
+                if (target_is_lpc(target_get_type()) &&
+                    strcmp(parts->parts[2], "CRP") == 0 && parts->count >= 4) {
+                    const char *sub = parts->parts[3];
+                    if (strcasecmp(sub, "INFO") == 0) {
+                        lpc_bl_crp_info();
+                        goto api_response;
+                    }
+                    if (strcasecmp(sub, "CHECK") == 0) {
+                        if (parts->count < 5) {
+                            api_error("ERROR: Usage: TARGET BL CRP CHECK <hex-word>\r\n");
+                            goto api_response;
+                        }
+                        uint32_t crp_value = (uint32_t)strtoul(parts->parts[4], NULL, 16);
+                        lpc_bl_crp_check(crp_value);
+                        goto api_response;
+                    }
                 }
 
                 // Auto-sync: if bootloader not synced, run TARGET SYNC automatically
                 if (!target_is_bl_synced()) {
                     if (target_get_type() == TARGET_NONE) {
-                        api_error("ERROR: No target type set. Use TARGET <STM32F1|STM32F3|...> first\r\n");
+                        api_error("ERROR: No target type set. Use TARGET <LPC|STM32F1|STM32F3|...> first\r\n");
                         goto api_response;
                     }
                     uart_cli_send("Bootloader not synced — running TARGET SYNC...\r\n");
@@ -1276,12 +1338,15 @@ void command_parser_execute(cmd_parts_t *parts) {
                     }
                 }
 
+                bool is_lpc = target_is_lpc(target_get_type());
+
                 if (strcmp(parts->parts[2], "GET") == 0) {
-                    stm32_bl_get();
+                    if (is_lpc) lpc_bl_get(); else stm32_bl_get();
                 } else if (strcmp(parts->parts[2], "GV") == 0) {
-                    stm32_bl_get_version();
+                    if (is_lpc) api_error("ERROR: GV not applicable for LPC (use GET)\r\n");
+                    else stm32_bl_get_version();
                 } else if (strcmp(parts->parts[2], "GID") == 0) {
-                    stm32_bl_gid();
+                    if (is_lpc) lpc_bl_gid(); else stm32_bl_gid();
                 } else if (strcmp(parts->parts[2], "READ") == 0) {
                     if (parts->count < 4) {
                         api_error("ERROR: Usage: TARGET BL READ <addr> [count]\r\n");
@@ -1295,10 +1360,11 @@ void command_parser_execute(cmd_parts_t *parts) {
                             goto api_response;
                         }
                     }
-                    stm32_bl_read(addr, count);
+                    if (is_lpc) lpc_bl_read(addr, count);
+                    else stm32_bl_read(addr, count);
                 } else if (strcmp(parts->parts[2], "WRITE") == 0) {
                     if (parts->count < 5) {
-                        api_error("ERROR: Usage: TARGET BL WRITE <addr> <hex_bytes>\r\n");
+                        api_error("ERROR: Usage: TARGET BL WRITE <addr> <hex_bytes> [LOCK-CRP]\r\n");
                         goto api_response;
                     }
                     uint32_t addr = strtoul(parts->parts[3], NULL, 16);
@@ -1314,14 +1380,53 @@ void command_parser_execute(cmd_parts_t *parts) {
                         char byte_str[3] = {hex[i*2], hex[i*2+1], '\0'};
                         buf[i] = (uint8_t)strtoul(byte_str, NULL, 16);
                     }
-                    stm32_bl_write(addr, buf, data_len);
+                    if (is_lpc) {
+                        // CRP-write guard: any write overlapping the 4-byte CRP
+                        // word permanently locks the chip if the bytes happen to
+                        // spell one of the CRP magic values. Address is
+                        // family-dependent (0x1FC on ARM7 LPCs, 0x2FC on
+                        // Cortex-M LPCs) — pull it from the family info struct.
+                        const lpc_target_info_t *lpc_info = lpc_get_target_info();
+                        bool overlaps_crp = lpc_info->has_crp &&
+                            (addr <= lpc_info->crp_word_end) &&
+                            (addr + data_len - 1 >= lpc_info->crp_word_addr);
+                        bool got_token = (parts->count >= 6 &&
+                                          strcasecmp(parts->parts[5], "LOCK-CRP") == 0);
+                        if (overlaps_crp && !got_token) {
+                            uart_cli_printf("ERROR: write touches the CRP word at 0x%08lX.\r\n",
+                                            (unsigned long)lpc_info->crp_word_addr);
+                            uart_cli_send("       Writing the magic value PERMANENTLY locks the chip.\r\n");
+                            uart_cli_send("       Run TARGET BL CRP INFO for the level table, or CRP CHECK\r\n");
+                            uart_cli_send("       <hex> to see what a given value would do.\r\n");
+                            uart_cli_send("       To confirm, append LOCK-CRP:\r\n");
+                            uart_cli_send("         TARGET BL WRITE <addr> <hex> LOCK-CRP\r\n");
+                            api_error("ERROR: CRP-write guard tripped\r\n");
+                            goto api_response;
+                        }
+                        lpc_bl_write(addr, buf, data_len);
+                    } else {
+                        stm32_bl_write(addr, buf, data_len);
+                    }
                 } else if (strcmp(parts->parts[2], "GO") == 0) {
                     if (parts->count < 4) {
-                        api_error("ERROR: Usage: TARGET BL GO <addr>\r\n");
+                        api_error("ERROR: Usage: TARGET BL GO <addr> [T|A]\r\n");
                         goto api_response;
                     }
                     uint32_t addr = strtoul(parts->parts[3], NULL, 16);
-                    stm32_bl_go(addr);
+                    if (is_lpc) {
+                        bool thumb = false;
+                        if (parts->count >= 5) {
+                            if (parts->parts[4][0] == 'T' || parts->parts[4][0] == 't') thumb = true;
+                            else if (parts->parts[4][0] == 'A' || parts->parts[4][0] == 'a') thumb = false;
+                            else {
+                                api_error("ERROR: GO mode must be T (Thumb) or A (ARM)\r\n");
+                                goto api_response;
+                            }
+                        }
+                        lpc_bl_go(addr, thumb);
+                    } else {
+                        stm32_bl_go(addr);
+                    }
                 } else if (strcmp(parts->parts[2], "ERASE") == 0) {
                     if (parts->count < 4) {
                         api_error("ERROR: Usage: TARGET BL ERASE <page> or TARGET BL ERASE ALL WIPE\r\n");
@@ -1332,23 +1437,49 @@ void command_parser_execute(cmd_parts_t *parts) {
                             api_error("ERROR: Mass erase requires confirmation: TARGET BL ERASE ALL WIPE\r\n");
                             goto api_response;
                         }
-                        stm32_bl_erase(-1, true);
+                        if (is_lpc) lpc_bl_erase(-1, -1);
+                        else stm32_bl_erase(-1, true);
                     } else {
                         int page = (int)strtol(parts->parts[3], NULL, 0);
-                        stm32_bl_erase(page, false);
+                        if (is_lpc) lpc_bl_erase(page, page);
+                        else stm32_bl_erase(page, false);
                     }
                 } else if (strcmp(parts->parts[2], "RU") == 0) {
+                    if (is_lpc) {
+                        api_error("ERROR: RU not applicable for LPC (use ERASE ALL WIPE)\r\n");
+                        goto api_response;
+                    }
                     if (parts->count < 4 || strcasecmp(parts->parts[3], "WIPE") != 0) {
                         api_error("ERROR: Readout unprotect erases all flash! Confirm: TARGET BL RU WIPE\r\n");
                         goto api_response;
                     }
                     stm32_bl_readout_unprotect();
                 } else if (strcmp(parts->parts[2], "RP") == 0) {
+                    if (is_lpc) {
+                        api_error("ERROR: RP not applicable for LPC (write CRP word via WRITE)\r\n");
+                        goto api_response;
+                    }
                     if (parts->count < 4 || strcasecmp(parts->parts[3], "CONFIRM") != 0) {
                         api_error("ERROR: Readout protect locks flash! Confirm: TARGET BL RP CONFIRM\r\n");
                         goto api_response;
                     }
                     stm32_bl_readout_protect();
+                } else if (strcmp(parts->parts[2], "UNLOCK") == 0) {
+                    if (!is_lpc) {
+                        api_error("ERROR: UNLOCK is LPC-only (STM32 has no explicit unlock)\r\n");
+                        goto api_response;
+                    }
+                    lpc_bl_unlock();
+                } else if (strcmp(parts->parts[2], "CRP") == 0) {
+                    // INFO and CHECK are handled before auto-sync. Anything that
+                    // reaches here is "TARGET BL CRP" (bare) or an explicit
+                    // STATUS subcommand — both read the live CRP word.
+                    if (parts->count == 3 ||
+                        strcasecmp(parts->parts[3], "STATUS") == 0) {
+                        lpc_bl_crp();
+                    } else {
+                        api_error("ERROR: Unknown CRP subcommand. Use: STATUS, INFO, CHECK <hex>\r\n");
+                    }
                 }
             }
         } else if (strcmp(parts->parts[1], "GLITCH") == 0) {
@@ -3103,6 +3234,67 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uint16_t manuf = (idcode >> 1) & 0x7FF;
                 uart_cli_printf("  Version: %u, Part: 0x%04X, Manufacturer: 0x%03X\r\n",
                                version, part, manuf);
+
+                // Match against known ARM core / LPC family IDCODEs.
+                // Specific LPC chip identification requires reading the Part ID
+                // via the bootloader (TARGET BL GID) since LPC2xxx parts all share
+                // the same ARM7TDMI-S core IDCODE.
+                const char *core_desc = NULL;
+                const char *family    = NULL;
+                bool auto_lpc = false;
+                switch (idcode) {
+                    case 0x4F1F0F0F:
+                        core_desc = "ARM7TDMI-S (rev 4)";
+                        family    = "NXP LPC2xxx (LPC2138/2148/2378/2387/2388/2458/2468/2470/2478, etc.)";
+                        auto_lpc  = true;
+                        break;
+                    case 0x07926F0F:
+                        core_desc = "ARM7TDMI (rev 3)";
+                        family    = "Older NXP LPC21xx / Atmel AT91SAM7";
+                        break;
+                    case 0x14900F0F:
+                    case 0x15900F0F:
+                        core_desc = "ARM968E-S";
+                        family    = "NXP LPC2900 / LPC3xxx";
+                        break;
+                    case 0x4BA00477:
+                        core_desc = "ARM Cortex-M3 (generic)";
+                        family    = "LPC17xx / LPC13xx / STM32 / many vendors — use SWD IDCODE for chip detail";
+                        break;
+                    case 0x4BA02477:
+                        core_desc = "ARM Cortex-M4";
+                        family    = "LPC18xx / LPC43xx / STM32F3/F4 — use SWD IDCODE for chip detail";
+                        break;
+                    case 0x0BA00477:
+                        core_desc = "ARM Cortex-M0 / M0+";
+                        family    = "LPC8xx / LPC11xx — use SWD IDCODE for chip detail";
+                        break;
+                    case 0x4BA01477:
+                        core_desc = "ARM Cortex-M7";
+                        family    = "i.MX RT / LPC55xx — use SWD IDCODE for chip detail";
+                        break;
+                    default:
+                        break;
+                }
+                if (core_desc) {
+                    uart_cli_printf("  Core: %s\r\n", core_desc);
+                    uart_cli_printf("  Family: %s\r\n", family);
+                } else {
+                    uart_cli_send("  Core: unknown IDCODE (not in built-in table)\r\n");
+                }
+
+                if (auto_lpc) {
+                    target_set_type(TARGET_LPC);
+                    uart_cli_send("  TARGET auto-set to LPC2xxx (ARM7, CRP@0x1FC)\r\n");
+                    uart_cli_send("  Next: TARGET SYNC, then TARGET BL GID for specific part ID\r\n");
+                }
+                // Cortex-M IDCODEs (0x4BA00477 etc.) are shared by LPC17xx,
+                // STM32, and many other vendors — can't be sure it's an LPC.
+                // Hint at the LPC17 path for Cortex-M LPCs.
+                if (idcode == 0x4BA00477u || idcode == 0x4BA02477u ||
+                    idcode == 0x0BA00477u || idcode == 0x4BA01477u) {
+                    uart_cli_send("  Hint: if this is a Cortex-M LPC, use TARGET LPC17 (CRP@0x2FC).\r\n");
+                }
             } else {
                 api_error_printf("ERROR: No IDCODE (got 0x%08X)\r\n", idcode);
             }

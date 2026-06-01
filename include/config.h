@@ -48,7 +48,8 @@ typedef enum {
 // Target Types
 typedef enum {
     TARGET_NONE = 0,
-    TARGET_LPC,
+    TARGET_LPC,         // LPC2xxx (ARM7TDMI-S) — CRP word at 0x000001FC
+    TARGET_LPC_CM,      // LPC Cortex-M family (LPC17xx/11xx/12xx/13xx/18xx/43xx/54xxx) — CRP word at 0x000002FC
     TARGET_STM32F1,     // STM32F103 etc (Cortex-M3)
     TARGET_STM32F3,     // STM32F334 etc (Cortex-M4)
     TARGET_STM32F4,     // STM32F401/F429 etc (Cortex-M4)
@@ -58,6 +59,11 @@ typedef enum {
 // Helper to check if any STM32 family is selected
 static inline bool target_is_stm32(target_type_t t) {
     return t >= TARGET_STM32F1 && t <= TARGET_STM32L4;
+}
+
+// Helper to check if any LPC family is selected
+static inline bool target_is_lpc(target_type_t t) {
+    return t == TARGET_LPC || t == TARGET_LPC_CM;
 }
 
 // STM32 flash controller register map (varies by family)

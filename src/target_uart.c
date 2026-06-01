@@ -396,6 +396,7 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
     // Target-specific bootloader entry
     switch (current_target_type) {
         case TARGET_LPC:
+        case TARGET_LPC_CM:
             uart_cli_send("Entering LPC ISP bootloader mode...\r\n");
 
             // Clear response buffer
