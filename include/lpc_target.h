@@ -5,16 +5,30 @@
 #include <stdbool.h>
 #include "config.h"
 
+// Flash sector descriptor.
+typedef struct {
+    uint16_t number;        // sector number used in ISP P/E commands
+    uint32_t start_addr;    // first byte of the sector
+    uint32_t size_bytes;    // sector size (always a power of two)
+} lpc_sector_t;
+
 // Per-family info — picked up by lpc_get_target_info() based on the
 // currently-selected target type. The CRP word address is the main thing
 // that varies across LPC families (see comment block on LPC_CRP_WORD_ADDR
 // below for the table).
 typedef struct {
-    const char *name;             // "LPC2xxx (ARM7)" / "LPC Cortex-M"
-    uint32_t    crp_word_addr;    // 0x000001FC or 0x000002FC
-    uint32_t    crp_word_end;     // crp_word_addr + 3
-    bool        has_crp;          // false for LPC55xx-style (CMPA/PUF based)
+    const char        *name;             // "LPC2xxx (ARM7)" / "LPC Cortex-M"
+    uint32_t           crp_word_addr;    // 0x000001FC or 0x000002FC
+    uint32_t           crp_word_end;     // crp_word_addr + 3
+    bool               has_crp;          // false for LPC55xx-style (CMPA/PUF based)
+    const lpc_sector_t *sectors;         // sector table, sorted by start_addr
+    uint32_t           num_sectors;
+    uint32_t           ram_staging_addr; // safe RAM address for W → P → C staging
 } lpc_target_info_t;
+
+// Look up the sector containing `addr`; returns -1 if the address is not
+// in any user-accessible sector.
+int lpc_sector_for_addr(const lpc_target_info_t *info, uint32_t addr);
 
 // Return the info block for the current target type. Falls back to the
 // ARM7 (LPC2xxx) layout when no LPC target is selected, so callers can
@@ -36,6 +50,7 @@ void lpc_bl_unlock(void);                                    // U 23130
 void lpc_bl_crp(void);                                       // Read 0x1FC, decode
 void lpc_bl_crp_info(void);                                  // Print all CRP levels + magic values (no target talk)
 void lpc_bl_crp_check(uint32_t value);                       // Decode a hypothetical CRP word (no target talk)
+void lpc_bl_crp_set(uint8_t level);                          // Set CRP level (0..3) via sector-0 read-modify-write
 
 // CRP word — writing the magic values there permanently locks the chip.
 // The runtime address is family-dependent and comes from lpc_target_info_t:

@@ -1,0 +1,8 @@
+# Development-only Python dependencies. Pulls in the runtime set above
+# plus testing tooling. Keep this in a separate file so production users
+# of the host-side scripts don't have to install the test rig.
+
+-r requirements.txt
+
+# Test harness for tests/ (config-driven Pico CLI integration tests).
+pytest>=7.0

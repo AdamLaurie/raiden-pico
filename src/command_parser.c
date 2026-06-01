@@ -1241,6 +1241,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  CRP [STATUS]         - Read+decode CRP word at 0x1FC [LPC only]\r\n");
                 uart_cli_send("  CRP INFO             - List CRP levels + magic values [LPC only]\r\n");
                 uart_cli_send("  CRP CHECK <hex>      - Decode a hypothetical CRP word [LPC only]\r\n");
+                uart_cli_send("  CRP SET <0..3> LOCK-CRP - Re-program sector 0 with new CRP [LPC only]\r\n");
                 uart_cli_send("Requires: TARGET SYNC first\r\n");
             } else {
                 const char *bl_cmds[] = {"GET", "GV", "GID", "READ", "WRITE", "GO", "ERASE", "RU", "RP", "UNLOCK", "CRP"};
@@ -1472,13 +1473,38 @@ void command_parser_execute(cmd_parts_t *parts) {
                     lpc_bl_unlock();
                 } else if (strcmp(parts->parts[2], "CRP") == 0) {
                     // INFO and CHECK are handled before auto-sync. Anything that
-                    // reaches here is "TARGET BL CRP" (bare) or an explicit
-                    // STATUS subcommand — both read the live CRP word.
+                    // reaches here is "TARGET BL CRP" (bare), an explicit
+                    // STATUS, or a destructive SET <level> LOCK-CRP.
                     if (parts->count == 3 ||
                         strcasecmp(parts->parts[3], "STATUS") == 0) {
                         lpc_bl_crp();
+                    } else if (strcasecmp(parts->parts[3], "SET") == 0) {
+                        // TARGET BL CRP SET <level> LOCK-CRP
+                        if (parts->count < 5) {
+                            api_error("ERROR: Usage: TARGET BL CRP SET <0|1|2|3> LOCK-CRP\r\n");
+                            goto api_response;
+                        }
+                        uint32_t lvl = 0;
+                        if (!parse_u32(parts->parts[4], 10, &lvl) || lvl > 3) {
+                            api_error("ERROR: CRP level must be 0..3\r\n");
+                            goto api_response;
+                        }
+                        if (parts->count < 6 ||
+                            strcasecmp(parts->parts[5], "LOCK-CRP") != 0) {
+                            uart_cli_send("ERROR: TARGET BL CRP SET re-programs sector 0 and changes\r\n");
+                            uart_cli_send("       chip-wide debug+ISP behavior. Level 3 can brick the chip.\r\n");
+                            uart_cli_send("       To confirm, append LOCK-CRP:\r\n");
+                            uart_cli_send("         TARGET BL CRP SET <level> LOCK-CRP\r\n");
+                            api_error("ERROR: CRP SET requires LOCK-CRP token\r\n");
+                            goto api_response;
+                        }
+                        if (lvl == 3) {
+                            uart_cli_send("WARNING: CRP3 disables ISP-on-reset. Without user code that\r\n");
+                            uart_cli_send("         re-invokes the bootloader, the chip becomes locked.\r\n");
+                        }
+                        lpc_bl_crp_set((uint8_t)lvl);
                     } else {
-                        api_error("ERROR: Unknown CRP subcommand. Use: STATUS, INFO, CHECK <hex>\r\n");
+                        api_error("ERROR: Unknown CRP subcommand. Use: STATUS, INFO, CHECK <hex>, SET <level> LOCK-CRP\r\n");
                     }
                 }
             }

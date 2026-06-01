@@ -12,19 +12,62 @@
 
 // ----- Per-family target info -----
 
+// LPC2468 sector map (UM10237 §31.3):
+//   sectors 0..7   -> 8 × 4 KB    0x00000-0x07FFF
+//   sectors 8..21  -> 14 × 32 KB  0x08000-0x77FFF
+//   sectors 22..27 -> 6 × 4 KB    0x78000-0x7DFFF (user accessible)
+//   sectors 28..29 -> 2 × 4 KB    0x7E000-0x7FFFF (BOOT BLOCK — reserved,
+//                                                  ISP rc=14 on read)
+// We list only user-accessible sectors here so that mass-erase / sector
+// validation can't accidentally target the boot block.
+static const lpc_sector_t lpc2468_sectors[] = {
+    { 0, 0x00000000, 0x1000 }, { 1, 0x00001000, 0x1000 },
+    { 2, 0x00002000, 0x1000 }, { 3, 0x00003000, 0x1000 },
+    { 4, 0x00004000, 0x1000 }, { 5, 0x00005000, 0x1000 },
+    { 6, 0x00006000, 0x1000 }, { 7, 0x00007000, 0x1000 },
+    { 8, 0x00008000, 0x8000 }, { 9, 0x00010000, 0x8000 },
+    {10, 0x00018000, 0x8000 }, {11, 0x00020000, 0x8000 },
+    {12, 0x00028000, 0x8000 }, {13, 0x00030000, 0x8000 },
+    {14, 0x00038000, 0x8000 }, {15, 0x00040000, 0x8000 },
+    {16, 0x00048000, 0x8000 }, {17, 0x00050000, 0x8000 },
+    {18, 0x00058000, 0x8000 }, {19, 0x00060000, 0x8000 },
+    {20, 0x00068000, 0x8000 }, {21, 0x00070000, 0x8000 },
+    {22, 0x00078000, 0x1000 }, {23, 0x00079000, 0x1000 },
+    {24, 0x0007A000, 0x1000 }, {25, 0x0007B000, 0x1000 },
+    {26, 0x0007C000, 0x1000 }, {27, 0x0007D000, 0x1000 },
+};
+
 static const lpc_target_info_t lpc_arm7_info = {
-    .name          = "LPC2xxx (ARM7TDMI-S)",
-    .crp_word_addr = 0x000001FCu,
-    .crp_word_end  = 0x000001FFu,
-    .has_crp       = true,
+    .name             = "LPC2xxx (ARM7TDMI-S)",
+    .crp_word_addr    = 0x000001FCu,
+    .crp_word_end     = 0x000001FFu,
+    .has_crp          = true,
+    .sectors          = lpc2468_sectors,
+    .num_sectors      = sizeof(lpc2468_sectors) / sizeof(lpc2468_sectors[0]),
+    // ISP scratch / vector area lives below 0x40000200; pick a 256-byte aligned
+    // address well above the bootloader workspace per UM10237 §31.6.
+    .ram_staging_addr = 0x40001000u,
 };
 
 static const lpc_target_info_t lpc_cm_info = {
-    .name          = "LPC Cortex-M (17xx/11xx/13xx/18xx/43xx/54xxx)",
-    .crp_word_addr = 0x000002FCu,
-    .crp_word_end  = 0x000002FFu,
-    .has_crp       = true,
+    .name             = "LPC Cortex-M (17xx/11xx/13xx/18xx/43xx/54xxx)",
+    .crp_word_addr    = 0x000002FCu,
+    .crp_word_end     = 0x000002FFu,
+    .has_crp          = true,
+    .sectors          = NULL,   // TODO: per-family Cortex-M sector tables
+    .num_sectors      = 0,
+    .ram_staging_addr = 0x10001000u,  // typical LPC17xx local SRAM address
 };
+
+int lpc_sector_for_addr(const lpc_target_info_t *info, uint32_t addr) {
+    if (!info || !info->sectors) return -1;
+    for (uint32_t i = 0; i < info->num_sectors; i++) {
+        const lpc_sector_t *s = &info->sectors[i];
+        if (addr >= s->start_addr && addr < s->start_addr + s->size_bytes)
+            return (int)s->number;
+    }
+    return -1;
+}
 
 const lpc_target_info_t *lpc_get_target_info_for(target_type_t t) {
     switch (t) {
@@ -554,17 +597,349 @@ void lpc_bl_crp_check(uint32_t value) {
     }
 }
 
-// ----- Phase 2 stubs (destructive operations) -----
-// Implementing W+P+C, P+E, etc. needs a RAM staging area, sector tables,
-// and --destructive gating. Deferred until we exercise the read-only path
-// on hardware.
+// ----- Phase 2: destructive operations -----
+//
+// All of E / W / C require the bootloader to be UNLOCKED first
+// (U 23130). The user-facing dispatcher does NOT auto-unlock — the
+// rc=15 (CMD_LOCKED) hint is enough.
 
-void lpc_bl_write(uint32_t addr, const uint8_t *data, uint32_t len) {
-    (void)addr; (void)data; (void)len;
-    uart_cli_send("ERROR: LPC BL WRITE not yet implemented (phase 2)\r\n");
+// --- internal helpers --------------------------------------------------
+
+// Send "P start end" and validate rc=0.
+static int lpc_isp_prepare(int start, int end) {
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "P %d %d", start, end);
+    return lpc_send_cmd(cmd);
 }
 
+// LPC-variant UU encoder. Encodes up to 45 input bytes into a UU line
+// (length byte + 4 chars per 3-byte group). Returns number of chars
+// written (not counting the trailing NUL).
+static int lpc_uu_encode_line(const uint8_t *in, int n, char *out) {
+    if (n < 0 || n > 45) return -1;
+    out[0] = (n == 0) ? '`' : (char)(n + 0x20);
+    int pos = 1;
+    for (int i = 0; i < n; i += 3) {
+        uint8_t b0 = in[i];
+        uint8_t b1 = (i + 1 < n) ? in[i + 1] : 0;
+        uint8_t b2 = (i + 2 < n) ? in[i + 2] : 0;
+        int v0 = (b0 >> 2) & 0x3F;
+        int v1 = ((b0 & 0x3) << 4) | ((b1 >> 4) & 0xF);
+        int v2 = ((b1 & 0xF) << 2) | ((b2 >> 6) & 0x3);
+        int v3 = b2 & 0x3F;
+        out[pos++] = (v0 == 0) ? '`' : (char)(v0 + 0x20);
+        out[pos++] = (v1 == 0) ? '`' : (char)(v1 + 0x20);
+        out[pos++] = (v2 == 0) ? '`' : (char)(v2 + 0x20);
+        out[pos++] = (v3 == 0) ? '`' : (char)(v3 + 0x20);
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+// Send a UU-encoded buffer to RAM via the W command, with the LPC's
+// 20-line group + checksum + OK/RESEND handshake.
+//
+// Caller must have already validated that target is unlocked and the
+// RAM region is writable. Echo of each line is consumed.
+//
+// Returns 0 on success, negative LPC_RC_* / ISP rc on failure.
+static int lpc_isp_write_to_ram(uint32_t ram_addr, const uint8_t *data, uint32_t len) {
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "W %lu %lu", (unsigned long)ram_addr, (unsigned long)len);
+    int rc = lpc_send_cmd(cmd);
+    if (rc != 0) return rc;
+
+    char line_buf[80];
+    char ack_buf[96];   // big enough to swallow the echo of a 61-char UU line
+    uint32_t sent = 0;
+    uint32_t group_sum = 0;
+    int group_lines = 0;
+
+    while (sent < len) {
+        uint32_t remaining = len - sent;
+        int line_bytes = (remaining >= 45) ? 45 : (int)remaining;
+
+        lpc_uu_encode_line(data + sent, line_bytes, line_buf);
+
+        for (int i = 0; i < line_bytes; i++)
+            group_sum += data[sent + i];
+
+        // Send the encoded line + \r\n
+        lpc_send_str(line_buf);
+        uart_putc_raw(TARGET_UART_ID, '\r');
+        uart_putc_raw(TARGET_UART_ID, '\n');
+        uart_tx_wait_blocking(TARGET_UART_ID);
+
+        // Drain the echo of our line. If the LPC has echo disabled in
+        // W-mode, this just times out quickly; either way we continue.
+        (void)lpc_recv_line(ack_buf, sizeof(ack_buf), 500);
+
+        sent += (uint32_t)line_bytes;
+        group_lines++;
+
+        bool end_of_data = (sent >= len);
+        if (group_lines == 20 || end_of_data) {
+            // Send checksum line
+            char chk_line[16];
+            snprintf(chk_line, sizeof(chk_line), "%lu", (unsigned long)group_sum);
+            lpc_send_str(chk_line);
+            uart_putc_raw(TARGET_UART_ID, '\r');
+            uart_putc_raw(TARGET_UART_ID, '\n');
+            uart_tx_wait_blocking(TARGET_UART_ID);
+
+            // Drain the echo of the checksum line (if any).
+            (void)lpc_recv_line(ack_buf, sizeof(ack_buf), 500);
+
+            // Read OK or RESEND. LPC may emit a leading blank line first.
+            int n = lpc_recv_line(ack_buf, sizeof(ack_buf), 5000);
+            int skip = 0;
+            while (n == 0 && skip++ < 3)
+                n = lpc_recv_line(ack_buf, sizeof(ack_buf), 5000);
+            if (n < 0) return LPC_RC_TIMEOUT_DATA;
+            if (strncmp(ack_buf, "OK", 2) != 0) {
+                if (strncmp(ack_buf, "RESEND", 6) == 0)
+                    return LPC_RC_BAD_CHECKSUM;
+                return LPC_RC_BAD_CHECKSUM;
+            }
+
+            group_sum = 0;
+            group_lines = 0;
+        }
+    }
+    return 0;
+}
+
+// --- public phase 2 commands ------------------------------------------
+
 void lpc_bl_erase(int sector_start, int sector_end) {
-    (void)sector_start; (void)sector_end;
-    uart_cli_send("ERROR: LPC BL ERASE not yet implemented (phase 2)\r\n");
+    const lpc_target_info_t *info = lpc_get_target_info();
+    if (!info->sectors || info->num_sectors == 0) {
+        uart_cli_send("ERROR: no sector map for current LPC family\r\n");
+        return;
+    }
+
+    // Mass erase: (-1, -1) collapses to "all user-accessible sectors"
+    bool mass = (sector_start < 0 || sector_end < 0);
+    if (mass) {
+        sector_start = (int)info->sectors[0].number;
+        sector_end   = (int)info->sectors[info->num_sectors - 1].number;
+    }
+    if (sector_start > sector_end) {
+        uart_cli_send("ERROR: sector_start > sector_end\r\n");
+        return;
+    }
+
+    uart_cli_printf("Erasing sectors %d..%d%s ...\r\n",
+                    sector_start, sector_end, mass ? " (mass)" : "");
+
+    lpc_begin();
+    int rc = lpc_isp_prepare(sector_start, sector_end);
+    if (rc != 0) {
+        uart_cli_printf("ERROR: P failed: %s (rc=%d) — UNLOCK first?\r\n",
+                        lpc_rc_str(rc), rc);
+        lpc_end();
+        return;
+    }
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "E %d %d", sector_start, sector_end);
+    rc = lpc_send_cmd(cmd);
+    if (rc != 0) {
+        uart_cli_printf("ERROR: E failed: %s (rc=%d)\r\n", lpc_rc_str(rc), rc);
+        lpc_end();
+        return;
+    }
+    uart_cli_printf("OK: erased sectors %d..%d\r\n", sector_start, sector_end);
+    lpc_end();
+}
+
+void lpc_bl_write(uint32_t flash_addr, const uint8_t *data, uint32_t len) {
+    // LPC ISP Copy-RAM-to-Flash count must be 256 / 512 / 1024 / 4096.
+    if (len != 256 && len != 512 && len != 1024 && len != 4096) {
+        uart_cli_printf("ERROR: WRITE length must be 256/512/1024/4096 (got %lu)\r\n",
+                        (unsigned long)len);
+        return;
+    }
+    if (flash_addr & (len - 1)) {
+        uart_cli_printf("ERROR: flash_addr 0x%08lX not aligned to %lu\r\n",
+                        (unsigned long)flash_addr, (unsigned long)len);
+        return;
+    }
+    const lpc_target_info_t *info = lpc_get_target_info();
+    int s_start = lpc_sector_for_addr(info, flash_addr);
+    int s_end   = lpc_sector_for_addr(info, flash_addr + len - 1);
+    if (s_start < 0 || s_end < 0) {
+        uart_cli_printf("ERROR: flash 0x%08lX..0x%08lX not in any sector\r\n",
+                        (unsigned long)flash_addr,
+                        (unsigned long)(flash_addr + len - 1));
+        return;
+    }
+
+    uart_cli_printf("Writing %lu bytes to flash 0x%08lX via RAM 0x%08lX (sectors %d..%d)\r\n",
+                    (unsigned long)len, (unsigned long)flash_addr,
+                    (unsigned long)info->ram_staging_addr, s_start, s_end);
+
+    lpc_begin();
+
+    int rc = lpc_isp_write_to_ram(info->ram_staging_addr, data, len);
+    if (rc != 0) {
+        uart_cli_printf("ERROR: W (to RAM) failed: %s (rc=%d)\r\n",
+                        lpc_rc_str(rc), rc);
+        lpc_end();
+        return;
+    }
+
+    rc = lpc_isp_prepare(s_start, s_end);
+    if (rc != 0) {
+        uart_cli_printf("ERROR: P failed: %s (rc=%d)\r\n", lpc_rc_str(rc), rc);
+        lpc_end();
+        return;
+    }
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "C %lu %lu %lu",
+             (unsigned long)flash_addr,
+             (unsigned long)info->ram_staging_addr,
+             (unsigned long)len);
+    rc = lpc_send_cmd(cmd);
+    if (rc != 0) {
+        uart_cli_printf("ERROR: C failed: %s (rc=%d)\r\n", lpc_rc_str(rc), rc);
+        lpc_end();
+        return;
+    }
+
+    uart_cli_printf("OK: wrote %lu bytes to 0x%08lX\r\n",
+                    (unsigned long)len, (unsigned long)flash_addr);
+    lpc_end();
+}
+
+// --- CRP SET orchestrator ----------------------------------------------
+//
+// Reads sector 0 into a firmware buffer, patches the family CRP word,
+// erases sector 0, writes the modified buffer back. Avoids needing the
+// host to send 4 KB of hex over the CLI.
+
+// Read N bytes from `addr` into `out_buf` via the R command, with the
+// same UU group + checksum + OK handshake as lpc_bl_read but without
+// printing the hex dump. Returns 0 on success.
+static int lpc_isp_read_into_buf(uint32_t addr, uint32_t count, uint8_t *out_buf) {
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "R %lu %lu", (unsigned long)addr, (unsigned long)count);
+    int rc = lpc_send_cmd(cmd);
+    if (rc != 0) return rc;
+
+    uint32_t got = 0;
+    uint32_t group_sum = 0;
+    int group_lines = 0;
+    char line[80];
+    uint8_t dec_line[64];
+
+    while (got < count) {
+        int n = lpc_recv_line(line, sizeof(line), 3000);
+        if (n < 0) return LPC_RC_TIMEOUT_DATA;
+        if (n == 0) continue;
+
+        int dec = lpc_uu_decode(line, dec_line, sizeof(dec_line));
+        if (dec < 0) return LPC_RC_BAD_UU;
+        if (got + (uint32_t)dec > count) dec = (int)(count - got);
+        memcpy(out_buf + got, dec_line, (size_t)dec);
+        for (int i = 0; i < dec; i++) group_sum += dec_line[i];
+        got += (uint32_t)dec;
+        group_lines++;
+
+        bool eod = (got >= count);
+        if (group_lines == 20 || eod) {
+            int csn = lpc_recv_line(line, sizeof(line), 2000);
+            if (csn < 0) return LPC_RC_TIMEOUT_DATA;
+            uint32_t target_sum = (uint32_t)strtoul(line, NULL, 10);
+            if (target_sum != group_sum) {
+                lpc_send_str("RESEND\r\n");
+                return LPC_RC_BAD_CHECKSUM;
+            }
+            lpc_send_str("OK\r\n");
+            if (!eod)
+                (void)lpc_recv_line(line, sizeof(line), 2000);
+            group_sum = 0;
+            group_lines = 0;
+        }
+    }
+    return 0;
+}
+
+void lpc_bl_crp_set(uint8_t level) {
+    const lpc_target_info_t *info = lpc_get_target_info();
+    if (!info->has_crp) {
+        uart_cli_send("ERROR: this LPC family has no fixed CRP word\r\n");
+        return;
+    }
+    if (!info->sectors || info->num_sectors == 0) {
+        uart_cli_send("ERROR: no sector map for current LPC family\r\n");
+        return;
+    }
+
+    uint32_t magic;
+    const char *level_name;
+    switch (level) {
+        case 0: magic = 0xFFFFFFFFu; level_name = "NONE"; break;
+        case 1: magic = 0x12345678u; level_name = "CRP1"; break;
+        case 2: magic = 0x87654321u; level_name = "CRP2"; break;
+        case 3: magic = 0x43218765u; level_name = "CRP3"; break;
+        default:
+            uart_cli_printf("ERROR: invalid CRP level %u (use 0..3)\r\n", level);
+            return;
+    }
+
+    // Find sector 0 (the one containing the CRP word).
+    int sec = lpc_sector_for_addr(info, info->crp_word_addr);
+    if (sec < 0) {
+        uart_cli_send("ERROR: CRP word address not in any mapped sector\r\n");
+        return;
+    }
+    const lpc_sector_t *s0 = NULL;
+    for (uint32_t i = 0; i < info->num_sectors; i++) {
+        if (info->sectors[i].number == (uint32_t)sec) { s0 = &info->sectors[i]; break; }
+    }
+    if (!s0) { uart_cli_send("ERROR: sector lookup failed\r\n"); return; }
+
+    if (s0->size_bytes != 4096) {
+        uart_cli_printf("ERROR: CRP-set assumes a 4 KB CRP sector (this one is %lu bytes)\r\n",
+                        (unsigned long)s0->size_bytes);
+        return;
+    }
+
+    static uint8_t sector_buf[4096];
+
+    // 1. Read existing sector contents
+    uart_cli_printf("Reading sector %d (0x%08lX..0x%08lX)...\r\n",
+                    sec, (unsigned long)s0->start_addr,
+                    (unsigned long)(s0->start_addr + s0->size_bytes - 1));
+    lpc_begin();
+    int rc = lpc_isp_read_into_buf(s0->start_addr, s0->size_bytes, sector_buf);
+    lpc_end();
+    if (rc != 0) {
+        uart_cli_printf("ERROR: read failed: %s (rc=%d)\r\n", lpc_rc_str(rc), rc);
+        return;
+    }
+
+    // 2. Patch the CRP word (little-endian)
+    uint32_t off = info->crp_word_addr - s0->start_addr;
+    sector_buf[off + 0] = (uint8_t)(magic & 0xFF);
+    sector_buf[off + 1] = (uint8_t)((magic >> 8) & 0xFF);
+    sector_buf[off + 2] = (uint8_t)((magic >> 16) & 0xFF);
+    sector_buf[off + 3] = (uint8_t)((magic >> 24) & 0xFF);
+    uart_cli_printf("Patched CRP word at 0x%08lX -> 0x%08lX (%s)\r\n",
+                    (unsigned long)info->crp_word_addr,
+                    (unsigned long)magic, level_name);
+
+    // 3. Auto-unlock (the LOCK-CRP token at the CLI was the user's consent)
+    uart_cli_send("Auto-unlocking bootloader...\r\n");
+    lpc_bl_unlock();
+
+    // 4. Erase the sector
+    lpc_bl_erase(sec, sec);
+
+    // 5. Write the patched buffer back
+    lpc_bl_write(s0->start_addr, sector_buf, s0->size_bytes);
+
+    uart_cli_printf("OK: CRP set to %s. Power-cycle the target for it to take effect.\r\n",
+                    level_name);
 }

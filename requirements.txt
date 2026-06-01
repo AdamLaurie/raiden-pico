@@ -1,0 +1,12 @@
+# Runtime Python dependencies for raiden-pico host-side scripts.
+# Used by glitch_heatmap.py, jtag_glitch_heatmap.py, the scripts/ helpers,
+# etc. GitHub's dependency graph picks this file up automatically.
+
+# Serial port access — every host-side script that talks to the Pico CLI
+# (TARGET BL ..., SWD, JTAG, ChipSHOUTER, Grbl) goes through pyserial.
+pyserial>=3.5
+
+# Trace analysis / plotting — used by scripts/stm32_single_trace.py and
+# scripts/stm32_dual_trace.py for DWT-cycle-count + ADC-shunt visualization.
+numpy>=1.20
+matplotlib>=3.4
