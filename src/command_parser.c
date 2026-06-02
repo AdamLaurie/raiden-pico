@@ -13,6 +13,8 @@
 #include "pico/bootrom.h"
 #include "hardware/regs/sysinfo.h"
 #include "hardware/structs/sysinfo.h"
+#include "hardware/adc.h"
+#include "hardware/gpio.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -249,9 +251,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
         "HELP", "REBOOT", "DEBUG", "API", "ERROR", "SWD", "JTAG",
-        "TRACE", "VERSION", "CLOCK", "GRBL"
+        "TRACE", "VERSION", "CLOCK", "GRBL", "ADC"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 22, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 23, "command")) {
         goto api_response;
     }
 
@@ -410,6 +412,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
         uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
         uart_cli_send("TRIGGER UART <byte> [TX|RX] - UART byte trigger (TX=Raiden TX, RX=Raiden RX)\r\n");
+        uart_cli_send("\r\n");
+        uart_cli_send("== ADC ==\r\n");
+        uart_cli_send("ADC                    - Read both: GP26 (target VDD) + GP27 (shunt)\r\n");
+        uart_cli_send("ADC 1                  - Read GP26 only (target VDD monitor)\r\n");
+        uart_cli_send("ADC 2                  - Read GP27 only (shunt current monitor)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ADC Trace (GP27/ADC1 shunt current) ==\r\n");
         uart_cli_send("TRACE                  - Show trace status\r\n");
@@ -3394,6 +3401,45 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else {
             uart_cli_send("No error recorded\r\n");
+        }
+
+    } else if (strcmp(parts->parts[0], "ADC") == 0) {
+        // One-shot read of the two ADC inputs.
+        //   ADC          → both channels
+        //   ADC 1        → GP26 / ADC0 only  (target VDD monitor)
+        //   ADC 2        → GP27 / ADC1 only  (shunt current monitor)
+        //
+        // NOTE: do NOT call adc_gpio_init() — on RP2350 it leaves the pin
+        // in a state that latches HIGH and won't release until the next
+        // gpio_init() or reboot. The ADC analog mux still samples the pin
+        // correctly even without changing the pin function, since the
+        // analog path is independent of the digital function.
+        adc_init();
+
+        int which = 0;  // 0 = both
+        if (parts->count >= 2) {
+            if (strcmp(parts->parts[1], "1") == 0) {
+                which = 1;
+            } else if (strcmp(parts->parts[1], "2") == 0) {
+                which = 2;
+            } else {
+                api_error("ERROR: Usage: ADC [1|2]   (1=GP26 power, 2=GP27 shunt)\r\n");
+                goto api_response;
+            }
+        }
+        if (which == 0 || which == 1) {
+            adc_select_input(0);
+            uint16_t raw = adc_read();
+            float v = raw * 3.3f / 4095.0f;
+            uart_cli_printf("ADC1 (GP26, target VDD): raw=%u  voltage=%.3fV\r\n",
+                            raw, v);
+        }
+        if (which == 0 || which == 2) {
+            adc_select_input(1);
+            uint16_t raw = adc_read();
+            float v = raw * 3.3f / 4095.0f;
+            uart_cli_printf("ADC2 (GP27, shunt):      raw=%u  voltage=%.3fV\r\n",
+                            raw, v);
         }
 
     } else if (strcmp(parts->parts[0], "TRACE") == 0) {
