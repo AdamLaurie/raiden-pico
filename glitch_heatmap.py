@@ -55,8 +55,19 @@ parser.add_argument('--no-dump', action='store_true',
 parser.add_argument('--dump-size', type=lambda v: int(v, 0), default=0x7E000,
                     help='Bytes to dump on a successful glitch (default 0x7E000 = 504 KB, LPC2468 user flash)')
 parser.add_argument('--shots', type=int, default=15,
-                    help='Shots per position (default 15). Bigger value = better statistical confidence at each cell.')
+                    help='Shots per cell (default 15). In quickmap mode this is the TOTAL shot budget per cell across all voltage levels (settle count is --confirm). In slow mode this is shots per voltage level. In fixed mode this is total shots per cell.')
+parser.add_argument('--confirm', type=int, default=5,
+                    help='QUICKMAP only — consecutive normals at one voltage to declare the cell "settled" (default 5). Smaller = faster; larger = more confident the voltage is safe.')
+parser.add_argument('--always-sync', action='store_true',
+                    help='Re-sync the target before every shot (strict cycling). Default skips sync after a clean rc=19 (normal) shot since the LPC stays in ISP-ready state, which is ~3x faster but assumes the previous read didn\'t leave the bootloader in an unknown state.')
+parser.add_argument('--slow-sweep', action='store_true',
+                    help='Legacy mode: run --shots N shots at the start voltage, then binary-search-optimize voltage. Slower but produces full hit-rate maps at each cell. Default is quickmap (drop voltage on first non-normal, settle on N consecutive normals).')
+parser.add_argument('--fixed-voltage', type=int, default=None,
+                    help='Lock CS voltage to this value across every position (no sweep, no optimization). Useful for detailed scans at a known threshold. Mutually exclusive with --slow-sweep.')
 args = parser.parse_args()
+
+if args.slow_sweep and args.fixed_voltage is not None:
+    parser.error("--slow-sweep and --fixed-voltage are mutually exclusive")
 
 # Determine direction (default is forward)
 REVERSE_SPIRAL = args.reverse and not args.forward
@@ -109,6 +120,18 @@ server_ready = threading.Event()
 # Progress / ETA tracking — set by main loop, consumed by broadcast_* helpers
 total_points = (SIZE + 1) * (SIZE + 1)
 scan_start_time = None
+
+# Scan bounding box — resolve early so the web UI's footer can show the
+# right info before the (slow) ChipSHOUTER setup completes.
+SCAN_XMIN = X_MIN if X_MIN is not None else 0
+SCAN_XMAX = X_MAX if X_MAX is not None else SIZE
+SCAN_YMIN = Y_MIN if Y_MIN is not None else 0
+SCAN_YMAX = Y_MAX if Y_MAX is not None else SIZE
+_scan_w = SCAN_XMAX - SCAN_XMIN + 1
+_scan_h = SCAN_YMAX - SCAN_YMIN + 1
+SCAN_INFO = (f"Window x=[{SCAN_XMIN},{SCAN_XMAX}] y=[{SCAN_YMIN},{SCAN_YMAX}] "
+             f"({_scan_w}x{_scan_h} cells, {_scan_w * _scan_h} positions). "
+             f"Spiral scan local to window. Hover for details.")
 
 # CSV log file
 CSV_FILE = f"glitch_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -301,7 +324,7 @@ HTML_PAGE = '''<!DOCTYPE html>
     </div>
 
     <div id="tooltip"></div>
-    <div id="info">25x25mm grid (15px/cell). Spiral scan pattern. Hover for details.</div>
+    <div id="info">{{SCAN_INFO}}</div>
 
     <script>
         const canvasHitRate = document.getElementById('gridHitRate');
@@ -609,7 +632,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode())
+            self.wfile.write(HTML_PAGE.replace("{{SCAN_INFO}}", SCAN_INFO).encode())
 
         elif self.path == '/events':
             self.send_response(200)
@@ -970,11 +993,10 @@ def run_glitch_test(x, y, voltage):
     if not check_and_reset_chipshouter():
         return 'cs_error'
 
-    # Setup trigger and arm
-    send_cmd(f"TRIGGER UART {TRIGGER_BYTE_HEX}")
-    send_cmd("SET PAUSE 5000")
-    send_cmd("SET WIDTH 150")
-    send_cmd("SET COUNT 1")
+    # TRIGGER UART + SET PAUSE/WIDTH/COUNT are set ONCE at script startup
+    # by configure_glitch_trigger() — they persist on the Pico across
+    # commands. Only the one-shot ARM has to be re-issued each shot
+    # (COUNT=1 means the glitcher disarms automatically after firing).
     send_cmd("ARM ON")
 
     # Pick read size based on mode.
@@ -1017,7 +1039,14 @@ def run_glitch_test(x, y, voltage):
                     saw_ok_marker = True
                 elif "ERROR" in ln:
                     saw_other_error = True
-            if saw_ok_marker or saw_rc19:
+            if saw_ok_marker or saw_rc19 or saw_other_error:
+                # Command terminated — short drain to swallow the trailing
+                # prompt so the next shot's send_cmd doesn't trip on it.
+                drain_end = time.time() + 0.2
+                while time.time() < drain_end:
+                    d2 = s.read(s.in_waiting or 1)
+                    if not d2:
+                        break
                 break
         elif time.time() - last_data > idle_limit:
             break
@@ -1077,14 +1106,22 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
     retries = 0
     max_retries = 3
     glitch_found = False
+    # After a clean rc=19 response the LPC stays in ISP-ready state, so we
+    # can skip the full TARGET SYNC handshake on the next shot (~3x faster).
+    # --always-sync forces strict per-shot cycling for cases where you want
+    # the target to start each shot from a known cold reset.
+    last_result = None  # 'normal' / 'effect' / 'glitch' / None
 
     while completed < shots:
-        # Sync with target before each test
-        if not sync_target():
+        # Sync target unless the previous shot left it cleanly in ISP-ready
+        # state and the user hasn't asked for strict cycling.
+        need_sync = (last_result != 'normal') or args.always_sync
+        if need_sync and not sync_target():
             print(f"S", end='', flush=True)  # S = sync failed
             log_test(x, y, voltage, completed + 1, 'sync_fail')
             hits += 1
             completed += 1
+            last_result = 'sync_fail'
             continue
 
         result = run_glitch_test(x, y, voltage)
@@ -1101,6 +1138,7 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
 
         retries = 0  # Reset retry counter on success
         completed += 1
+        last_result = result
 
         # Log the test result
         log_test(x, y, voltage, completed, result)
@@ -1123,6 +1161,108 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
 
     hit_rate = hits / max(completed, 1)
     return hit_rate, completed, glitch_found
+
+
+def test_position_quickmap(x, y, start_voltage):
+    """Quickmap voltage sweep at one position.
+
+    Walk from start_voltage downward in CS_VOLTAGE_STEP increments. At each
+    voltage, take shots until we either see CONFIRM_NORMALS consecutive
+    'normal' results (settled — return that voltage) or get a non-normal
+    (immediately drop voltage and start again). Bail at CS_VOLTAGE_MIN or
+    when SHOTS_PER_POSITION total shots have been taken.
+
+    --shots and --confirm are independent: --shots caps the total work per
+    cell (across all voltage levels), --confirm sets how many consecutive
+    normals at one voltage we need to call the cell "settled".
+
+    Returns: (settle_voltage, glitch_found, perturbable)
+        settle_voltage — lowest voltage we got CONFIRM_NORMALS consecutive
+                         normals at, or CS_VOLTAGE_MIN if we never settled.
+        glitch_found   — True if any shot at any voltage was 'glitch'.
+        perturbable    — True if any shot at any voltage was non-normal.
+    """
+    global current_voltage
+
+    voltage = start_voltage
+    glitch_found = False
+    perturbable = False
+    last_result = None
+    total_shots = 0
+    cs_error_retries = 0
+    cs_error_max = 5  # bail if CS keeps faulting (independent of total_shots cap)
+    confirm_target = args.confirm
+    total_cap = SHOTS_PER_POSITION  # already = args.shots, total budget per cell
+
+    while voltage >= CS_VOLTAGE_MIN and total_shots < total_cap and cs_error_retries < cs_error_max:
+        if current_voltage != voltage:
+            set_chipshouter_voltage(voltage)
+            current_voltage = voltage
+            last_result = None  # voltage change → re-sync
+
+        consecutive_normals = 0
+        non_normal_seen = False
+
+        while (consecutive_normals < confirm_target and total_shots < total_cap
+               and cs_error_retries < cs_error_max):
+            need_sync = (last_result != 'normal') or args.always_sync
+            if need_sync and not sync_target():
+                print('S', end='', flush=True)
+                total_shots += 1
+                log_test(x, y, voltage, total_shots, 'sync_fail')
+                broadcast_shot(x, y, total_shots, total_cap, voltage, 'sync_fail')
+                last_result = 'sync_fail'
+                continue
+
+            result = run_glitch_test(x, y, voltage)
+
+            if result == 'cs_error':
+                print('R', end='', flush=True)
+                log_test(x, y, voltage, total_shots + 1, 'cs_error')
+                cs_error_retries += 1
+                # don't count toward total_shots
+                continue
+
+            cs_error_retries = 0  # reset on any non-cs_error shot
+            last_result = result
+            total_shots += 1
+            log_test(x, y, voltage, total_shots, result)
+            broadcast_shot(x, y, total_shots, total_cap, voltage, result)
+
+            if result == 'normal':
+                consecutive_normals += 1
+                print('.', end='', flush=True)
+            elif result == 'glitch':
+                glitch_found = True
+                perturbable = True
+                print('+', end='', flush=True)
+                non_normal_seen = True
+                break  # drop voltage immediately
+            else:  # 'effect'
+                perturbable = True
+                print('!', end='', flush=True)
+                non_normal_seen = True
+                break  # drop voltage immediately
+
+            time.sleep(0.2)
+
+        if consecutive_normals >= confirm_target and not non_normal_seen:
+            # Settled — all-normal at this voltage
+            return (voltage, glitch_found, perturbable)
+
+        if cs_error_retries >= cs_error_max:
+            # CS stuck — give up on this cell to avoid burning the rest of the scan
+            print(f' [CS-STUCK]', end='', flush=True)
+            return (voltage, glitch_found, perturbable)
+
+        # Non-normal seen → drop voltage and re-test
+        voltage -= CS_VOLTAGE_STEP
+        if voltage >= CS_VOLTAGE_MIN:
+            print(f' [{voltage}V]', end='', flush=True)
+
+    # Floor reached without settling — position is perturbable at the min voltage
+    return (CS_VOLTAGE_MIN, glitch_found, perturbable)
+
 
 def optimize_voltage(x, y, initial_hit_rate, initial_glitch):
     """
@@ -1284,6 +1424,18 @@ def setup_chipshouter():
 
 setup_chipshouter()
 
+# These settings persist on the Pico across commands until reboot, so set
+# them ONCE at startup rather than re-sending every shot. Saves ~0.5s/shot.
+print("=== Configuring glitch trigger ===", flush=True)
+print(f"  TRIGGER UART {TRIGGER_BYTE_HEX}", flush=True)
+send_cmd(f"TRIGGER UART {TRIGGER_BYTE_HEX}")
+print("  SET PAUSE 5000  (33.3 us @ 150 MHz)", flush=True)
+send_cmd("SET PAUSE 5000")
+print("  SET WIDTH 150   (1.0 us @ 150 MHz)", flush=True)
+send_cmd("SET WIDTH 150")
+print("  SET COUNT 1     (one-shot per ARM)", flush=True)
+send_cmd("SET COUNT 1")
+
 mode_str = "REVERSE" if REVERSE_SPIRAL else "FORWARD"
 print(f"\n=== Starting Glitch Heat Map ({mode_str}) ===", flush=True)
 print(f"Grid: {SIZE+1}x{SIZE+1} = {(SIZE+1)**2} positions", flush=True)
@@ -1293,56 +1445,49 @@ print(f"CSV log: {CSV_FILE}", flush=True)
 print("View heat map at http://localhost:8080", flush=True)
 
 # Generate forward spiral points first, then reverse
-def generate_spiral_points(size):
-    """Generate all points in forward spiral order (0,0) -> center"""
+def generate_spiral_points(x_min, x_max, y_min, y_max):
+    """Generate spiral points within an inclusive [x_min,x_max] × [y_min,y_max]
+    bounding box, starting at the (x_min, y_min) corner and spiraling inward
+    to the center. Walks each layer's perimeter contiguously so consecutive
+    visited cells are physically adjacent (no jumps)."""
     points = []
     offset = 0
-    while offset <= size // 2:
-        min_c = offset
-        max_c = size - offset
-
-        if min_c > max_c:
+    while True:
+        xa, xb = x_min + offset, x_max - offset
+        ya, yb = y_min + offset, y_max - offset
+        if xa > xb or ya > yb:
             break
-
-        if min_c == max_c:
-            points.append((min_c, min_c))
+        if xa == xb and ya == yb:
+            points.append((xa, ya))
             break
-
-        # Start at corner
-        points.append((min_c, min_c))
-
-        # Bottom edge: left to right
-        for x in range(min_c + 1, max_c + 1):
-            points.append((x, min_c))
-
-        # Right edge: bottom to top
-        for y in range(min_c + 1, max_c + 1):
-            points.append((max_c, y))
-
-        # Top edge: right to left
-        for x in range(max_c - 1, min_c - 1, -1):
-            points.append((x, max_c))
-
-        # Left edge: top to bottom (stop before corner)
-        for y in range(max_c - 1, min_c, -1):
-            points.append((min_c, y))
-
+        if xa == xb:
+            for y in range(ya, yb + 1):
+                points.append((xa, y))
+            break
+        if ya == yb:
+            for x in range(xa, xb + 1):
+                points.append((x, ya))
+            break
+        # Bottom-left corner
+        points.append((xa, ya))
+        # Bottom edge: left → right
+        for x in range(xa + 1, xb + 1):
+            points.append((x, ya))
+        # Right edge: bottom → top
+        for y in range(ya + 1, yb + 1):
+            points.append((xb, y))
+        # Top edge: right → left
+        for x in range(xb - 1, xa - 1, -1):
+            points.append((x, yb))
+        # Left edge: top → bottom (stop before bottom corner)
+        for y in range(yb - 1, ya, -1):
+            points.append((xa, y))
         offset += 1
-
     return points
 
-# Generate spiral points
-spiral_points = generate_spiral_points(SIZE)
-
-# Apply bounding box if requested
-if any(v is not None for v in (X_MIN, X_MAX, Y_MIN, Y_MAX)):
-    xmin = X_MIN if X_MIN is not None else 0
-    xmax = X_MAX if X_MAX is not None else SIZE
-    ymin = Y_MIN if Y_MIN is not None else 0
-    ymax = Y_MAX if Y_MAX is not None else SIZE
-    spiral_points = [(x, y) for (x, y) in spiral_points
-                     if xmin <= x <= xmax and ymin <= y <= ymax]
-    print(f"Bounding box: x=[{xmin},{xmax}] y=[{ymin},{ymax}] -> {len(spiral_points)} points", flush=True)
+# Generate the spiral local to the bounding box — no global-spiral filter.
+spiral_points = generate_spiral_points(SCAN_XMIN, SCAN_XMAX, SCAN_YMIN, SCAN_YMAX)
+print(f"Bounding box: x=[{SCAN_XMIN},{SCAN_XMAX}] y=[{SCAN_YMIN},{SCAN_YMAX}] -> {len(spiral_points)} points", flush=True)
 
 if REVERSE_SPIRAL:
     spiral_points.reverse()
@@ -1366,36 +1511,75 @@ print(f"Spiral: {len(spiral_points)} points, {direction_str}", flush=True)
 total_points = len(spiral_points)
 scan_start_time = time.time()
 
+# Decide the scan mode once
+SCAN_MODE = ('fixed' if args.fixed_voltage is not None
+             else 'slow' if args.slow_sweep
+             else 'quickmap')
+print(f"\n=== Scan mode: {SCAN_MODE} ===", flush=True)
+if SCAN_MODE == 'fixed':
+    print(f"  Fixed voltage: {args.fixed_voltage}V, --shots {SHOTS_PER_POSITION} per position", flush=True)
+elif SCAN_MODE == 'slow':
+    print(f"  Slow sweep: --shots {SHOTS_PER_POSITION} per voltage + binary-search optimizer", flush=True)
+else:
+    print(f"  Quickmap: drop voltage on first non-normal, settle on {args.confirm} consecutive normals (total cap --shots {SHOTS_PER_POSITION})", flush=True)
+
 # Process each point
 for i, (x, y) in enumerate(spiral_points):
     print(f"\n[{i+1}/{len(spiral_points)}] Position ({x},{y}):", end='', flush=True)
 
-    # Reset voltage to starting level before each new position
-    if current_voltage != CS_VOLTAGE:
-        print(f" [reset to {CS_VOLTAGE}V]", end='', flush=True)
-        set_chipshouter_voltage(CS_VOLTAGE)
-        send_cmd("CS ARM")
-        time.sleep(0.3)
+    if SCAN_MODE == 'fixed':
+        # Fixed-voltage detailed scan — no sweep, no drop.
+        if current_voltage != args.fixed_voltage:
+            set_chipshouter_voltage(args.fixed_voltage)
+        grbl_move(x, y)
+        broadcast_move(x, y, current_voltage)
+        print(' ', end='', flush=True)
+        hit_rate, _, glitch_found = test_position(x, y, current_voltage)
+        print(f" {hit_rate*100:.0f}%", flush=True)
+        broadcast_result(x, y, hit_rate, current_voltage,
+                         special=('glitch' if glitch_found else None))
 
-    grbl_move(x, y)
-    broadcast_move(x, y, current_voltage)
-    print(f" ", end='', flush=True)
-    hit_rate, _, glitch_found = test_position(x, y, current_voltage)
-    print(f" {hit_rate*100:.0f}%", flush=True)
+    elif SCAN_MODE == 'slow':
+        # Legacy mode: full --shots at the start voltage, then optimize.
+        if current_voltage != CS_VOLTAGE:
+            print(f" [reset to {CS_VOLTAGE}V]", end='', flush=True)
+            set_chipshouter_voltage(CS_VOLTAGE)
+            send_cmd("CS ARM")
+            time.sleep(0.3)
+        grbl_move(x, y)
+        broadcast_move(x, y, current_voltage)
+        print(' ', end='', flush=True)
+        hit_rate, _, glitch_found = test_position(x, y, current_voltage)
+        print(f" {hit_rate*100:.0f}%", flush=True)
+        if glitch_found:
+            print(f"    GLITCH FOUND! Marking as blue.", flush=True)
+            broadcast_result(x, y, hit_rate, current_voltage, special='glitch')
+            continue
+        start_v = current_voltage
+        if hit_rate > 0:
+            hit_rate, opt_voltage, was_optimized, special, threshold_v = optimize_voltage(x, y, hit_rate, glitch_found)
+            broadcast_result(x, y, hit_rate, opt_voltage, was_optimized, start_v, special=special, threshold=threshold_v)
+        else:
+            broadcast_result(x, y, hit_rate, current_voltage)
 
-    # If glitch found, mark blue and move on immediately
-    if glitch_found:
-        print(f"    GLITCH FOUND! Marking as blue.", flush=True)
-        broadcast_result(x, y, hit_rate, current_voltage, special='glitch')
-        continue
-
-    start_v = current_voltage
-    # Optimize voltage if ANY hits were detected (not just >50%)
-    if hit_rate > 0:
-        hit_rate, opt_voltage, was_optimized, special, threshold_v = optimize_voltage(x, y, hit_rate, glitch_found)
-        broadcast_result(x, y, hit_rate, opt_voltage, was_optimized, start_v, special=special, threshold=threshold_v)
     else:
-        broadcast_result(x, y, hit_rate, current_voltage)
+        # Quickmap (default): drop voltage on first non-normal.
+        # Always restart each position at CS_VOLTAGE (no carryover) so per-
+        # cell results are independent — neighbour cells shouldn't bias the
+        # voltage we test at.
+        if current_voltage != CS_VOLTAGE:
+            print(f" [reset to {CS_VOLTAGE}V]", end='', flush=True)
+            set_chipshouter_voltage(CS_VOLTAGE)
+        grbl_move(x, y)
+        broadcast_move(x, y, current_voltage)
+        print(' ', end='', flush=True)
+        settle_v, glitch_found, perturbable = test_position_quickmap(x, y, CS_VOLTAGE)
+        hit_rate = 1.0 if perturbable else 0.0
+        special = 'glitch' if glitch_found else None
+        print(f" settled at {settle_v}V (perturbable={perturbable})", flush=True)
+        broadcast_result(x, y, hit_rate, settle_v,
+                         special=special,
+                         threshold=settle_v if perturbable else None)
 
 print("\n=== Heat Map Complete! ===", flush=True)
 print(f"Total positions tested: {len(visited)}", flush=True)

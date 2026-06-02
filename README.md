@@ -708,19 +708,89 @@ The project includes Python scripts for automated XY scanning with real-time hea
 
 ### Live Heatmap (`glitch_heatmap.py`)
 
-Run automated scans with live web-based visualization:
+Run automated EM-glitch scans of a CRP-protected target with live web-based
+visualization. The script drives the XY platform (Grbl), the ChipSHOUTER,
+and the Pico glitcher in lockstep — each cell of the grid is hit with one
+or more EM pulses while the target attempts an ISP read of flash. Each
+shot's response is classified:
+
+- **`normal`** — target replied with `rc=19 / CODE_READ_PROTECTION_ENABLED`.
+  CRP held; glitch missed.
+- **`effect`** — target perturbed: no reply, garbled reply, or any other
+  unexpected error. The target was disrupted but CRP wasn't bypassed.
+- **`glitch`** — target replied with real flash content (the BL READ
+  succeeded). **CRP bypassed!** In the default dump mode the full flash
+  range is saved to `dump_<ts>_x<X>_y<Y>_v<V>.bin` immediately, since the
+  bypass may not repeat on the next attempt.
 
 ```bash
-# Basic scan (25x25 grid, spiral from corner)
+# Basic scan (25x25 grid, full window, default quickmap mode)
 python3 glitch_heatmap.py
+
+# Focused 5x5 window with 10 confirms per voltage
+python3 glitch_heatmap.py --start 8 11 --end 12 15 --shots 10
 
 # Reverse spiral starting from center
 python3 glitch_heatmap.py --reverse --start-x 12 --start-y 12
 ```
 
-Open http://localhost:8080 to view the live dual heatmap showing:
-- **Hit Rate**: Green (0%) to Red (100%), Blue for successful glitches
-- **Threshold Voltage**: Dark blue (0V) to Red (500V)
+Open http://localhost:8080 for the live UI:
+
+- **Hit Rate grid**: green (0%) → red (100%), blue cell for any landed
+  glitch.
+- **Voltage grid**: dark blue (0 V) → red (500 V). In quickmap mode this is
+  the settle voltage (lower = chip is more sensitive at this cell).
+- **Left side bar**: shot count for the active cell (fills bottom→top).
+- **Right side bar**: live CS voltage (fills bottom→top, shrinks if the
+  voltage drops during a sweep).
+- **Hover any cell** for tested-cell stats or live `IN PROGRESS` numbers
+  on the active cell (shots done, running hit rate, current voltage, any
+  glitch landings so far).
+
+#### Scan modes
+
+The script supports three scan strategies. Pick the one matching what
+you're trying to learn about the target:
+
+| Mode | Flag | What it does | Best for |
+|---|---|---|---|
+| **Quickmap** | *(default)* | At each position, drop the CS voltage by `CS_VOLTAGE_STEP` on the **first non-normal shot**. Re-test at the lower voltage. Position "settles" once we get `--confirm N` consecutive normals at one voltage, capped by `--shots N` total shots across all voltage levels. Each position always restarts at `CS_VOLTAGE` (500 V) so cells are mapped independently — no neighbour bias. | Quick exploration to find which positions are sensitive and roughly at what voltage. Cheap and fast — most positions resolve in a handful of shots. |
+| **Slow sweep** | `--slow-sweep` | At each position, run all `--shots N` shots at the start voltage to get a real hit rate, then binary-search downward through voltage levels to find the threshold. Original legacy behavior. | High-confidence hit-rate maps when you want to know the per-cell rate at multiple voltages, not just the settle voltage. |
+| **Fixed voltage** | `--fixed-voltage <V>` | Lock the CS voltage to V for every position. Take `--shots N` shots per cell at that voltage. No optimization, no drop. | Detailed maps at a known-good voltage (e.g. a threshold from a quickmap run). Same flow as the original behavior minus the optimizer. |
+
+`--slow-sweep` and `--fixed-voltage` are mutually exclusive.
+
+#### Output-mode flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--shots N` | 15 | Per-cell shot budget. Quickmap: total shots across all voltage levels (cap). Slow: shots per voltage level. Fixed: total shots per cell. |
+| `--confirm N` | 5 | **Quickmap only** — consecutive `normal` results at one voltage needed to declare the cell settled. Smaller = faster but noisier; larger = more confident the voltage is safe. |
+| `--no-dump` | off | Each shot only does a 4-byte test read instead of the full flash dump. Faster (`~0.5 s` per shot vs. `~2 s`) but you don't capture flash content on a successful glitch. Useful for discovery scans where finding *where* a glitch lands matters more than capturing the data. |
+| `--dump-size <bytes>` | `0x7E000` (504 KB, LPC2468 user flash) | Bytes to attempt to dump on a successful glitch. The remaining 8 KB at the top of LPC2468 flash is the boot block and returns `rc=14`. |
+| `--always-sync` | off | Re-`TARGET SYNC` before every shot (strict cycling). By default the script skips re-sync after a clean `normal` since the LPC bootloader stays in ISP-ready state — ~3× faster but assumes the previous shot didn't leave the chip in an unknown state. |
+
+#### Window / position flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--start X Y` | `0 0` corner | Bottom-left corner of the scan window AND the spiral start point. |
+| `--end X Y` | `24 24` corner | Top-right corner of the scan window. |
+| `--start-x X` / `--start-y Y` | from `--start` | Override the spiral start point independently of the window. |
+| `--x-min N` / `--x-max N` / `--y-min N` / `--y-max N` | from `--start`/`--end` | Restrict individual axes. |
+| `--reverse` / `--forward` | forward | Direction of the spiral within the window. |
+| `--trigger-byte HH` | `0D` | UART byte the PIO glitch trigger fires on. Default is `0x0D` (CR) — fires on the LPC echoing the `\r` at the end of our `R` command. |
+
+#### Result classification on the UI
+
+| CLI ticker | Result | Meaning |
+|---|---|---|
+| `.` | normal | rc=19 returned, CRP held |
+| `!` | effect | Target perturbed, no clean rc |
+| `+` | glitch | Read succeeded — bypass! Dump saved (unless `--no-dump`) |
+| `S` | sync_fail | TARGET SYNC could not re-attach |
+| `R` | cs_error | ChipSHOUTER fault; shot retried, doesn't count |
+| `[NNNV]` | voltage drop | Quickmap mode dropped CS voltage to NNNV after a non-normal |
 
 ### CSV to Heatmap (`csv_to_heatmap.py`)
 
