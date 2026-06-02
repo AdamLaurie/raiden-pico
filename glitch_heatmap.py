@@ -54,6 +54,8 @@ parser.add_argument('--no-dump', action='store_true',
                     help='Skip full-flash dump on successful glitch (default: dump 504 KB and save to dump_<ts>_x<X>_y<Y>_v<V>.bin)')
 parser.add_argument('--dump-size', type=lambda v: int(v, 0), default=0x7E000,
                     help='Bytes to dump on a successful glitch (default 0x7E000 = 504 KB, LPC2468 user flash)')
+parser.add_argument('--shots', type=int, default=15,
+                    help='Shots per position (default 15). Bigger value = better statistical confidence at each cell.')
 args = parser.parse_args()
 
 # Determine direction (default is forward)
@@ -79,7 +81,7 @@ TRIGGER_BYTE_HEX = f"0x{int(TRIGGER_BYTE_HEX, 16):02X}"
 SIZE = 24  # 25x25 grid (0-24)
 
 # Glitch test parameters
-SHOTS_PER_POSITION = 15  # Number of glitch attempts per position
+SHOTS_PER_POSITION = args.shots  # Number of glitch attempts per position (CLI: --shots)
 TARGET_BAUD = 115200
 CRYSTAL_KHZ = 8000
 RESET_DELAY = 300
@@ -212,6 +214,47 @@ HTML_PAGE = '''<!DOCTYPE html>
             background: linear-gradient(to right, #000033, #0066ff, #00ffff, #ffff00, #ff0000);
             border-radius: 3px;
         }
+        .vbar {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+        }
+        .vbar-label {
+            color: #00ff88;
+            font-size: 13px;
+            margin-bottom: 10px;
+            min-height: 18px;
+            text-align: center;
+        }
+        .vbar-track {
+            width: 26px;
+            height: 375px;
+            border: 2px solid #00ff88;
+            background: #0f0f23;
+            position: relative;
+            overflow: hidden;
+        }
+        .vbar-fill {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(to top, #00ff00, #ffff00, #ff0000);
+            height: 0%;
+            transition: height 0.15s linear;
+        }
+        .vbar-fill.voltage {
+            background: linear-gradient(to top, #000033, #0066ff, #00ffff, #ffff00, #ff0000);
+        }
+        .vbar-value {
+            color: #fff;
+            font-size: 12px;
+            margin-top: 8px;
+            font-weight: bold;
+            min-height: 18px;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -219,6 +262,12 @@ HTML_PAGE = '''<!DOCTYPE html>
     <div id="status">Connecting...</div>
 
     <div class="grids-container">
+        <div class="vbar">
+            <div class="vbar-label">Shots</div>
+            <div class="vbar-track"><div id="shotsFill" class="vbar-fill"></div></div>
+            <div id="shotsText" class="vbar-value">0 / 0</div>
+        </div>
+
         <div class="grid-wrapper">
             <div class="grid-title">Hit Rate</div>
             <div class="container">
@@ -243,6 +292,12 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <span>500V</span>
             </div>
         </div>
+
+        <div class="vbar">
+            <div class="vbar-label">CS V</div>
+            <div class="vbar-track"><div id="voltageFill" class="vbar-fill voltage"></div></div>
+            <div id="voltageText" class="vbar-value">0 V</div>
+        </div>
     </div>
 
     <div id="tooltip"></div>
@@ -262,6 +317,8 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         // Store cell data for tooltips
         let cellData = {};  // "x,y" -> {hitRate, voltage, special, threshold}
+        // Live state for the cell currently being shot at (cleared on result)
+        let currentLive = null;  // {x, y, shotsDone, shotsTotal, voltage, hits, glitches}
 
         function drawGrid(ctx, canvas) {
             ctx.fillStyle = '#0f0f23';
@@ -360,9 +417,30 @@ HTML_PAGE = '''<!DOCTYPE html>
             if (cellX >= 0 && cellX < GRID_SIZE && cellY >= 0 && cellY < GRID_SIZE) {
                 var key = cellX + ',' + cellY;
                 var cellInfo = cellData[key];
-
                 var tooltipHtml;
-                if (cellInfo) {
+
+                if (typeof currentLive !== 'undefined' && currentLive &&
+                    currentLive.x === cellX && currentLive.y === cellY) {
+                    // Cell currently being shot — show live progress
+                    var pctShots = currentLive.shotsTotal > 0
+                        ? (currentLive.shotsDone / currentLive.shotsTotal * 100).toFixed(0)
+                        : 0;
+                    var hits = currentLive.hits || 0;
+                    var glitches = currentLive.glitches || 0;
+                    var liveHr = currentLive.shotsDone > 0
+                        ? (hits / currentLive.shotsDone * 100).toFixed(1) + '%'
+                        : '—';
+                    tooltipHtml = '<b>(' + cellX + ', ' + cellY + ')</b>' +
+                        '<br><span style="color:#ffcc00">IN PROGRESS</span>' +
+                        '<br>Shots: ' + currentLive.shotsDone + ' / ' +
+                            currentLive.shotsTotal + ' (' + pctShots + '%)' +
+                        '<br>Hit rate so far: ' + liveHr +
+                        '<br>Voltage: ' + currentLive.voltage + 'V';
+                    if (glitches > 0) {
+                        tooltipHtml += '<br><span style="color:#0088ff">GLITCH x ' +
+                            glitches + '</span>';
+                    }
+                } else if (cellInfo) {
                     var pct = (cellInfo.hitRate * 100).toFixed(1);
                     var specialText = '';
                     if (cellInfo.special === 'glitch') {
@@ -412,6 +490,25 @@ HTML_PAGE = '''<!DOCTYPE html>
             return s;
         }
 
+        // ---- Live side-bar updates ----
+        const shotsFill = document.getElementById('shotsFill');
+        const shotsText = document.getElementById('shotsText');
+        const voltageFill = document.getElementById('voltageFill');
+        const voltageText = document.getElementById('voltageText');
+        function setShotsBar(done, total) {
+            if (total == null) total = 0;
+            if (done == null) done = 0;
+            const pct = total > 0 ? Math.min(done / total * 100, 100) : 0;
+            shotsFill.style.height = pct + '%';
+            shotsText.textContent = done + ' / ' + total;
+        }
+        function setVoltageBar(v) {
+            if (v == null) v = 0;
+            const pct = Math.min(Math.max(v / VOLTAGE_MAX * 100, 0), 100);
+            voltageFill.style.height = pct + '%';
+            voltageText.textContent = v + ' V';
+        }
+
         const evtSource = new EventSource('/events');
 
         evtSource.onopen = function() {
@@ -446,7 +543,33 @@ HTML_PAGE = '''<!DOCTYPE html>
                 }
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
+                currentLive = {
+                    x: data.x, y: data.y,
+                    shotsDone: 0, shotsTotal: data.shotsTotal,
+                    voltage: data.voltage, hits: 0, glitches: 0
+                };
+                if (typeof setShotsBar === 'function') setShotsBar(0, data.shotsTotal);
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
                 status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V` + progressSuffix(data);
+            }
+            else if (data.type === 'shot') {
+                if (!currentLive || currentLive.x !== data.x || currentLive.y !== data.y) {
+                    currentLive = {
+                        x: data.x, y: data.y,
+                        shotsDone: data.shotsDone, shotsTotal: data.shotsTotal,
+                        voltage: data.voltage, hits: 0, glitches: 0
+                    };
+                } else {
+                    currentLive.shotsDone = data.shotsDone;
+                    currentLive.shotsTotal = data.shotsTotal;
+                    currentLive.voltage = data.voltage;
+                }
+                if (data.result === 'effect' || data.result === 'glitch')
+                    currentLive.hits = (currentLive.hits || 0) + 1;
+                if (data.result === 'glitch')
+                    currentLive.glitches = (currentLive.glitches || 0) + 1;
+                if (typeof setShotsBar === 'function') setShotsBar(data.shotsDone, data.shotsTotal);
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
             }
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
@@ -454,6 +577,8 @@ HTML_PAGE = '''<!DOCTYPE html>
                 drawCell(data.x, data.y, data.hitRate, data.special, data.threshold, data.voltage);
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
+                currentLive = null;
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
                 const pct = (data.hitRate * 100).toFixed(0);
                 let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
@@ -547,6 +672,25 @@ def broadcast_move(x, y, voltage):
         'x': x,
         'y': y,
         'voltage': voltage,
+        'shotsTotal': SHOTS_PER_POSITION,
+    }
+    update.update(_progress_fields())
+    update_queue.put(update)
+
+def broadcast_shot(x, y, shots_done, shots_total, voltage, result=None):
+    """Per-shot tick so the UI's progress + voltage sidebars stay live.
+
+    `result` is one of 'normal' / 'effect' / 'glitch' / 'cs_error' / 'sync_fail'
+    so the tooltip can count live hits + glitches at the in-progress cell.
+    """
+    update = {
+        'type': 'shot',
+        'x': x,
+        'y': y,
+        'shotsDone': shots_done,
+        'shotsTotal': shots_total,
+        'voltage': voltage,
+        'result': result,
     }
     update.update(_progress_fields())
     update_queue.put(update)
@@ -626,7 +770,33 @@ def save_html_snapshot(filename):
                 }
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
+                currentLive = {
+                    x: data.x, y: data.y,
+                    shotsDone: 0, shotsTotal: data.shotsTotal,
+                    voltage: data.voltage, hits: 0, glitches: 0
+                };
+                if (typeof setShotsBar === 'function') setShotsBar(0, data.shotsTotal);
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
                 status.textContent = `Testing: (${data.x}, ${data.y}) @ ${data.voltage}V` + progressSuffix(data);
+            }
+            else if (data.type === 'shot') {
+                if (!currentLive || currentLive.x !== data.x || currentLive.y !== data.y) {
+                    currentLive = {
+                        x: data.x, y: data.y,
+                        shotsDone: data.shotsDone, shotsTotal: data.shotsTotal,
+                        voltage: data.voltage, hits: 0, glitches: 0
+                    };
+                } else {
+                    currentLive.shotsDone = data.shotsDone;
+                    currentLive.shotsTotal = data.shotsTotal;
+                    currentLive.voltage = data.voltage;
+                }
+                if (data.result === 'effect' || data.result === 'glitch')
+                    currentLive.hits = (currentLive.hits || 0) + 1;
+                if (data.result === 'glitch')
+                    currentLive.glitches = (currentLive.glitches || 0) + 1;
+                if (typeof setShotsBar === 'function') setShotsBar(data.shotsDone, data.shotsTotal);
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
             }
             else if (data.type === 'result') {
                 const key = `${data.x},${data.y}`;
@@ -634,6 +804,8 @@ def save_html_snapshot(filename):
                 drawCell(data.x, data.y, data.hitRate, data.special, data.threshold, data.voltage);
                 drawCurrent(data.x, data.y);
                 prevPos = [data.x, data.y];
+                currentLive = null;
+                if (typeof setVoltageBar === 'function') setVoltageBar(data.voltage);
                 const pct = (data.hitRate * 100).toFixed(0);
                 let specialMsg = data.special === 'glitch' ? ' [GLITCH!]' : '';
                 let optMsg = data.optimized ? ` (optimized from ${data.startVoltage}V)` : '';
@@ -932,6 +1104,7 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
 
         # Log the test result
         log_test(x, y, voltage, completed, result)
+        broadcast_shot(x, y, completed, shots, voltage, result)
 
         if result == 'effect' or result == 'glitch':
             hits += 1

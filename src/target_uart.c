@@ -4112,7 +4112,37 @@ void target_power_resettest(void) {
 
 resettest_done:
 
-    uart_cli_send("[8] Power cycling target...\r\n");
+    /* Post-STANDBY SWD-only flash probe. Bypasses the SRAM-payload
+     * limitation: by the time we reach here the chip has gone through
+     * STOP cycling + IWDG reset + WWDG reset + (attempted) STANDBY, and
+     * the RTC alarm should have woken it back up. If STANDBY exit
+     * actually disrupts the flash controller's RDP latch, AHB-AP reads
+     * of 0x08000000 will return real flash content. If RDP is re-applied
+     * by the wake reset (theory's prediction), the read faults or
+     * returns zero. */
+    uart_cli_send("\r\n[8] Post-STANDBY SWD probe of flash 0x08000000...\r\n");
+    sleep_ms(200);  /* Let any in-flight wake settle */
+
+    swd_init();
+    if (!swd_connect_under_reset()) {
+        uart_cli_send("    SWD reattach failed (chip in unresponsive state)\r\n");
+        swd_deinit();
+        goto probe_done;
+    }
+    uint32_t probe_val = 0xDEADBEEF;
+    uint32_t got = swd_read_mem(0x08000000, &probe_val, 1);
+    if (got != 1) {
+        uart_cli_send("    Flash 0x08000000: FAULT (AHB-AP read rejected — RDP re-latched)\r\n");
+    } else if (probe_val == 0 || probe_val == 0xFFFFFFFF) {
+        uart_cli_printf("    Flash 0x08000000: 0x%08lX (likely RDP-masked)\r\n", probe_val);
+    } else {
+        uart_cli_printf("    Flash 0x08000000: 0x%08lX *** BYPASS — RDP NOT re-latched after STANDBY ***\r\n",
+                        probe_val);
+    }
+    swd_deinit();
+
+probe_done:
+    uart_cli_send("[9] Power cycling target...\r\n");
     gpio_clr_mask(POWER_MASK);
     sleep_ms(100);
     gpio_set_mask(POWER_MASK);
