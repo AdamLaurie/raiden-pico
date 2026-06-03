@@ -18,6 +18,7 @@ system_flags_t* glitch_get_flags(void);
 void glitch_set_pause(uint32_t pause_us);
 void glitch_set_width(uint32_t width_us);
 void glitch_set_gap(uint32_t gap_us);
+void glitch_set_vmin(uint32_t vmin_mv);
 void glitch_set_count(uint32_t count);
 
 // Configure trigger

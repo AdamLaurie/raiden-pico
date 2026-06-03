@@ -108,6 +108,7 @@ typedef struct {
     uint32_t pause_cycles;    // Pause in system clock cycles (150MHz = 6.67ns per cycle)
     uint32_t width_cycles;    // Width in system clock cycles
     uint32_t gap_cycles;      // Gap in system clock cycles
+    uint32_t vmin_mv;         // ADC-gated glitch depth threshold (millivolts; 0 = WIDTH-only PIO pulse, !=0 = CPU-side ADC-polling glitch with WIDTH as minimum dwell)
     uint32_t count;
     trigger_type_t trigger;
     uint8_t trigger_pin;

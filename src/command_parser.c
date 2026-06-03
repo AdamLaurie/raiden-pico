@@ -304,13 +304,13 @@ void command_parser_execute(cmd_parts_t *parts) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "SET") == 0 && parts->count >= 2) {
-        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP", "BREAKPOINT", "BP"};
-        if (!match_and_replace(&parts->parts[1], variables, 6, "variable name")) {
+        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP", "VMIN", "BREAKPOINT", "BP"};
+        if (!match_and_replace(&parts->parts[1], variables, 7, "variable name")) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "GET") == 0 && parts->count == 2) {
-        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP"};
-        if (!match_and_replace(&parts->parts[1], variables, 4, "variable name")) {
+        const char *variables[] = {"PAUSE", "COUNT", "WIDTH", "GAP", "VMIN"};
+        if (!match_and_replace(&parts->parts[1], variables, 5, "variable name")) {
             goto api_response;
         }
     }
@@ -352,8 +352,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  SET P 1000 → SET PAUSE 1000             TRIG G R → TRIGGER GPIO RISING\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Configuration ==\r\n");
-        uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT] - Get current glitch parameter(s)\r\n");
+        uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT|VMIN] - Get current glitch parameter(s)\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
+        uart_cli_send("SET VMIN <mV>             - 0 = WIDTH-only PIO pulse, !=0 = ADC-gated drop\r\n");
+        uart_cli_send("                            (CPU-side, drops GP10/11/12 until ADC<VMIN,\r\n");
+        uart_cli_send("                             WIDTH cycles act as minimum dwell)\r\n");
         uart_cli_send("  Example: SET WIDTH 150 = 1us (150 cycles × 6.67ns @ 150MHz)\r\n");
         uart_cli_send("SET BP <slot> <name|0xADDR> [HARD|SOFT] - Set FPB breakpoint\r\n");
         uart_cli_send("SET BP LIST / CLEAR [slot|ALL]          - List/clear breakpoints\r\n");
@@ -594,6 +597,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("  PAUSE: %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
             uart_cli_printf("  WIDTH: %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
             uart_cli_printf("  GAP:   %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            uart_cli_printf("  VMIN:  %u mV (%s)\r\n", cfg->vmin_mv,
+                            cfg->vmin_mv == 0 ? "disabled — WIDTH-only PIO pulse" : "ADC-gated CPU drop, WIDTH = min dwell");
             uart_cli_printf("  COUNT: %u\r\n", cfg->count);
         } else if (strcmp(parts->parts[1], "BREAKPOINT") == 0 || strcmp(parts->parts[1], "BP") == 0) {
             // SET BREAKPOINT <slot> <name|0xADDR> [HARD|SOFT]
@@ -666,8 +671,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("       SET BREAKPOINT CLEAR [slot|ALL]\r\n");
             }
         } else if (parts->count != 3) {
-            uart_cli_send("ERROR: Usage: SET <PAUSE|WIDTH|GAP|COUNT> <value>\r\n");
-            uart_cli_send("       Value is in system clock cycles (150MHz = 6.67ns per cycle)\r\n");
+            uart_cli_send("ERROR: Usage: SET <PAUSE|WIDTH|GAP|COUNT|VMIN> <value>\r\n");
+            uart_cli_send("       PAUSE/WIDTH/GAP value is system clock cycles (150MHz = 6.67ns per cycle)\r\n");
+            uart_cli_send("       VMIN value is millivolts (0 = disabled)\r\n");
             goto api_response;
         } else {
             uint32_t value = atoi(parts->parts[2]);
@@ -681,11 +687,21 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[1], "GAP") == 0) {
                 glitch_set_gap(value);
                 uart_cli_printf("OK: GAP set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+            } else if (strcmp(parts->parts[1], "VMIN") == 0) {
+                glitch_set_vmin(value);
+                if (value == 0) {
+                    uart_cli_send("OK: VMIN disabled — WIDTH-only PIO pulse mode\r\n");
+                } else {
+                    // Dwell uses integer cycles/150 us — so WIDTH < 150 (< 1us)
+                    // truncates to 0. Print the actual dwell that'll be applied.
+                    uart_cli_printf("OK: VMIN set to %u mV (%.3f V) — ADC-gated CPU drop, dwell=%uus (WIDTH %u cycles / 150)\r\n",
+                                    value, value / 1000.0f, cfg->width_cycles / 150, cfg->width_cycles);
+                }
             } else if (strcmp(parts->parts[1], "COUNT") == 0) {
                 glitch_set_count(value);
                 uart_cli_printf("OK: COUNT set to %u\r\n", value);
             } else {
-                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT)\r\n", parts->parts[1]);
+                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT/VMIN)\r\n", parts->parts[1]);
             }
         }
 
@@ -697,9 +713,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("PAUSE: %u cycles (%.2f us)\r\n", cfg->pause_cycles, cfg->pause_cycles / 150.0f);
             uart_cli_printf("WIDTH: %u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
             uart_cli_printf("GAP:   %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            uart_cli_printf("VMIN:  %u mV (%s)\r\n", cfg->vmin_mv,
+                            cfg->vmin_mv == 0 ? "disabled" : "ADC-gated CPU drop");
             uart_cli_printf("COUNT: %u\r\n", cfg->count);
         } else if (parts->count != 2) {
-            uart_cli_send("ERROR: Usage: GET <PAUSE|WIDTH|GAP|COUNT>\r\n");
+            uart_cli_send("ERROR: Usage: GET <PAUSE|WIDTH|GAP|COUNT|VMIN>\r\n");
             goto api_response;
         } else {
             if (strcmp(parts->parts[1], "PAUSE") == 0) {
@@ -708,10 +726,16 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->width_cycles, cfg->width_cycles / 150.0f);
             } else if (strcmp(parts->parts[1], "GAP") == 0) {
                 uart_cli_printf("%u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
+            } else if (strcmp(parts->parts[1], "VMIN") == 0) {
+                if (cfg->vmin_mv == 0) {
+                    uart_cli_send("0 mV (disabled)\r\n");
+                } else {
+                    uart_cli_printf("%u mV (%.3f V)\r\n", cfg->vmin_mv, cfg->vmin_mv / 1000.0f);
+                }
             } else if (strcmp(parts->parts[1], "COUNT") == 0) {
                 uart_cli_printf("%u\r\n", cfg->count);
             } else {
-                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT)\r\n", parts->parts[1]);
+                api_error_printf("ERROR: Unknown variable '%s' (use PAUSE/WIDTH/GAP/COUNT/VMIN)\r\n", parts->parts[1]);
             }
         }
 
@@ -1521,7 +1545,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TEST <voltage> [count]     - Basic power glitch test\r\n");
                 uart_cli_send("  SWEEP                      - Voltage sweep\r\n");
                 uart_cli_send("  PAYLOAD [voltage] [attempts] - Glitch with SRAM payload\r\n");
-                uart_cli_send("  BYPASS [attempts] [dump_bytes] - RDP bypass + flash dump\r\n");
+                uart_cli_send("  BYPASS [attempts] [dump_bytes] - STM32 RDP bypass + flash dump\r\n");
+                uart_cli_send("  LPCBYPASS [count]              - LPC CRP-bypass; depth=VMIN, dwell=WIDTH\r\n");
                 uart_cli_send("  HALT [dump_bytes]          - Halt-based flash dump\r\n");
                 uart_cli_send("  LITERAL                    - Literal payload test\r\n");
                 uart_cli_send("  REGDUMP                    - Register dump payload\r\n");
@@ -1530,8 +1555,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
-                if (!match_and_replace(&parts->parts[2], glitch_cmds, 10, "GLITCH command")) {
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
+                                             "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
                 }
 
@@ -1585,6 +1611,21 @@ void command_parser_execute(cmd_parts_t *parts) {
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
                     target_power_bypass(attempts, dump_bytes);
+                } else if (strcmp(parts->parts[2], "LPCBYPASS") == 0) {
+                    // ADC-controlled voltage glitch against a CRP-locked LPC.
+                    // Reads depth (VMIN) and dwell (WIDTH) from glitch config —
+                    // SET VMIN <mV> + SET WIDTH <cycles> before firing.
+                    // Usage: TARGET GLITCH LPCBYPASS [count]
+                    uint32_t count = 1;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &count)) {
+                            api_error("ERROR: Invalid count. Usage: TARGET GLITCH LPCBYPASS [count]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (count < 1) count = 1;
+                    if (count > 10000) count = 10000;
+                    target_power_lpc_glitch(count);
                 } else if (strcmp(parts->parts[2], "HALT") == 0) {
                     uint32_t dump_bytes = 0;
                     if (parts->count >= 4) {

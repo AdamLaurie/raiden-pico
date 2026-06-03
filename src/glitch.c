@@ -66,6 +66,7 @@ void glitch_init(void) {
     config.pause_cycles = 0;     // No pause by default for minimum latency
     config.width_cycles = 100;   // 100 cycles = 0.67us at 150MHz
     config.gap_cycles = 100;     // 100 cycles = 0.67us at 150MHz
+    config.vmin_mv = 0;          // 0 = WIDTH-only PIO pulse mode
     config.count = 1;
     config.trigger = TRIGGER_NONE;
     config.trigger_pin = 3;  // Default trigger pin
@@ -135,6 +136,10 @@ void glitch_set_width(uint32_t width_cycles) {
 
 void glitch_set_gap(uint32_t gap_cycles) {
     config.gap_cycles = gap_cycles;
+}
+
+void glitch_set_vmin(uint32_t vmin_mv) {
+    config.vmin_mv = vmin_mv;
 }
 
 void glitch_set_count(uint32_t count) {
@@ -603,6 +608,7 @@ void glitch_reset(void) {
     config.pause_cycles = 0;     // No pause by default for minimum latency
     config.width_cycles = 100;   // 100 cycles = 0.67us at 150MHz
     config.gap_cycles = 100;     // 100 cycles = 0.67us at 150MHz
+    config.vmin_mv = 0;          // 0 = WIDTH-only PIO pulse mode
     config.count = 1;
     config.trigger = TRIGGER_NONE;
 
