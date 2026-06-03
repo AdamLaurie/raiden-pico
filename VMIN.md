@@ -23,6 +23,39 @@ VMIN is in millivolts so integer-only parsing keeps the CLI simple.
 The probe pin is **GP26 (ADC channel 0)**, the same pin used by
 `TARGET POWER SWEEP` and the `ADC` CLI command.
 
+## Wiring (mandatory)
+
+The target's reference rail must be physically connected to **GP26
+(ADC1)** before any VMIN glitch will work. The CPU loop polls this
+pin to decide when to release the rail — with nothing connected, it
+reads noise / floor and the threshold never trips (or trips
+immediately, depending on which side of `VMIN` the floor sits on).
+
+Typical wiring choices:
+
+- **JTAG `VTref`** — the JTAG header's target-reference-voltage pin
+  is usually a direct tap on the chip's VDD (or VDD via a small
+  series R for protection). Convenient if your target exposes a JTAG
+  header. **Caveat:** some JTAG adapters bridge nRST or other signals
+  onto the VTref net; characterise it with the four-state procedure
+  below before trusting it. The Raiden firmware floats its reset pin
+  when inactive specifically so the reset wire doesn't leak onto
+  VTref.
+- **Direct probe on a decoupling cap** at the chip's VDD pin — most
+  accurate, but needs you to identify the rail you actually care
+  about. Watch out for chips with separate I/O and core supplies;
+  glitching the wrong rail will pass calibration but never affect
+  the protection logic.
+- **Divider** — if the rail you want to monitor exceeds GP26's ADC
+  range (3.3 V max), put a divider between the rail and GP26.
+  Everything VMIN reports will then be in probe-space; scale
+  threshold values accordingly.
+
+Sanity check after wiring: `ADC 1` should show the target's idle
+voltage (or a divided version). If it reads 0 V the wire is loose;
+if it reads close to 3.3 V you have a leak from another net (often
+the reset line — see below).
+
 ## When does VMIN fire?
 
 The CPU-side ADC primitive (`power_glitch_once`) is called by:

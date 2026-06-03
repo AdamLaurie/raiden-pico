@@ -160,6 +160,12 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `GET WIDTH`
 
 **`SET VMIN <mV>`** - ADC-gated glitch-depth threshold (millivolts)
+- **Wiring required:** the target's reference rail (e.g. JTAG `VTref`,
+  the chip's VDD pin, or whichever rail you intend to monitor while
+  glitching) must be wired to **GP26 (ADC1)**. Without that wire the
+  CPU has nothing to gate on and the glitch will never reach its
+  threshold. Verify with `ADC 1` — should return the target's idle
+  voltage (or a divided version of it).
 - `0` (default) = disabled. Glitches use the standard time-based PIO pulse
   defined by WIDTH/GAP/PAUSE/COUNT.
 - Non-zero = enables **ADC-gated** glitching: instead of releasing the rail
