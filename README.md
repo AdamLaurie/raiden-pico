@@ -155,9 +155,35 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `SET WIDTH 150` = 1µs pulse
 - With no value, shows current settings
 
-**`GET [PAUSE|WIDTH|GAP|COUNT]`** - Read current parameter values
+**`GET [PAUSE|WIDTH|GAP|COUNT|VMIN]`** - Read current parameter values
 - Query individual or all glitch parameters
 - Example: `GET WIDTH`
+
+**`SET VMIN <mV>`** - ADC-gated glitch-depth threshold (millivolts)
+- `0` (default) = disabled. Glitches use the standard time-based PIO pulse
+  defined by WIDTH/GAP/PAUSE/COUNT.
+- Non-zero = enables **ADC-gated** glitching: instead of releasing the rail
+  after a fixed time, the CPU polls ADC0 (GP26) during the drop and releases
+  only once the probed voltage reaches the configured threshold. WIDTH is
+  then re-interpreted as the *minimum dwell time past threshold* (in
+  cycles ÷ 150 = µs), so the rail is held LOW for at least that long even
+  after the ADC trips — useful for letting core decoupling caps drain
+  further than the I/O rail.
+- Example: `SET VMIN 500` `SET WIDTH 15000` → drop the rail until ADC reads
+  ≤ 500 mV (probe-space), then hold for 100 µs before restoring.
+- `SET WIDTH 0` → release the rail *immediately* once the ADC hits VMIN,
+  no dwell. This is the right default for chips whose protection logic
+  sits on a low-capacitance rail where dwell adds nothing useful (and
+  for inrush-sensitive setups where the shorter time at LOW is safer
+  for the Pico's GPIO sink pads).
+- VMIN's depth control applies to commands that route through the
+  CPU-side ADC primitive — currently `TARGET GLITCH LPCBYPASS` (and the
+  STM32 sweep/test routines that already use ADC gating). PIO-driven
+  triggers (UART/GPIO) still use WIDTH-only timed pulses until VMIN is
+  wired into that path.
+- See [VMIN.md](VMIN.md) for the math (RC time constants vs decoupling
+  caps) and the cap-strip experimental procedure used to reach µs-scale
+  transients from the GP10/11/12 sink path.
 
 #### Trigger Configuration
 
