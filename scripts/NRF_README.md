@@ -134,7 +134,7 @@ Constants in `nrf_recovery.py`: `NRF52840_FLASH_SIZE`, `NRF52840_RAM_BASE/SIZE`,
 `NRF52840_AHB_BASE`. ⚠️ **Peripheral reads can have side effects** (read-to-clear) and unmapped
 addresses bus-fault, so APB/AHB are **bounded samples**, not a blind dump. `dump_region(p, base, size,
 out)` dumps any region; `dump_flash_and_ram(p, out)` does the two bulk regions.
-- ★ **REAL-TARGET NOTE:** on the HID Signo R20 (or any nRF52840 with external **QSPI flash**), also dump
+- ★ **REAL-TARGET NOTE:** on any nRF52840 with external **QSPI flash** also dump
   the **XIP region @0x12000000** — the real firmware/keys may be in external flash, not the internal
   1 MiB. (The practice dongle has no QSPI, so XIP reads empty there.)
 - **Fidelity verified**: wrote `1C E1 CE BA B4` to RAM @0x20002000 → found at the exact offset in the dump.

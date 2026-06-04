@@ -26,7 +26,7 @@ import time
 
 from nrf_attack import Pico, find_port   # reuse serial helpers
 from nrf_recovery import (parse_hexdump, run_recovery, dump_flash_and_ram,
-                          project_path, pretty_info)
+                          project_path, unique_dump_path, pretty_info)
 from colors import hdr, ok, warn, err, info, dim, green, strip, ColorHelpFormatter
 
 HERE = os.path.dirname(os.path.abspath(__file__))   # this script's dir (no hardcoded path)
@@ -118,13 +118,22 @@ def main():
                     help="attempts per window before rotating to the next")
     ap.add_argument("--off", type=int, default=18, help="target power-off time per attempt, ms (18 = full rail discharge)")
     ap.add_argument("--settle", type=int, default=4, help="wait after glitch before SWD probe, ms")
-    ap.add_argument("--out", default=project_path("nrf_flash_dump.bin"),
-                    help="flash dump file on unlock (default: scripts/nrf52840/)")
+    ap.add_argument("--label", default="dongle",
+                    help="target label -> dumps go to scripts/nrf52840/<label>/ (default: dongle for "
+                         "this cold power-cycle attack). Keeps each target's dumps separate.")
+    ap.add_argument("--out", default=None,
+                    help="explicit flash dump path (default: a UNIQUE timestamped file under the "
+                         "--label folder, so unlocks never overwrite prior findings)")
     ap.add_argument("--batch-max-secs", type=float, default=2000.0,
                     help="per-batch host watchdog timeout, s")
     ap.add_argument("--log", default=project_path("nrf_autopwn.log"),
                     help="progress log file (flushed; default: scripts/nrf52840/)")
     a = ap.parse_args()
+    # Unique, target-scoped dump path so a successful dump NEVER overwrites old findings.
+    if not a.out:
+        a.out = unique_dump_path(a.label)
+    elif os.path.dirname(a.out):
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
     try:
         _lf = open(a.log, "a", buffering=1)
         _lf.write(f"\n===== autopwn start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")

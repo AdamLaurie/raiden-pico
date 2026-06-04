@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 nrf_recovery.py -- post-unlock APPROTECT recovery for nRF52840, branched on the
-chip's build/revision code (the HID Signo doc's "Dxx" vs "Fxx or later" split).
+chip's build/revision code ("Dxx" vs "Fxx or later" split).
 
 After a glitch opens the debug port, the unlock is TRANSIENT: APPROTECT is
 re-latched on the next reset/power-cycle. To make debug access persist you must
@@ -53,6 +53,19 @@ def project_dir(name="nrf52840"):
 def project_path(filename, name="nrf52840"):
     """Full path to `filename` inside the per-target output folder (see project_dir)."""
     return os.path.join(project_dir(name), filename)
+
+
+def unique_dump_path(label=""):
+    """A UNIQUE, target-scoped flash-dump path so a successful dump never overwrites old
+    findings: always timestamped; `label` (e.g. 'dongle', 'my_target') becomes a subfolder
+    AND a filename tag. Creates the directory. The RAM dump derives as <path>.ram.bin via
+    ram_path_for(). Pass an explicit --out to override."""
+    import time as _t
+    ts = _t.strftime("%Y%m%d_%H%M%S")
+    fname = f"nrf52840_{label}_flash_{ts}.bin" if label else f"nrf52840_flash_{ts}.bin"
+    p = project_path(os.path.join(label, fname)) if label else project_path(fname)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    return p
 
 
 def resolve_outdir(dest=None):

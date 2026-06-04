@@ -39,6 +39,7 @@ Examples:
 import argparse
 import os
 import sys
+import time
 
 from colors import ColorHelpFormatter
 from efm32_link import EfmLink, add_common_args, project_path
@@ -132,7 +133,9 @@ def do_sweeprst(link, args):
 
 
 def do_dump(link, args):
-    out = args.out if (args.out and os.path.dirname(args.out)) else project_path(args.out or "efm32_dump.bin")
+    # default: a UNIQUE timestamped file in scripts/efm32/ so dumps never overwrite old findings
+    out = args.out if (args.out and os.path.dirname(args.out)) \
+        else project_path(args.out or f"efm32_dump_{time.strftime('%Y%m%d_%H%M%S')}.bin")
     print(f"Dumping 0x{args.size:X} bytes from 0x{args.addr:08X} -> {out}")
     data = link.dump(args.addr, args.size,
                      progress=lambda g, t: print(f"  {g}/{t}", end="\r"))

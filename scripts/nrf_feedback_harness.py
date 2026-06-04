@@ -25,7 +25,7 @@ truth result counters back over SWD. That gives a direct 3-way classifier per sh
 Sweeping crowbar WIDTH while tallying SKIP vs CRASH finds the amplitude/width band
 that produces clean skips instead of crashes. Those tuned params (plus the
 separately-measured boot read-timing) then feed the real locked-boot APPROTECT
-sweep -- and ultimately the HID Signo R20.
+sweep 
 
 THE MOCK ROUTINE (hand-assembled Thumb, base 0x20000000, r0 = counter base)
 --------------------------------------------------------------------------

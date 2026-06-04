@@ -22,6 +22,7 @@ Examples:
 import argparse
 from colors import ColorHelpFormatter
 import sys
+import time
 
 from pic_icsp import PicLink, add_common_args, project_path
 
@@ -41,8 +42,10 @@ def main():
                     help="number of bytes (default 0x2000 = 8 KB)")
     ap.add_argument("--chunk", type=lambda x: int(x, 0), default=256,
                     help="bytes per ICSP DUMP call (default 256)")
-    ap.add_argument("-o", "--output", default=project_path("pic_dump.bin"),
-                    help="output file (default: scripts/pic18/pic_dump.bin)")
+    ap.add_argument("-o", "--output",
+                    default=project_path(f"pic_dump_{time.strftime('%Y%m%d_%H%M%S')}.bin"),
+                    help="output file (default: a UNIQUE timestamped file in scripts/pic18/, "
+                         "so dumps never overwrite prior findings)")
     args = ap.parse_args()
 
     link = PicLink(port=args.port, verbose=args.verbose, lvp=args.lvp)

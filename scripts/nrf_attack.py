@@ -25,13 +25,14 @@ Examples:
 import argparse
 from colors import ColorHelpFormatter, hdr, ok, warn, err, info, dim
 import glob
+import os
 import sys
 import time
 
 import serial
 
 from nrf_recovery import (parse_hexdump, run_recovery, dump_flash_and_ram,
-                          project_path, pretty_info)
+                          project_path, unique_dump_path, pretty_info)
 
 
 def colorize_fw(t):
@@ -111,13 +112,22 @@ def main():
     ap.add_argument("--off", type=int, default=18, help="target power-off time per attempt, ms (18 = full rail discharge)")
     ap.add_argument("--settle", type=int, default=4, help="wait after glitch before SWD probe, ms")
     ap.add_argument("--tries", type=int, default=20000, help="total attempts (grid loops to fill)")
-    ap.add_argument("--out", default=project_path("nrf_flash_dump.bin"),
-                    help="flash dump file on unlock (default: scripts/nrf52840/)")
+    ap.add_argument("--label", default="dongle",
+                    help="target label -> dumps go to scripts/nrf52840/<label>/ (default: dongle for "
+                         "this cold power-cycle attack). Keeps each target's dumps separate.")
+    ap.add_argument("--out", default=None,
+                    help="explicit flash dump path (default: a UNIQUE timestamped file under the "
+                         "--label folder, so unlocks never overwrite prior findings)")
     ap.add_argument("--max-secs", type=float, default=2400.0, help="host watchdog timeout, s")
     ap.add_argument("--apply-recovery", action="store_true",
                     help="after the dump, EXECUTE the build-code recovery (legacy parts: "
                          "ERASEUICR for a persistent unlock). Default: dry-run print only.")
     a = ap.parse_args()
+    # Unique, target-scoped dump path so a successful dump NEVER overwrites old findings.
+    if not a.out:
+        a.out = unique_dump_path(a.label)
+    elif os.path.dirname(a.out):
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
     try:
         sys.stdout.reconfigure(line_buffering=True)   # live progress in a redirected log
     except Exception:

@@ -35,7 +35,7 @@ import time
 
 from nrf_attack import Pico, find_port
 from nrf_recovery import (parse_hexdump, run_recovery, dump_flash_and_ram,
-                          project_path, pretty_info)
+                          project_path, unique_dump_path, pretty_info)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -57,11 +57,21 @@ def main():
     ap.add_argument("--tries", type=int, default=200000, help="max attempts before giving up")
     ap.add_argument("--dump-bytes", dest="dump", type=int, default=0,
                     help="bytes to dump on unlock (0 = full 1MB flash)")
-    ap.add_argument("--out", default=project_path("nrf_flash_dump.bin"),
-                    help="flash dump file on unlock (default: scripts/nrf52840/)")
+    ap.add_argument("--label", default="current",
+                    help="target label -> dumps go to scripts/nrf52840/<label>/ (default: current_target). "
+                         "Keeps each target's dumps separate.")
+    ap.add_argument("--out", default=None,
+                    help="explicit flash dump path (default: a UNIQUE timestamped file under the "
+                         "--label folder, so unlocks never overwrite prior findings)")
     ap.add_argument("--log", default=project_path("nrf_reset_attack.log"),
                     help="progress log, flushed (default: scripts/nrf52840/)")
     a = ap.parse_args()
+
+    # Unique, target-scoped dump path so a successful dump NEVER overwrites old findings.
+    if not a.out:
+        a.out = unique_dump_path(a.label)
+    elif os.path.dirname(a.out):
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
 
     try:
         lf = open(a.log, "a", buffering=1)
