@@ -2,7 +2,7 @@
 # Sweep delay from 0 to 1000 in steps of 10 at 201V
 # Loop until SUCCESS is found
 
-cd /home/addy/work/claude-code/raiden-pico/scripts
+cd "$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 while true; do
     for DELAY in $(seq 0 10 1000); do

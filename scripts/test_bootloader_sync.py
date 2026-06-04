@@ -3,8 +3,9 @@
 Quick test to debug bootloader sync detection
 """
 
+import os
 import sys
-sys.path.insert(0, '/home/addy/work/claude-code/raiden-pico/scripts')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from jtag_chipshouter_isp import RaidenPico
 

@@ -11,6 +11,10 @@ import csv
 import os
 from datetime import datetime
 
+# Resolve paths relative to this script so it runs from any checkout location
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPTS_DIR)
+
 # Parameter sets to try
 PARAMETER_SETS = [
     # Set 1: Current best guess (crashes at V=300, early timing)
@@ -115,7 +119,7 @@ def run_parameter_set(param_set, iteration):
     # Create custom marathon script for this parameter set
     script_content = f"""
 import sys
-sys.path.insert(0, '/home/addy/work/claude-code/raiden-pico/scripts')
+sys.path.insert(0, {SCRIPTS_DIR!r})
 from glitch_marathon import *
 
 # Override parameter ranges
@@ -139,7 +143,7 @@ run_marathon_custom(voltage_range, pause_range, width_range, {HOURS_PER_SET}, '{
             cmd,
             stdout=log,
             stderr=subprocess.STDOUT,
-            cwd='/home/addy/work/claude-code/raiden-pico'
+            cwd=PROJECT_DIR
         )
 
     return proc, log_file, csv_file
