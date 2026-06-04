@@ -31,6 +31,9 @@ still ramping and weak, faulting the boot-ROM APPROTECT read.
 ```
 
 ## Connections
+
+![nRF52840 aQFN73 ball / pad assignments](docs/aQFN73_ball_assignments.png)
+
 | From (Pico) | To (nRF52840) | Purpose |
 |---|---|---|
 | **GP10 + GP11 + GP12** (ganged) | **VDD** | power the target **and power-cycle it** each attempt (direct, no series R) |

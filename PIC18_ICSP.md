@@ -39,6 +39,8 @@ you need an HV VPP source on MCLR (out of scope of this rig).
 Defined in `include/pic18_target.h` / `include/config.h`. The ICSP pins reuse the
 SWD header.
 
+![PIC18F4321 44-pin TQFP pinout](docs/PIC18F4321_44PIN_TQFP.png)
+
 | Pico2 GPIO | Signal            | PIC18 pin            | Direction        |
 |-----------:|-------------------|----------------------|------------------|
 | **GP17**   | ICSP **PGC** clock| PGC / RB6            | Pico → target    |

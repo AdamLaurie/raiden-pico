@@ -108,7 +108,10 @@ The **cold power-cycle attack cracks the part reproducibly** (3–7× in this se
   warm boot (DEC1 held by the LDO); ~2 M attempts, 0 unlocks. Cold power-cycle is THE attack.
 
 ## What memory we dump — full nRF52840 memory map
-Per the official nRF52840 memory map (see the Nordic product specification).
+Per the official nRF52840 memory map (see the Nordic product specification):
+
+![nRF52840 memory map](../docs/nRF52840_memory_map.png)
+
 Once the glitch opens the AHB-AP, any AHB-readable region is dumpable over `TARGET NRF DUMP`. On unlock
 the attacks pull the two bulk regions; `nrf_dump_test.py` adds bounded peripheral samples.
 

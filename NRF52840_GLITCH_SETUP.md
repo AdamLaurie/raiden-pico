@@ -70,6 +70,8 @@ Two channels; pick the pair for the job:
   `nrf_timing_marker.py --pin N --port P flash`.
 - DEC1 must be probed on the **actual die pin**, not the removed-cap pad.
 
+![Glitch probe tip placement on the nRF die pin](docs/nRF52832_glitch_tip.png)
+
 ## Two attacks — pick the wiring
 This file is the COMMON bench reference (crowbar / MOSFET / resistors / scope). Each attack has its
 own wiring doc with the validated parameters:

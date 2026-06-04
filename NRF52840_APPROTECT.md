@@ -8,6 +8,8 @@ the core regulator during early boot so the AHB-AP stays enabled, then dump flas
 - **Target:** bare nRF52840 module (MDBT50Q / Ebyte style)
 - **Injection point:** the module **DEC1** pin (~1.3 V core regulator output) — **NOT** main VDD
 
+![APPROTECT left disabled after glitching DEC1 during early boot](docs/APPROTECT_DISABLE.png)
+
 ## Wiring
 
 | Raiden Pico (RP2350) | → | nRF52840 module |
