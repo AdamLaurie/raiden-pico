@@ -255,8 +255,8 @@ This analysis was performed by:
 - `/tmp/lpc2468_bootrom_full.bin` - Complete boot ROM dump (72KB)
 - `/tmp/bootrom_full_disasm.txt` - ARM mode disassembly
 - `/tmp/boot_thumb_disasm.txt` - Thumb mode disassembly
-- `/home/addy/work/claude-code/raiden-pico/openocd/lpc2478_no_checksum.cfg` - OpenOCD config without auto-checksum
-- `/home/addy/work/claude-code/raiden-pico/images/crp*_test.{bin,hex}` - CRP test images
+- `openocd/lpc2478_no_checksum.cfg` - OpenOCD config without auto-checksum (relative to repo root)
+- `images/crp*_test.{bin,hex}` - CRP test images (relative to repo root)
 
 ---
 

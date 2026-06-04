@@ -9,13 +9,14 @@ The exploit has two stages:
 BOOT1 on F4 is an option bit, not a pin - only BOOT0 is controllable.
 """
 
+import os
 import subprocess
 import serial
 import time
 import sys
 import argparse
 
-PAYLOAD_PATH = "/home/addy/work/claude-code/raiden-pico/stm32_payloads/f4/payload.bin"
+PAYLOAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "payload.bin")
 PICO_PORT = "/dev/ttyACM0"
 PICO_BAUD = 115200
 
