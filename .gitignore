@@ -13,6 +13,14 @@ Makefile
 # But do track hand-written payload Makefiles
 !stm32_payloads/**/Makefile
 
+# In-source build trees (if cmake is ever run from repo root instead of build/)
+/_deps/
+/generated/
+/pico-sdk/
+/pioasm/
+/pioasm-install/
+/pico_flash_region.ld
+
 # Build outputs
 *.elf
 *.bin
