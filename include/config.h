@@ -22,6 +22,8 @@
 #define PIN_BOOT0 13           // STM32 BOOT0 control
 #define PIN_BOOT1 14           // STM32 BOOT1 control
 #define PIN_ARMED 16           // ARMED status (CPU-controlled, HIGH when armed)
+// GP17/GP18/GP15 reused as PIC18 ICSP PGC/PGD/MCLR (see pic18_target.h)
+// GP19 = PIC18 RB5/PGM for PGM-pin LVP entry (F4321 family)
 #define PIN_GLITCH_FIRED 22    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
 
 // Platform Types
@@ -54,6 +56,9 @@ typedef enum {
     TARGET_STM32F3,     // STM32F334 etc (Cortex-M4)
     TARGET_STM32F4,     // STM32F401/F429 etc (Cortex-M4)
     TARGET_STM32L4,     // STM32L451/L452 etc (Cortex-M4)
+    TARGET_NRF52840,    // Nordic nRF52840 (Cortex-M4F) - APPROTECT glitch target
+    TARGET_PIC18,       // Microchip PIC18F (classic, e.g. F4320) - ICSP CP glitch target
+    TARGET_EFM32LG,     // Silicon Labs EFM32 Leopard Gecko (Cortex-M3) - DLW debug-lock glitch target
 } target_type_t;
 
 // Helper to check if any STM32 family is selected
@@ -64,6 +69,21 @@ static inline bool target_is_stm32(target_type_t t) {
 // Helper to check if any LPC family is selected
 static inline bool target_is_lpc(target_type_t t) {
     return t == TARGET_LPC || t == TARGET_LPC_CM;
+} 
+
+// Helper to check if an nRF target is selected
+static inline bool target_is_nrf(target_type_t t) {
+    return t == TARGET_NRF52840;
+}
+
+// Helper to check if a PIC18 target is selected
+static inline bool target_is_pic18(target_type_t t) {
+    return t == TARGET_PIC18;
+}
+
+// Helper to check if an EFM32 target is selected
+static inline bool target_is_efm32(target_type_t t) {
+    return t == TARGET_EFM32LG;
 }
 
 // STM32 flash controller register map (varies by family)
