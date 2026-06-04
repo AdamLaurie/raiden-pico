@@ -10,3 +10,8 @@ pyserial>=3.5
 # scripts/stm32_dual_trace.py for DWT-cycle-count + ADC-shunt visualization.
 numpy>=1.20
 matplotlib>=3.4
+
+# Image handling for the Rigol scope viewers (rigol_view.py, rigol_scope_live.py,
+# rigol_screenshot.py) — screenshot capture + Tk preview (PIL.ImageTk; needs the
+# system tkinter / python3-tk package at runtime).
+Pillow>=9.0
