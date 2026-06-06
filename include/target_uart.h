@@ -69,6 +69,13 @@ void target_power_on(void);
 void target_power_off(void);
 void target_power_cycle(uint32_t time_ms);
 bool target_power_get_state(void);
+
+// Power mode (GP10/11/12 group: INTERNAL source vs EXTERNAL supply + crowbar gate)
+void target_set_power_mode(power_mode_t mode);
+power_mode_t target_get_power_mode(void);
+void target_set_crowbar_polarity(bool active_high);
+bool target_crowbar_gate_active_high(void);
+void target_crowbar_gate_idle(void);  // drive GP11 to safe de-asserted idle (GPIO)
 void target_power_sweep(void);
 void target_power_glitch(float voltage, uint32_t count);
 // LPC CRP-bypass via ADC-controlled VDD glitch. Reads glitch config VMIN

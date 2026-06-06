@@ -168,6 +168,15 @@ static bool match_and_replace(char **part, const char **candidates, uint8_t coun
         api_error_printf("ERROR: Ambiguous %s '%s' - be more specific\r\n", context, *part);
         return false;
     }
+    // command_parser_match() returns the original string (same pointer) when it
+    // matches no candidate — a lenient passthrough that would let a mistyped
+    // sub-command (e.g. "POWER EXT" for "POWER MODE EXT") slip through as if
+    // valid. A keyword gate must reject the unknown token, not silently accept
+    // it, so callers don't fall through to a wrong/no-op branch.
+    if (matched == *part) {
+        api_error_printf("ERROR: Unknown %s '%s'\r\n", context, *part);
+        return false;
+    }
     *part = (char*)matched;
     return true;
 }
@@ -379,6 +388,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE [ms]]  - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET POWER MODE [INT|EXT [AHIGH|ALOW]] - Power group mode\r\n");
+        uart_cli_send("                   INT = GP10/11/12 ganged power source (default)\r\n");
+        uart_cli_send("                   EXT = GP10 supply, GP11 crowbar gate, GP12 spare\r\n");
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
@@ -571,7 +583,15 @@ void command_parser_execute(cmd_parts_t *parts) {
             target_type_str = info ? info->name : "STM32";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
-        uart_cli_printf("Power (GP10): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+        if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
+            uart_cli_printf("Power mode:   EXTERNAL (GP10 supply enable, GP11 crowbar gate %s, GP12 spare)\r\n",
+                            target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
+                                                              : "active-LOW/idle-HIGH");
+            uart_cli_printf("Supply (GP10):%s\r\n", target_power_get_state() ? " ON" : " OFF");
+        } else {
+            uart_cli_send("Power mode:   INTERNAL (GP10/11/12 ganged source)\r\n");
+            uart_cli_printf("Power (GP10/11/12): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+        }
         uart_cli_printf("Reset (GP15): HIGH, LOW 300ms pulse\r\n");
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
@@ -904,9 +924,18 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  Pico GP9 <- controller pin 6 (controller TX)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");
-        uart_cli_send("GP11 - Target Power (ganged, default ON, 12mA drive)\r\n");
-        uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
+        if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
+            uart_cli_send("GP10 - Target Power supply enable (EXTERNAL mode)\r\n");
+            uart_cli_printf("GP11 - Crowbar gate, PIO-driven, same waveform as GP2 (%s)\r\n",
+                            target_crowbar_gate_active_high() ? "active-HIGH, idle LOW"
+                                                              : "active-LOW, idle HIGH");
+            uart_cli_send("GP12 - Reserved spare (EXTERNAL mode, no function)\r\n");
+        } else {
+            uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");
+            uart_cli_send("GP11 - Target Power (ganged, default ON, 12mA drive)\r\n");
+            uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
+        }
+        uart_cli_send("       (GP10/11/12 mode: TARGET POWER MODE [INT|EXT])\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("GP13 - BOOT0 Control\r\n");
@@ -1234,10 +1263,12 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
             if (parts->count < 3) {
                 bool power_state = target_power_get_state();
-                uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
+                const char *pins = (target_get_power_mode() == POWER_MODE_EXTERNAL)
+                                       ? "GP10 supply" : "GP10/11/12";
+                uart_cli_printf("Target power (%s): %s\r\n", pins, power_state ? "ON" : "OFF");
             } else {
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 3, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "MODE"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 4, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1254,6 +1285,47 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     target_power_cycle(cycle_time_ms);
+                } else if (strcmp(parts->parts[2], "MODE") == 0) {
+                    if (parts->count < 4) {
+                        // Query current mode + crowbar gate polarity
+                        bool ext = (target_get_power_mode() == POWER_MODE_EXTERNAL);
+                        uart_cli_printf("Power mode: %s\r\n", ext ? "EXTERNAL" : "INTERNAL");
+                        if (ext) {
+                            uart_cli_printf("  GP10 = supply enable, GP11 = crowbar gate (%s), GP12 = spare\r\n",
+                                            target_crowbar_gate_active_high() ? "active-HIGH, idle LOW"
+                                                                              : "active-LOW, idle HIGH");
+                        } else {
+                            uart_cli_send("  GP10/11/12 = ganged target power source\r\n");
+                        }
+                    } else {
+                        // Changing mode while armed would tear GP11 out from under the
+                        // crowbar pulse SM — refuse and make the user disarm first.
+                        if (glitch_get_flags()->armed) {
+                            api_error("ERROR: disarm (ARM OFF) before changing power mode\r\n");
+                            goto api_response;
+                        }
+                        const char *mode_names[] = {"INTERNAL", "EXTERNAL"};
+                        if (!match_and_replace(&parts->parts[3], mode_names, 2, "power mode")) {
+                            goto api_response;
+                        }
+                        if (strcmp(parts->parts[3], "EXTERNAL") == 0) {
+                            // Optional polarity: AHIGH (default) | ALOW
+                            if (parts->count >= 5) {
+                                const char *pol_names[] = {"AHIGH", "ALOW"};
+                                if (!match_and_replace(&parts->parts[4], pol_names, 2, "gate polarity")) {
+                                    goto api_response;
+                                }
+                                target_set_crowbar_polarity(strcmp(parts->parts[4], "AHIGH") == 0);
+                            }
+                            target_set_power_mode(POWER_MODE_EXTERNAL);
+                            uart_cli_printf("OK: Power mode EXTERNAL (GP10 supply, GP11 crowbar gate %s, GP12 spare)\r\n",
+                                            target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
+                                                                              : "active-LOW/idle-HIGH");
+                        } else {
+                            target_set_power_mode(POWER_MODE_INTERNAL);
+                            uart_cli_send("OK: Power mode INTERNAL (GP10/11/12 ganged power source)\r\n");
+                        }
+                    }
                 }
             }
         } else if (strcmp(parts->parts[1], "BL") == 0) {

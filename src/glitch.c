@@ -18,6 +18,7 @@ static uint sm_pulse_gen = 1;
 static uint sm_flag_output = 2;  // Can reuse for UART trigger since not used simultaneously
 static uint sm_clock_gen = 0;    // Clock uses PIO1 SM0
 static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
+static uint sm_crowbar = 3;      // Crowbar gate pulse: PIO0 SM3 (2nd pulse_generator copy driving GP11)
 
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
@@ -48,6 +49,9 @@ static uint offset_clock_gen;        // Simple clock generator
 static uint offset_clock_gen_boost;  // Clock generator with glitch boost
 static uint offset_uart_match;
 static uint offset_irq_trigger;
+
+// Crowbar gate pulse state (EXTERNAL power mode only)
+static bool crowbar_pulse_active = false;
 
 // Track which trigger programs are loaded (avoid removing unloaded programs)
 static bool trigger_programs_loaded = false;
@@ -85,7 +89,7 @@ void glitch_init(void) {
     clock_config.enabled = false;
 
     // Initialize semaphore pins for clock boost coordination
-    // GP9 (ARMED): CPU-controlled, HIGH when armed, LOW when disarmed
+    // GP16 (ARMED): CPU-controlled, HIGH when armed, LOW when disarmed
     gpio_init(PIN_ARMED);
     gpio_set_dir(PIN_ARMED, GPIO_OUT);
     gpio_put(PIN_ARMED, 0);  // Start disarmed
@@ -112,6 +116,8 @@ void glitch_init(void) {
     offset_clock_gen = pio_add_program(clock_pio, &clock_generator_program);
     offset_clock_gen_boost = pio_add_program(clock_pio, &clock_generator_with_boost_program);
     // Total PIO1: clock_delay(6) + clock(2) + clock_boost(19) = 27 instructions
+    // (The crowbar gate is driven by a 2nd pulse_generator SM on PIO0, not PIO1 —
+    //  PIO1 cannot read GP2's input on this RP2350B, so the old follower was dropped.)
 
     // PIO state machines are configured and started in glitch_arm() based on trigger type
     // Output pin is configured for PIO control in glitch_arm()
@@ -161,6 +167,68 @@ void glitch_set_trigger_byte(uint8_t byte) {
 
 // Output pins are hardwired - no need for setter function
 
+// ---- Crowbar gate pulse (EXTERNAL power mode) ----
+// Drives the crowbar gate (GP11) with the SAME WIDTH/GAP/COUNT waveform as the
+// GP2 glitch output, using a SECOND copy of the pulse_generator program on a
+// free PIO0 state machine (SM3). Both SMs wait on IRQ0, so they fire together
+// on any trigger (GPIO/UART/manual). This avoids reading GP2 across PIO blocks
+// (PIO1 cannot read GP2's input on this RP2350B). Polarity is applied via pad
+// outover, exactly like the inverted output GP7. No-op outside EXTERNAL mode.
+// Must be called from glitch_arm() AFTER precalc_* and the GP2 SM are set up.
+static void crowbar_pulse_start(void) {
+    extern power_mode_t target_get_power_mode(void);
+    extern bool target_crowbar_gate_active_high(void);
+
+    if (target_get_power_mode() != POWER_MODE_EXTERNAL) {
+        return;
+    }
+
+    // Reuse the existing pulse_generator program (no extra instruction memory).
+    // The program needs both a SET pin and a SIDE-SET pin; point both at GP11 —
+    // they always carry the same value here, so GP11 cleanly follows the pulse.
+    pio_sm_config c = pulse_generator_program_get_default_config(offset_pulse_gen);
+    sm_config_set_set_pins(&c, PIN_CROWBAR_GATE, 1);
+    sm_config_set_sideset_pins(&c, PIN_CROWBAR_GATE);
+    sm_config_set_clkdiv(&c, 1.0);
+
+    // Hand GP11 to PIO0 and apply polarity: active-high gate = normal pad (idle
+    // LOW / assert HIGH), active-low = inverted pad (idle HIGH / assert LOW) —
+    // the same pad-inversion trick the inverted output (GP7) uses.
+    pio_gpio_init(glitch_pio, PIN_CROWBAR_GATE);
+    hw_clear_bits(&padsbank0_hw->io[PIN_CROWBAR_GATE], PADS_BANK0_GPIO0_ISO_BITS);
+    pio_sm_set_consecutive_pindirs(glitch_pio, sm_crowbar, PIN_CROWBAR_GATE, 1, true);
+    gpio_set_outover(PIN_CROWBAR_GATE,
+                     target_crowbar_gate_active_high() ? GPIO_OVERRIDE_NORMAL
+                                                       : GPIO_OVERRIDE_INVERT);
+
+    pio_sm_clear_fifos(glitch_pio, sm_crowbar);
+    pio_sm_restart(glitch_pio, sm_crowbar);
+    pio_sm_init(glitch_pio, sm_crowbar, offset_pulse_gen, &c);
+
+    // Same FIFO params as sm_pulse_gen (PAUSE, COUNT-1, WIDTH, GAP) so the GP11
+    // pulse is identical to the GP2 pulse. precalc_* were computed in glitch_arm.
+    pio_sm_put_blocking(glitch_pio, sm_crowbar, precalc_pause_cycles);
+    pio_sm_put_blocking(glitch_pio, sm_crowbar, config.count > 0 ? config.count - 1 : 0);
+    pio_sm_put_blocking(glitch_pio, sm_crowbar, precalc_width_cycles);
+    pio_sm_put_blocking(glitch_pio, sm_crowbar, precalc_gap_cycles);
+
+    // Enable — now waits on IRQ0 alongside sm_pulse_gen; both fire together.
+    pio_sm_set_enabled(glitch_pio, sm_crowbar, true);
+    crowbar_pulse_active = true;
+}
+
+// Stops the crowbar pulse SM and returns GP11 to a GPIO-driven, polarity-aware
+// safe idle.
+static void crowbar_pulse_stop(void) {
+    extern void target_crowbar_gate_idle(void);
+    if (!crowbar_pulse_active) {
+        return;
+    }
+    pio_sm_set_enabled(glitch_pio, sm_crowbar, false);
+    crowbar_pulse_active = false;
+    target_crowbar_gate_idle();  // de-assert via SIO before next arm
+}
+
 bool glitch_arm(void) {
     if (flags.armed) {
         return false;  // Already armed
@@ -172,6 +240,10 @@ bool glitch_arm(void) {
     // Disable all trigger state machines first to ensure clean state
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
     pio_sm_set_enabled(glitch_pio, sm_uart_trigger, false);
+    // Soft-disarm leaves the pulse / crowbar SMs running (idle at 'wait irq 0')
+    // so a train can never be truncated; stop them now before we re-init them.
+    pio_sm_set_enabled(glitch_pio, sm_pulse_gen, false);
+    pio_sm_set_enabled(glitch_pio, sm_crowbar, false);
 
     // Clear their FIFOs
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
@@ -244,7 +316,7 @@ bool glitch_arm(void) {
         sm_config_set_in_pins(&c_edge, config.trigger_pin);   // IN pins for 'wait' instruction
         sm_config_set_set_pins(&c_edge, PIN_GLITCH_FIRED, 1);  // SET pins for GLITCH_FIRED
 
-        // Initialize GP12 as output for PIO0 (will set HIGH when trigger fires)
+        // Initialize GLITCH_FIRED (GP22) as output for PIO0 (will set HIGH when trigger fires)
         pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
         hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
         pio_sm_set_consecutive_pindirs(glitch_pio, sm_edge_detect, PIN_GLITCH_FIRED, 1, true);
@@ -378,7 +450,11 @@ bool glitch_arm(void) {
 
     trigger_programs_loaded = true;
 
-    // Set ARMED status HIGH (GP9)
+    // In EXTERNAL power mode, start the crowbar gate pulse SM so GP11 emits the
+    // same glitch waveform as GP2. No-op in INTERNAL mode.
+    crowbar_pulse_start();
+
+    // Set ARMED status HIGH (GP16)
     gpio_put(PIN_ARMED, 1);
 
     flags.armed = true;
@@ -498,7 +574,7 @@ bool glitch_arm_trace(void) {
 
     trigger_programs_loaded = true;
 
-    // NO pulse generator started — GP12 goes HIGH on trigger, that's it
+    // NO pulse generator started — GLITCH_FIRED (GP22) goes HIGH on trigger, that's it
     gpio_put(PIN_ARMED, 1);
     flags.armed = true;
     return true;
@@ -509,8 +585,11 @@ void glitch_disarm(void) {
         return;
     }
 
-    // Clear ARMED status LOW (GP9)
+    // Clear ARMED status LOW (GP16)
     gpio_put(PIN_ARMED, 0);
+
+    // Stop the crowbar pulse SM (if running) and return GP11 to safe idle
+    crowbar_pulse_stop();
 
     // Disable PIO state machines
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
@@ -569,7 +648,7 @@ bool glitch_execute(void) {
         return false;
     }
 
-    // Trigger IRQ 0 (glitch) via irq_trigger program, pulse GP9 for clock boost
+    // Trigger IRQ 0 (glitch) via irq_trigger program, pulse GP22 (GLITCH_FIRED) for clock boost
     // Use sm_flag_output (SM2) to trigger
     // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
     pio_sm_config c_irq = irq_trigger_program_get_default_config(offset_irq_trigger);
@@ -583,17 +662,21 @@ bool glitch_execute(void) {
     pio_sm_init(glitch_pio, sm_flag_output, offset_irq_trigger, &c_irq);
     pio_sm_set_enabled(glitch_pio, sm_flag_output, true);
 
-    // Wait for it to execute one cycle
+    // Give the pulse SMs a moment to latch IRQ0 and start their trains.
     busy_wait_us(1);
 
-    // Disable it
+    // Soft disarm: stop poking the trigger, clear IRQ0, and mark disarmed — but
+    // DO NOT disable the pulse / crowbar SMs. They run their full train to
+    // completion on their own and then idle harmlessly at 'wait irq 0' (FIFO
+    // empty). Disabling them here (the old glitch_disarm() path) tore them down
+    // mid-train, truncating the pulse count and leaving pins stuck. The next ARM
+    // re-inits them. (Explicit ARM OFF still does a full glitch_disarm.)
     pio_sm_set_enabled(glitch_pio, sm_flag_output, false);
+    pio_interrupt_clear(glitch_pio, GLITCH_IRQ_NUM);
 
-    // Increment glitch count
     glitch_count++;
-
-    // Properly disarm after executing glitch (cleans up PIO state machines)
-    glitch_disarm();
+    flags.armed = false;
+    gpio_put(PIN_ARMED, 0);
 
     return true;
 }
@@ -630,17 +713,22 @@ uint32_t glitch_get_count(void) {
         // Check if pulse generator FIFO is empty (means it fired)
         // Skip when core_programs_removed (ARM TRACE mode — no pulse generator loaded)
         if (pio_sm_is_tx_fifo_empty(glitch_pio, sm_pulse_gen)) {
-            // Glitch fired! Increment count and disarm
+            // Glitch fired (pulse SM consumed its FIFO). Mark disarmed and stop
+            // accepting NEW triggers — but do NOT disable the pulse / crowbar SMs.
+            // The FIFO empties at the START of the train (params pulled up front),
+            // so disabling the pulse SM here could truncate a still-running train
+            // mid-pulse. Left alone, it finishes and idles at 'wait irq 0' (FIFO
+            // empty); the next ARM re-inits it.
             glitch_count++;
             flags.armed = false;
+            gpio_put(PIN_ARMED, 0);
 
-            // Disable the trigger state machines since we fired
+            // Disable the trigger state machine since we fired
             if (config.trigger == TRIGGER_UART) {
                 pio_sm_set_enabled(glitch_pio, sm_uart_trigger, false);
             } else if (config.trigger == TRIGGER_GPIO) {
                 pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
             }
-            pio_sm_set_enabled(glitch_pio, sm_pulse_gen, false);
         }
     }
     return glitch_count;
@@ -711,7 +799,7 @@ void clock_enable(void) {
     sm_config_set_in_pins(&c, PIN_GLITCH_FIRED);      // IN pins for WAIT on GLITCH_FIRED
     sm_config_set_clkdiv(&c, 1.0);  // Full speed
 
-    // Clear ISO bit so PIO1 can read GP12 (set by PIO0, but readable by PIO1)
+    // Clear ISO bit so PIO1 can read GP22 (set by PIO0, but readable by PIO1)
     hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
 
     pio_sm_init(clock_pio, sm_clock_gen, offset_clock_gen_boost, &c);

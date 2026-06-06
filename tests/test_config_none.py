@@ -3,7 +3,21 @@
 Wiring: None. Only USB connection to Raiden Pico required.
 """
 
+import re
+
 import pytest
+
+
+def _glitch_count(raiden):
+    """Parse 'Glitch Count: N' out of STATUS (USB-only, no scope)."""
+    m = re.search(r"Glitch Count:\s*(\d+)", raiden.cmd("STATUS", wait=2))
+    assert m, "STATUS is missing the 'Glitch Count:' line"
+    return int(m.group(1))
+
+
+def _is_armed(resp):
+    """ARM query prints 'ARMED' or 'DISARMED' — careful, ARMED is a substring of DISARMED."""
+    return "ARMED" in resp and "DISARMED" not in resp
 
 
 # ── Help / Version / Status ──────────────────────────────────
@@ -255,6 +269,30 @@ class TestGlitch:
         r = raiden.cmd("GLITCH")
         # May fail (no trigger) or succeed, but should not crash
         assert "Glitch" in r or "ERROR" in r
+
+    def test_glitch_requires_arm(self, raiden):
+        """GLITCH while disarmed must error, not silently no-op."""
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("ARM OFF")
+        r = raiden.cmd("GLITCH")
+        assert "ERROR" in r or "Failed" in r
+
+    def test_glitch_increments_count(self, raiden):
+        """A successful manual GLITCH bumps the glitch count by exactly 1 (USB-verifiable)."""
+        raiden.cmd("TRIGGER NONE")
+        before = _glitch_count(raiden)
+        assert "armed" in raiden.cmd("ARM ON").lower()
+        assert "Glitch executed" in raiden.cmd("GLITCH")
+        assert _glitch_count(raiden) == before + 1
+
+    def test_glitch_auto_disarms(self, raiden):
+        """Manual GLITCH auto-disarms (soft disarm): ARM reports DISARMED afterwards."""
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("ARM ON")
+        assert _is_armed(raiden.cmd("ARM"))          # armed before firing
+        raiden.cmd("GLITCH")
+        assert "DISARMED" in raiden.cmd("ARM")       # auto-disarmed after firing
+        raiden.cmd("ARM OFF")
 
     def test_reset_command(self, raiden):
         r = raiden.cmd("RESET")
