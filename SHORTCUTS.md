@@ -9,9 +9,9 @@ Raiden Pico supports **non-ambiguous command shortcuts** for both primary comman
 ### Prefix Matching
 
 The shortcut system uses prefix matching for:
-- **Primary commands** (e.g., STATUS, GLITCH, PLATFORM)
-- **Sub-commands** (e.g., PLATFORM SET, CHIPSHOT ARM, TARGET INIT)
-- **Arguments** (e.g., trigger types, platform types, variable names)
+- **Primary commands** (e.g., STATUS, GLITCH, TARGET)
+- **Sub-commands** (e.g., CHIPSHOT ARM, TARGET INIT, SWEEP START)
+- **Arguments** (e.g., trigger types, variable names)
 
 Matching rules:
 - You can abbreviate by typing just the beginning
@@ -26,7 +26,6 @@ Matching rules:
 ```
 STAT      → STATUS
 GL        → GLITCH
-PLAT      → PLATFORM
 CHIP      → CHIPSHOT
 TARG      → TARGET
 SW        → SWEEP
@@ -37,12 +36,6 @@ ARM       → ARM (already short!)
 
 **Sub-Commands:**
 ```
-PLAT SET       → PLATFORM SET
-PLAT V         → PLATFORM VOLTAGE
-PLAT C         → PLATFORM CHARGE
-PLAT H         → PLATFORM HVPIN
-PLAT VP        → PLATFORM VPIN
-
 CHIP V         → CHIPSHOT VOLTAGE
 CHIP A         → CHIPSHOT ARM
 CHIP D         → CHIPSHOT DISARM
@@ -76,12 +69,6 @@ TRIG N         → TRIGGER NONE
 TRIG U         → TRIGGER UART
 TRIG G         → TRIGGER GPIO
 
-# Platform types
-PLAT SET M     → PLATFORM SET MANUAL
-PLAT SET C     → PLATFORM SET CHIPSHOUTER
-PLAT SET E     → PLATFORM SET EMFI
-PLAT SET CR    → PLATFORM SET CROWBAR
-
 # ARM states
 ARM O          → ARM ON (ambiguous with OFF!)
               → Use "ARM ON" or "ARM OF" for OFF
@@ -113,10 +100,6 @@ Some abbreviations are **ambiguous** and will result in an error:
 
 ### Sub-Command Conflicts
 
-**PLATFORM:**
-- `V` is NOT ambiguous → matches `VOLTAGE` only (VPIN requires `VP`)
-- `S` is NOT ambiguous → matches `SET` only
-
 **CHIPSHOT:**
 - `A` is NOT ambiguous → matches `ARM` only
 - `D` is NOT ambiguous → matches `DISARM` only
@@ -136,13 +119,6 @@ Some abbreviations are **ambiguous** and will result in an error:
 - `U` is NOT ambiguous → matches `UART` only
 - `G` is NOT ambiguous → matches `GPIO` only
 
-**Platform Types:**
-- `M` is NOT ambiguous → matches `MANUAL` only
-- `C` is ambiguous → matches `CHIPSHOUTER` and `CROWBAR`
-- `CH` is NOT ambiguous → matches `CHIPSHOUTER` only
-- `CR` is NOT ambiguous → matches `CROWBAR` only
-- `E` is NOT ambiguous → matches `EMFI` only
-
 **ARM States:**
 - `O` is ambiguous → matches `ON` and `OFF`
 - `ON` is NOT ambiguous → matches `ON` only
@@ -158,11 +134,6 @@ Some abbreviations are **ambiguous** and will result in an error:
 
 ### Basic Workflow (With Argument Shortcuts)
 ```
-PLAT SET CH            # Set platform to ChipShouter
-PLAT H 20              # Set HV enable pin
-PLAT VP 21             # Set voltage pin
-PLAT V 250             # Set voltage to 250V
-PLAT C 5000            # Set charge time to 5ms
 IN 10                  # Trigger input on GP10
 OUT 15                 # Output on GP15
 TRIG G                 # GPIO trigger
@@ -209,7 +180,6 @@ SW STO                           # Stop sweep
 
 | Full Command | Shortest Non-Ambiguous | Characters Saved |
 |--------------|------------------------|------------------|
-| `PLATFORM SET CHIPSHOUTER` | `PLAT SET CHIP` | 14 |
 | `CHIPSHOT VOLTAGE 250` | `CHIP V 250` | 11 |
 | `TARGET INIT` | `TARG I` | 7 |
 | `TARGET READLINE 1000` | `TARG READL 1000` | 4 |
@@ -260,7 +230,7 @@ ERROR: Unknown command. Type HELP for available commands.
 1. Start with the first letter
 2. If ambiguous, add one letter at a time until unique
 3. Common patterns:
-   - 2-3 letters for primary commands (e.g., `PLAT`, `CHIP`, `TARG`)
+   - 2-4 letters for primary commands (e.g., `STAT`, `CHIP`, `TARG`)
    - 1-3 letters for sub-commands (e.g., `V`, `ARM`, `READL`)
 
 ## Implementation Details
@@ -313,14 +283,6 @@ ERROR: Ambiguous command 'S' - be more specific
 (Correctly detected ambiguity)
 
 # Test sub-command matching
-> PLAT SET MANUAL
-OK: PLATFORM = MANUAL
-(Full command works)
-
-> PLAT SET MAN
-OK: PLATFORM = MANUAL
-(Abbreviated platform type works)
-
 > TARG I
 OK: Target UART initialized...
 (Shortest TARGET sub-command works)
@@ -356,5 +318,4 @@ Potential improvements for future versions:
 - [Main README](README.md) - Overall system documentation
 - [TARGET_UART.md](TARGET_UART.md) - Target UART feature details
 - [CHIPSHOT_UART.md](CHIPSHOT_UART.md) - ChipShouter UART control
-- [PLATFORM_GUIDE.md](PLATFORM_GUIDE.md) - Platform abstraction
 - [PIO_ARCHITECTURE.md](PIO_ARCHITECTURE.md) - PIO state machine design

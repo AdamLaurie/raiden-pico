@@ -24,13 +24,16 @@
 #define PIN_ARMED 16           // ARMED status (CPU-controlled, HIGH when armed)
 #define PIN_GLITCH_FIRED 22    // GLITCH_FIRED signal (PIO0 pulses when glitch fires)
 
-// Platform Types
+// Power group GP10/11/12 is mode-multiplexed (see power_mode_t):
+//   INTERNAL: GP10/11/12 are the ganged target power source/sink (POWER_MASK).
+//   EXTERNAL: GP10 = supply ON/OFF, GP11 = crowbar gate, GP12 = reserved spare.
+#define PIN_CROWBAR_GATE 11    // GP11 — crowbar MOSFET gate in EXTERNAL power mode (= POWER_PIN2)
+
+// Target power mode: how the GP10/11/12 group is driven (mutually exclusive by physics)
 typedef enum {
-    PLATFORM_MANUAL = 0,
-    PLATFORM_CHIPSHOUTER,
-    PLATFORM_EMFI,
-    PLATFORM_CROWBAR
-} platform_type_t;
+    POWER_MODE_INTERNAL = 0,   // GP10/11/12 ganged as the target power source (default)
+    POWER_MODE_EXTERNAL        // GP10 supply enable, GP11 crowbar gate, GP12 spare
+} power_mode_t;
 
 // Trigger Types
 typedef enum {
@@ -117,16 +120,6 @@ typedef struct {
     uint8_t trigger_uart_pin;  // GPIO pin for UART trigger snooping (GP4=TX, GP5=RX)
     // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 } glitch_config_t;
-
-// Platform Configuration
-typedef struct {
-    platform_type_t type;
-    uint8_t hv_pin;
-    uint8_t voltage_pin;
-    uint8_t armed_pin;
-    uint16_t voltage;
-    uint32_t charge_time_us;
-} platform_config_t;
 
 // Target UART Configuration
 typedef struct {

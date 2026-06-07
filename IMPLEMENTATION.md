@@ -35,7 +35,6 @@ raiden-pico-c/
 │   ├── uart_cli.h         - CLI interface API
 │   ├── command_parser.h   - Command parsing API
 │   ├── glitch.h           - Glitch control API
-│   ├── platform.h         - Platform abstraction API
 │   ├── chipshot_uart.h    - ChipShouter communication API
 │   └── target_uart.h      - Target UART API
 └── src/                    - Implementation files
@@ -43,11 +42,9 @@ raiden-pico-c/
     ├── uart_cli.c         - UART CLI with echo and buffering (106 lines)
     ├── command_parser.c   - Parser with shortcut matching (298 lines)
     ├── glitch.c           - Core glitching with PIO (175 lines)
-    ├── platform.c         - Platform control with PIO (116 lines)
     ├── chipshot_uart.c    - ChipShouter commands (88 lines)
     ├── target_uart.c      - PIO-based target UART (199 lines)
     ├── glitch.pio         - PIO programs for glitching (77 lines)
-    ├── platform.pio       - PIO programs for platform (41 lines)
     └── uart.pio           - PIO programs for UART (27 lines)
 ```
 
@@ -66,8 +63,8 @@ raiden-pico-c/
 
 #### 2. Command Parser (command_parser.c)
 - Non-ambiguous prefix matching for commands
-- Sub-command matching (PLATFORM SET, CHIPSHOT ARM, etc.)
-- Argument matching (TRIGGER UART, PLATFORM CHIPSHOUTER, etc.)
+- Sub-command matching (CHIPSHOT ARM, TARGET INIT, etc.)
+- Argument matching (TRIGGER UART, TRIGGER GPIO, etc.)
 - Clear error messages for ambiguous shortcuts
 - Uppercase normalization
 - Whitespace handling
@@ -80,7 +77,6 @@ raiden-pico-c/
 - GLITCH
 - STATUS
 - RESET
-- PLATFORM SET/VOLTAGE/CHARGE/HVPIN/VPIN
 - CHIPSHOT ARM/DISARM/FIRE/STATUS/VOLTAGE/PULSE
 - TARGET INIT/SEND/RESPONSE/RESET
 - HELP
@@ -95,15 +91,7 @@ raiden-pico-c/
 - Microsecond-precision timing
 - Multiple PIO state machine coordination
 
-#### 4. Platform Abstraction (platform.c)
-- Support for 4 platform types: MANUAL, CHIPSHOUTER, EMFI, CROWBAR
-- PIO-based voltage PWM control (0-5V range)
-- Configurable charge time with PIO timing
-- HV enable control with automatic charge delay
-- Status monitoring
-- Pin configuration
-
-#### 5. ChipShouter UART (chipshot_uart.c)
+#### 4. ChipShouter UART (chipshot_uart.c)
 - Dedicated UART on GP8 (TX) / GP9 (RX)
 - Command/response protocol
 - Arm/disarm/fire commands
@@ -111,7 +99,7 @@ raiden-pico-c/
 - Status queries
 - Response buffering
 
-#### 6. Target UART (target_uart.c)
+#### 5. Target UART (target_uart.c)
 - **PIO-based UART** (not hardware UART) for flexibility
 - Configurable TX/RX pins and baud rate
 - Hex string parsing and transmission
@@ -119,7 +107,7 @@ raiden-pico-c/
 - Reset control with configurable pin, period, and polarity
 - Shared pin support (RX doubles as trigger pin)
 
-#### 7. PIO Programs
+#### 6. PIO Programs
 
 **glitch.pio**:
 - `gpio_edge_detect`: Rising edge detection with IRQ
@@ -128,11 +116,6 @@ raiden-pico-c/
 - `pulse_generator`: Precise pulse timing with pause/width/gap
 - `flag_output`: Status flag output
 - Clock generators for various frequencies
-
-**platform.pio**:
-- `voltage_pwm`: PWM generation for voltage control
-- `platform_enable`: Enable with charge delay
-- `status_monitor`: Continuous status pin monitoring
 
 **uart.pio**:
 - `pio_uart_tx`: 8N1 UART transmit
@@ -211,12 +194,6 @@ Compare to MicroPython:
 - [ ] TRIGGER NONE disables trigger
 - [ ] TRIGGER GPIO configures edge detection
 - [ ] TRIGGER UART configures byte matching
-
-### Platform Control
-- [ ] PLATFORM SET changes type
-- [ ] PLATFORM VOLTAGE sets PWM
-- [ ] PLATFORM CHARGE sets delay
-- [ ] PLATFORM HVPIN/VPIN configures pins
 
 ### Target UART
 - [ ] TARGET INIT configures PIO UART

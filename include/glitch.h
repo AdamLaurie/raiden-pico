@@ -33,7 +33,7 @@ bool glitch_arm(void);
 void glitch_disarm(void);
 
 // Arm trigger detection only (no glitch pulse) for trace capture
-// GP12 (GLITCH_FIRED) goes HIGH on trigger, no pulse output
+// GP22 (GLITCH_FIRED) goes HIGH on trigger, no pulse output
 bool glitch_arm_trace(void);
 
 // Execute a glitch

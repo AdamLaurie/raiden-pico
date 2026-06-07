@@ -9,6 +9,16 @@ Usage:
     pytest tests/ -v --config=sweep         # + power sweep tests
     pytest tests/ -v --config=trace         # + shunt/ADC trace tests
     pytest tests/ -v --config=swd-rdp       # + destructive RDP tests
+    pytest tests/ -v --config=power-int     # + INTERNAL-mode power tests
+    pytest tests/ -v --config=power-ext     # + EXTERNAL/crowbar power tests
+
+SAFETY — power-int / power-ext: these drive the GP10/11/12 power group
+(power on/off/cycle, mode switching, and the crowbar gate fires in EXTERNAL).
+Run them ONLY with the bench wired for the matching mode, or the target
+disconnected: on the wrong wiring they can damage a connected target or short
+GP10 against GP11/12 (the ganged-harness gotcha) and report false failures.
+That's why they never run under the default config_none. Dual-mode tests carry
+BOTH markers and require both flags.
 """
 
 import os
@@ -26,6 +36,8 @@ _CONFIG_MARKERS = {
     "config_sweep": "sweep",
     "config_trace": "trace",
     "config_swd_rdp": "swd-rdp",
+    "config_power_int": "power-int",
+    "config_power_ext": "power-ext",
 }
 
 
@@ -34,7 +46,7 @@ def pytest_addoption(parser):
         "--config",
         action="append",
         default=[],
-        help="Enable a wiring config: swd, sweep, trace, swd-rdp. Repeat for multiple.",
+        help="Enable a wiring config: swd, sweep, trace, swd-rdp, power-int, power-ext. Repeat for multiple.",
     )
     parser.addoption(
         "--destructive",
@@ -70,9 +82,48 @@ class RaidenClient:
     """Serial communication helper for Raiden Pico CLI."""
 
     def __init__(self, port, baud=RAIDEN_BAUD):
+        self.port = port
+        self.baud = baud
         self.ser = serial.Serial(port, baud, timeout=3)
         time.sleep(1)
         self.ser.reset_input_buffer()
+
+    def reboot(self):
+        """Soft-reboot the device and reconnect. Writes REBOOT WITHOUT draining a
+        reply — the CDC drops mid-command, so reading in_waiting would raise an
+        I/O error — then re-opens the port via reconnect()."""
+        try:
+            self.ser.reset_input_buffer()
+            self.ser.write(b"REBOOT\r\n")
+            self.ser.flush()
+        except Exception:
+            pass
+        self.reconnect()
+
+    def reconnect(self, settle=2.0, timeout=25):
+        """Close and reopen the serial port after a REBOOT (the USB CDC drops and
+        re-enumerates). Waits for the port to come back and the CLI to respond, so
+        tests can check the power-on-reset state. Raises if it never reappears."""
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.close()
+        except Exception:
+            pass
+        time.sleep(settle)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(self.port):
+                try:
+                    self.ser = serial.Serial(self.port, self.baud, timeout=3)
+                    time.sleep(1)
+                    self.ser.reset_input_buffer()
+                    if "Raiden" in self.cmd("VERSION", wait=0.5):
+                        return
+                    self.ser.close()
+                except serial.SerialException:
+                    pass
+            time.sleep(0.5)
+        raise RuntimeError(f"{self.port} did not come back / respond after REBOOT")
 
     def cmd(self, command, wait=1.0):
         """Send command, return response text."""

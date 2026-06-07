@@ -255,8 +255,39 @@ static bool reset_pin_initialized = false;
 #define POWER_PIN2  11  // GP11
 #define POWER_PIN3  12  // GP12
 #define POWER_MASK  ((1u << POWER_PIN1) | (1u << POWER_PIN2) | (1u << POWER_PIN3))
+// Settle time after energising a cold target (rail rise + power-on reset) before
+// the connect/sync that follows. Applied only on an OFF->ON transition. Tunable.
+#define POWER_ON_SETTLE_MS  100
 static uint32_t power_cycle_time_ms = 300;  // Default 300ms cycle time
 static bool power_pin_initialized = false;
+
+// Power mode: how the GP10/11/12 group is driven (see power_mode_t in config.h).
+// INTERNAL (default) = ganged power source; EXTERNAL = GP10 supply, GP11 crowbar, GP12 spare.
+static power_mode_t power_mode = POWER_MODE_INTERNAL;
+// Crowbar gate polarity in EXTERNAL mode: true = assert HIGH / idle LOW (low-side N-FET),
+// false = assert LOW / idle HIGH (high-side P-FET / active-low gate driver).
+static bool crowbar_gate_active_high = true;
+
+// GPIO mask that target_power_on/off/cycle actually drive:
+//   INTERNAL = the whole ganged group; EXTERNAL = GP10 (supply enable) only,
+//   so we never re-grab GP11 (crowbar gate) / GP12 (spare) as power outputs.
+static inline uint32_t power_active_mask(void) {
+    return (power_mode == POWER_MODE_EXTERNAL) ? (1u << POWER_PIN1) : POWER_MASK;
+}
+
+// Force every pin in `mask` to be a driven output, then set it HIGH (on) or LOW
+// (off). gpio_set/clr_mask alone only flips the output latch — if a pin had been
+// left as an input (e.g. across a mode switch) it would read low regardless, so
+// ON/OFF must (re)assert the direction. Makes TARGET POWER ON/OFF work in both
+// power modes from any prior pin state.
+static void power_drive(uint32_t mask, bool on) {
+    for (uint pin = 0; pin < 32; pin++) {
+        if (mask & (1u << pin)) {
+            gpio_set_dir(pin, GPIO_OUT);
+        }
+    }
+    if (on) gpio_set_mask(mask); else gpio_clr_mask(mask);
+}
 
 // Debug mode
 static bool debug_mode = false;
@@ -301,14 +332,19 @@ void target_init(void) {
     // This ensures TARGET RESET works without explicit configuration
     target_reset_config(reset_pin, reset_period_ms, reset_active_high);
 
-    // Initialize power pins - ganged for higher current, default ON
+    // Initialize power pins - ganged for higher current. Boot default is OFF
+    // (de-energized) for both power modes: the boot mode is INTERNAL and the
+    // whole GP10/11/12 group is driven LOW. The target is energized on demand
+    // by TARGET POWER ON, or automatically by the auto-power-on at the
+    // TARGET SYNC / SWD CONNECT choke points. (Switching modes honours this
+    // off state, so EXTERNAL also comes up de-energized.)
     const uint8_t power_pins[] = {POWER_PIN1, POWER_PIN2, POWER_PIN3};
     for (int i = 0; i < 3; i++) {
         gpio_init(power_pins[i]);
         gpio_set_dir(power_pins[i], GPIO_OUT);
         gpio_set_drive_strength(power_pins[i], GPIO_DRIVE_STRENGTH_12MA);
     }
-    gpio_set_mask(POWER_MASK);  // All ON
+    gpio_clr_mask(POWER_MASK);  // boot default OFF (de-energized)
     power_pin_initialized = true;
 
     // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
@@ -1290,35 +1326,145 @@ static void power_ensure_init(void) {
             gpio_set_dir(pins[i], GPIO_OUT);
             gpio_set_drive_strength(pins[i], GPIO_DRIVE_STRENGTH_12MA);
         }
-        gpio_set_mask(POWER_MASK);  // Default ON
+        gpio_clr_mask(POWER_MASK);  // boot default OFF (matches target_init)
         power_pin_initialized = true;
     }
 }
 
-void target_power_on(void) {
+// Power the target on WITHOUT emitting a CLI line. Used by the auto-power-on at
+// the connect/sync choke points (TARGET SYNC, SWD CONNECT) so a target that boots
+// unpowered (power-off boot default) is energised before we reset/connect — no
+// host script needs its own POWER ON. Respects the mode: drives GP10 only in
+// EXTERNAL, the full GP10/11/12 group in INTERNAL.
+void target_power_ensure_on(void) {
     power_ensure_init();
-    gpio_set_mask(POWER_MASK);
+    // Only settle if we actually transition the supply OFF->ON. A cold target
+    // (power-off boot default) needs its rail to rise and finish its power-on
+    // reset before SWD DPIDR / bootloader sync will answer; without this the
+    // auto-power-on at the connect/sync choke points races the target's bring-up.
+    // If the supply is already on (e.g. repeated SYNC per heatmap shot), no delay.
+    bool was_on = gpio_get(POWER_PIN1);   // GP10 = supply state in both modes
+    power_drive(power_active_mask(), true);
+    if (!was_on) {
+        sleep_ms(POWER_ON_SETTLE_MS);
+    }
+}
+
+void target_power_on(void) {
+    target_power_ensure_on();   // silent core: power_ensure_init + power_drive(...on)
     uart_cli_send("OK: Target power ON\r\n");
 }
 
 void target_power_off(void) {
     power_ensure_init();
-    gpio_clr_mask(POWER_MASK);
+    power_drive(power_active_mask(), false);
     uart_cli_send("OK: Target power OFF\r\n");
 }
 
 void target_power_cycle(uint32_t time_ms) {
     power_ensure_init();
-    gpio_clr_mask(POWER_MASK);
+    power_drive(power_active_mask(), false);
     uart_cli_printf("OK: Target power cycling (OFF for %u ms)...\r\n", time_ms);
     sleep_ms(time_ms);
-    gpio_set_mask(POWER_MASK);
+    power_drive(power_active_mask(), true);
     uart_cli_send("OK: Target power ON\r\n");
 }
 
 bool target_power_get_state(void) {
     power_ensure_init();
     return gpio_get(POWER_PIN1);
+}
+
+// ---- Power mode (internal source group vs external supply + crowbar gate) ----
+
+power_mode_t target_get_power_mode(void) {
+    return power_mode;
+}
+
+bool target_crowbar_gate_active_high(void) {
+    return crowbar_gate_active_high;
+}
+
+// Drive the crowbar gate (GP11) to its safe, de-asserted idle level as a plain
+// GPIO output. Used at mode switch, disarm, and boot so a wrong/floating idle
+// can never clamp the rail. Polarity-aware: idle = LOW when active-high, HIGH
+// when active-low. Clears any PIO outover left over from an armed window.
+void target_crowbar_gate_idle(void) {
+    // Stage the SIO output (de-asserted value + output-enable) while the pin is
+    // still PIO-held at its idle level, then switch the function mux to SIO LAST.
+    // GP11 is driven to the de-asserted level the instant SIO takes over — with
+    // NO high-Z window and NO driven-assert. gpio_set_function() writes the whole
+    // CTRL register, resetting OUTOVER to NORMAL atomically with the mux switch, so
+    // the de-asserted value (set directly via gpio_put) needs no inversion.
+    // (The old gpio_init-first order forced the pin to input first, leaving GP11
+    //  briefly floating = a shallow spurious dip in active-low mode; and enabling
+    //  the output before clearing the armed INVERT drove a full spurious assert.)
+    gpio_put(PIN_CROWBAR_GATE, crowbar_gate_active_high ? 0 : 1);  // SIO_OUT (staged)
+    gpio_set_dir(PIN_CROWBAR_GATE, GPIO_OUT);                      // SIO_OE  (staged)
+    gpio_set_function(PIN_CROWBAR_GATE, GPIO_FUNC_SIO);            // mux -> SIO (resets OUTOVER -> NORMAL)
+}
+
+// Set crowbar gate polarity. Re-applies a safe idle immediately when already in
+// EXTERNAL mode so the new polarity's idle level takes effect at once.
+void target_set_crowbar_polarity(bool active_high) {
+    crowbar_gate_active_high = active_high;
+    if (power_mode == POWER_MODE_EXTERNAL) {
+        target_crowbar_gate_idle();
+    }
+}
+
+// Switch the GP10/11/12 group between INTERNAL (ganged power source) and
+// EXTERNAL (GP10 supply enable, GP11 crowbar gate, GP12 reserved spare).
+// Both directions honour the current GP10 supply on/off state (boot default is
+// OFF; an explicit POWER ON / choke-point auto-power-on before the switch stays on).
+void target_set_power_mode(power_mode_t mode) {
+    power_ensure_init();
+    bool supply_on = gpio_get(POWER_PIN1);
+
+    if (mode == POWER_MODE_EXTERNAL) {
+        // GP10 = supply enable: keep it a driven 12mA output and honour the
+        // current on/off state. No gpio_init here -> no momentary low blip that
+        // would briefly cut a powered target during the switch.
+        gpio_set_dir(POWER_PIN1, GPIO_OUT);
+        gpio_set_drive_strength(POWER_PIN1, GPIO_DRIVE_STRENGTH_12MA);
+        gpio_put(POWER_PIN1, supply_on);
+        // GP11 = crowbar gate at safe de-asserted idle (plain GPIO until
+        // glitch_arm hands it to the crowbar pulse SM).
+        target_crowbar_gate_idle();
+        // GP12 = reserved spare: driven LOW (defined safe level). A bare input
+        // floats/reads HIGH on RP2350 (erratum E9 input leakage), so we drive
+        // it low rather than leave it high-Z.
+        gpio_init(POWER_PIN3);
+        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_put(POWER_PIN3, 0);
+    } else {
+        // Keep GP10 a driven output (no gpio_init -> no low blip) and re-gang
+        // GP11/GP12 as 12mA power outputs, all matching the honoured supply state.
+        gpio_set_dir(POWER_PIN1, GPIO_OUT);
+        gpio_set_drive_strength(POWER_PIN1, GPIO_DRIVE_STRENGTH_12MA);
+        gpio_set_outover(PIN_CROWBAR_GATE, GPIO_OVERRIDE_NORMAL);
+        const uint8_t pins[] = {POWER_PIN2, POWER_PIN3};
+        for (int i = 0; i < 2; i++) {
+            gpio_init(pins[i]);
+            gpio_set_dir(pins[i], GPIO_OUT);
+            gpio_set_drive_strength(pins[i], GPIO_DRIVE_STRENGTH_12MA);
+        }
+        if (supply_on) gpio_set_mask(POWER_MASK); else gpio_clr_mask(POWER_MASK);
+    }
+    power_mode = mode;
+}
+
+// True when a CPU-side power-group glitch routine must not run because the group
+// is in EXTERNAL mode (GP11 belongs to the crowbar gate, GP12 is a spare).
+// Emits a CLI error pointing at the PIO crowbar path.
+static bool power_group_glitch_blocked(void) {
+    if (power_mode == POWER_MODE_EXTERNAL) {
+        uart_cli_send("ERROR: power-group glitch unavailable in EXTERNAL mode "
+                      "(GP11 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
+                      "or switch back with 'TARGET POWER INT'.\r\n");
+        return true;
+    }
+    return false;
 }
 
 // ADC configuration for voltage monitoring
@@ -1588,6 +1734,7 @@ static int sram_test_read_pattern(uint32_t sram_base) {
 // SRAM retention sweep — based on stimpik by Sean Cross (xobs)
 // https://github.com/xobs/stimpik
 void target_power_sweep(void) {
+    if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
     extern void swd_init(void);
@@ -1828,6 +1975,7 @@ void target_power_sweep(void) {
 
 // Repeated power glitch at a fixed threshold — reports success rate
 void target_power_glitch(float voltage, uint32_t count) {
+    if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
     extern void swd_init(void);
@@ -1972,6 +2120,7 @@ void target_power_glitch(float voltage, uint32_t count) {
 //   [LPC GLITCH] attempt=N vmin=X.XXV bor=Y/N dur=Nus isp=normal|bypass|effect|sync_fail
 // ----------------------------------------------------------------------------
 void target_power_lpc_glitch(uint32_t count) {
+    if (power_group_glitch_blocked()) return;
     // ---- guardrails ----
     // After the v1 of this function bricked a Pico (likely via cap-discharge
     // inrush through GP10/11/12 during repeated full-drop glitches), reject
@@ -2162,6 +2311,7 @@ void target_power_lpc_glitch(uint32_t count) {
 
 // Upload payload to SRAM, set BOOT0/BOOT1 for SRAM boot, power glitch to reset
 void target_power_payload(float voltage, uint32_t max_attempts) {
+    if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
     extern void swd_init(void);
@@ -2333,6 +2483,7 @@ void target_power_payload(float voltage, uint32_t max_attempts) {
 }
 
 void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
+    if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
     extern bool swd_resume(void);
@@ -4832,7 +4983,7 @@ void trace_start(uint32_t samples, uint32_t pre_pct_arg) {
     irq_set_exclusive_handler(DMA_IRQ_0, trace_dma_isr);
     irq_set_enabled(DMA_IRQ_0, true);
 
-    // Set up GP12 rising edge interrupt (GLITCH_FIRED) via shared dispatcher
+    // Set up GP22 rising edge interrupt (GLITCH_FIRED) via shared dispatcher
     gpio_irq_register(PIN_GLITCH_FIRED, GPIO_IRQ_EDGE_RISE, trace_glitch_fired_isr);
 
     // Start DMA then ADC

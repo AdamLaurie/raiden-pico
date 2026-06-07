@@ -60,7 +60,7 @@ OK: ChipShouter voltage set to 300V
 ```
 
 **Notes**:
-- Setting via UART also updates local `PLATFORM VOLTAGE` config
+- Setting via UART also updates Raiden's local voltage config
 - Range: 0-500V (ChipShouter dependent)
 
 ### 3. Arm/Disarm
@@ -150,13 +150,7 @@ ChipShouter: Firmware v2.1.0
 Control ChipShouter entirely from Raiden Pico (no PC needed):
 
 ```
-# 1. Configure platform
-PLATFORM SET CHIPSHOUTER
-PLATFORM HVPIN 20
-PLATFORM VPIN 21
-PLATFORM CHARGE 5000
-
-# 2. Configure ChipShouter via UART
+# 1. Configure ChipShouter via UART
 CHIPSHOT VOLTAGE 250
 CHIPSHOT ARM
 
@@ -193,7 +187,6 @@ def send(cmd):
     return ser.read(ser.in_waiting).decode()
 
 # Configure system
-send('PLATFORM SET CHIPSHOUTER')
 send('CHIPSHOT VOLTAGE 250')
 send('IN 10')
 send('OUT 15')
@@ -234,12 +227,6 @@ ser.close()
 Use both GPIO and UART control simultaneously:
 
 ```
-# Setup
-PLATFORM SET CHIPSHOUTER
-PLATFORM HVPIN 20           # GPIO HV enable (PIO-controlled)
-PLATFORM VPIN 21            # GPIO voltage control (PIO PWM)
-PLATFORM CHARGE 5000
-
 # Configure ChipShouter voltage via UART
 CHIPSHOT VOLTAGE 250
 
@@ -291,9 +278,6 @@ CHIPSHOT DISARM
 # Check UART pins
 CHIPSHOT UARTPINS 8 9
 
-# Try reinitializing platform
-PLATFORM SET CHIPSHOUTER
-
 # Send simple command
 CHIPSHOT CMD help
 ```
@@ -310,7 +294,6 @@ CHIPSHOT SYNC
 Or set explicitly:
 ```
 CHIPSHOT VOLTAGE 250        # Set ChipShouter via UART
-PLATFORM VOLTAGE 250        # Set Raiden local config
 ```
 
 ### UART Conflicts
@@ -318,9 +301,8 @@ PLATFORM VOLTAGE 250        # Set Raiden local config
 
 **Solution**:
 ```
-# Use different pins before initializing platform
+# Use different pins
 CHIPSHOT UARTPINS 12 13
-PLATFORM SET CHIPSHOUTER
 ```
 
 ### Timeout Errors

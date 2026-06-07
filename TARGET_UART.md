@@ -235,10 +235,7 @@ Interact with target bootloader to verify glitch success:
 TARGET INIT
 
 # 2. Configure glitching
-PLATFORM SET CHIPSHOUTER
-PLATFORM VOLTAGE 200
-PLATFORM HVPIN 20
-PLATFORM VPIN 21
+CS VOLTAGE 200
 IN 10
 OUT 15
 TRIGGER GPIO
@@ -278,10 +275,7 @@ def send(cmd):
     return ser.read(ser.in_waiting).decode()
 
 # Configure Raiden
-send('PLATFORM SET CHIPSHOUTER')
-send('PLATFORM VOLTAGE 250')
-send('PLATFORM HVPIN 20')
-send('PLATFORM VPIN 21')
+send('CS VOLTAGE 250')
 send('IN 10')
 send('OUT 15')
 send('TRIGGER GPIO')
@@ -393,11 +387,8 @@ SET PAUSE 100           # 100µs after seeing '>'
 SET WIDTH 50            # 50µs glitch pulse
 SET COUNT 1
 
-# 4. Configure platform
-PLATFORM SET CHIPSHOUTER
-PLATFORM VOLTAGE 250
-PLATFORM HVPIN 20
-PLATFORM VPIN 21
+# 4. Configure ChipSHOUTER
+CS VOLTAGE 250
 
 # 5. Arm and wait
 ARM ON
@@ -471,11 +462,8 @@ send('SET PAUSE 100')
 send('SET WIDTH 50')
 send('SET COUNT 1')
 
-# Configure platform
-send('PLATFORM SET CHIPSHOUTER')
-send('PLATFORM VOLTAGE 250')
-send('PLATFORM HVPIN 20')
-send('PLATFORM VPIN 21')
+# Configure ChipSHOUTER
+send('CS VOLTAGE 250')
 send('ARM ON')
 
 # Configure target reset

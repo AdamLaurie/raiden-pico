@@ -1,6 +1,6 @@
 ; GPIO RISING edge detection (0->1) - ONE-SHOT trigger with debouncing
 ; Debounce: wait for LOW, add delay, verify LOW, then wait for HIGH
-; SET pin pulses GP12 (GLITCH_FIRED) to signal PIO1 clock boost
+; SET pin pulses GP22 (GLITCH_FIRED) to signal PIO1 clock boost
 .program gpio_edge_detect_rising
 start:
     wait 0 pin 0        ; Wait for trigger pin to be LOW
@@ -10,14 +10,14 @@ start:
     wait 0 pin 0        ; Verify pin is still LOW (stable)
     wait 1 pin 0        ; Wait for RISING edge (LOW->HIGH)
     irq set 0           ; Trigger glitch via IRQ
-    set pins, 1         ; Pulse GP12 HIGH (GLITCH_FIRED signal for clock boost)
+    set pins, 1         ; Pulse GP22 HIGH (GLITCH_FIRED signal for clock boost)
 .wrap_target
     jmp 0               ; Halt: infinite loop, one-shot trigger
 .wrap
 
 ; GPIO FALLING edge detection (1->0) - ONE-SHOT trigger with debouncing
 ; Debounce: wait for HIGH, add delay, verify HIGH, then wait for LOW
-; SET pin pulses GP12 (GLITCH_FIRED) to signal PIO1 clock boost
+; SET pin pulses GP22 (GLITCH_FIRED) to signal PIO1 clock boost
 .program gpio_edge_detect_falling
 start:
     wait 1 pin 0        ; Wait for trigger pin to be HIGH
@@ -27,7 +27,7 @@ start:
     wait 1 pin 0        ; Verify pin is still HIGH (stable)
     wait 0 pin 0        ; Wait for FALLING edge (HIGH->LOW)
     irq set 0           ; Trigger glitch via IRQ
-    set pins, 1         ; Pulse GP12 HIGH (GLITCH_FIRED signal for clock boost)
+    set pins, 1         ; Pulse GP22 HIGH (GLITCH_FIRED signal for clock boost)
 .wrap_target
     jmp 0               ; Halt: infinite loop, one-shot trigger
 .wrap
@@ -60,11 +60,11 @@ bitloop:
 
     ; Match! Trigger the glitch
     irq set 0           ; Trigger glitch via IRQ
-    set pins, 1         ; Pulse GP9 HIGH
+    set pins, 1         ; Pulse GP22 (GLITCH_FIRED) HIGH
     nop [31]            ; Hold for 32 cycles
     nop [31]            ; Hold for 32 cycles
     nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
-    set pins, 0         ; Return GP9 LOW
+    set pins, 0         ; Return GP22 (GLITCH_FIRED) LOW
 .wrap
 
 ; Pulse generator with IRQ trigger and COUNT loop
@@ -105,6 +105,10 @@ gap_loop:
     jmp y-- pulse_loop  side 0  ; Loop COUNT times
 .wrap                           ; Wrap back to start to wait for next trigger
 
+; (The crowbar gate is driven by a 2nd copy of the pulse_generator program on a
+;  free PIO0 SM — see crowbar_pulse_start() in glitch.c. PIO1 cannot read GP2's
+;  input on this RP2350B, so the old GP2->GP11 follower program was removed.)
+
 ; Flag output - outputs 4-bit flags to GPIO
 .program flag_output
 .wrap_target
@@ -129,7 +133,7 @@ low:
 
 ; Clock generator with GLITCH_FIRED boost
 ; Y = normal_half_period, ISR = fast_half_period (set by C via pio_sm_exec)
-; JMP pin = GP12 (GLITCH_FIRED from PIO0 - set HIGH on glitch, cleared on next ARM)
+; JMP pin = GP22 (GLITCH_FIRED from PIO0 - set HIGH on glitch, cleared on next ARM)
 ; Note: GLITCH_FIRED can only be HIGH when armed, so no need to check ARMED separately
 .program clock_generator_with_boost
 .wrap_target
@@ -145,7 +149,7 @@ high_normal:
 low_normal:
     jmp x-- low_normal
 
-    ; Check if GLITCH_FIRED (GP12 HIGH via JMP pin)
+    ; Check if GLITCH_FIRED (GP22 HIGH via JMP pin)
     jmp pin boost_entry     ; If glitch fired, trigger boost
     jmp normal_clock        ; Otherwise, continue normal clock
 
@@ -183,15 +187,15 @@ low_boost:
     set pins, 0         ; Set output LOW
 .wrap
 
-; IRQ trigger helper - sets IRQ 0 and pulses GP9 for clock boost
+; IRQ trigger helper - sets IRQ 0 and pulses GP22 (GLITCH_FIRED) for clock boost
 ; This allows CPU to trigger via pio_sm_exec without instruction overhead
-; SET pin should be configured to GP9 (boost semaphore)
+; SET pin should be configured to GP22 (GLITCH_FIRED boost semaphore)
 .program irq_trigger
 .wrap_target
     irq set 0           ; Trigger glitch via IRQ
-    set pins, 1         ; Pulse GP9 HIGH
+    set pins, 1         ; Pulse GP22 (GLITCH_FIRED) HIGH
     nop [31]            ; Hold for 32 cycles
     nop [31]            ; Hold for 32 cycles
     nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
-    set pins, 0         ; Return GP9 LOW
+    set pins, 0         ; Return GP22 (GLITCH_FIRED) LOW
 .wrap

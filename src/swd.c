@@ -329,6 +329,10 @@ bool swd_is_connected(void) {
 bool swd_ensure_connected(void) {
     if (connected)
         return true;
+    // Energise the target before connecting — covers the power-off boot default,
+    // so SWD READ/WRITE/HALT (and breakpoint helpers) work without a host POWER ON.
+    extern void target_power_ensure_on(void);
+    target_power_ensure_on();
     return swd_connect();
 }
 

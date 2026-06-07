@@ -3,7 +3,21 @@
 Wiring: None. Only USB connection to Raiden Pico required.
 """
 
+import re
+
 import pytest
+
+
+def _glitch_count(raiden):
+    """Parse 'Glitch Count: N' out of STATUS (USB-only, no scope)."""
+    m = re.search(r"Glitch Count:\s*(\d+)", raiden.cmd("STATUS", wait=2))
+    assert m, "STATUS is missing the 'Glitch Count:' line"
+    return int(m.group(1))
+
+
+def _is_armed(resp):
+    """ARM query prints 'ARMED' or 'DISARMED' — careful, ARMED is a substring of DISARMED."""
+    return "ARMED" in resp and "DISARMED" not in resp
 
 
 # ── Help / Version / Status ──────────────────────────────────
@@ -256,9 +270,63 @@ class TestGlitch:
         # May fail (no trigger) or succeed, but should not crash
         assert "Glitch" in r or "ERROR" in r
 
+    def test_glitch_requires_arm(self, raiden):
+        """GLITCH while disarmed must error, not silently no-op."""
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("ARM OFF")
+        r = raiden.cmd("GLITCH")
+        assert "ERROR" in r or "Failed" in r
+
+    def test_glitch_increments_count(self, raiden):
+        """A successful manual GLITCH bumps the glitch count by exactly 1 (USB-verifiable)."""
+        raiden.cmd("TRIGGER NONE")
+        before = _glitch_count(raiden)
+        assert "armed" in raiden.cmd("ARM ON").lower()
+        assert "Glitch executed" in raiden.cmd("GLITCH")
+        assert _glitch_count(raiden) == before + 1
+
+    def test_glitch_auto_disarms(self, raiden):
+        """Manual GLITCH auto-disarms (soft disarm): ARM reports DISARMED afterwards."""
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("ARM ON")
+        assert _is_armed(raiden.cmd("ARM"))          # armed before firing
+        raiden.cmd("GLITCH")
+        assert "DISARMED" in raiden.cmd("ARM")       # auto-disarmed after firing
+        raiden.cmd("ARM OFF")
+
     def test_reset_command(self, raiden):
         r = raiden.cmd("RESET")
         assert "ERROR" not in r
+
+
+# ── Auto power-on at the connect/sync choke points ───────────
+
+@pytest.mark.config_power_int
+class TestAutoPowerOn:
+    """SWD CONNECT and TARGET SYNC energise the target first, so a power-off boot
+    default (or an explicit POWER OFF) doesn't leave them connecting to a dead
+    target. USB-only: we assert power flips back ON even though no target is wired
+    (the connect itself fails, which is fine — we only check it powered on first).
+
+    GATED config_power_int: this drives the INTERNAL GP10/11/12 power group
+    (POWER OFF then auto-ON), so it needs --config=power-int (confirm INTERNAL/
+    ganged wiring, or no target). It does not run under the default config_none."""
+
+    def test_swd_connect_auto_powers_target(self, raiden):
+        raiden.cmd("TARGET POWER INT")
+        raiden.cmd("TARGET POWER OFF")
+        assert "(GP10/11/12): OFF" in raiden.cmd("TARGET POWER")
+        raiden.cmd("SWD CONNECT", wait=2)        # no target -> connect fails, but powers on first
+        assert "(GP10/11/12): ON" in raiden.cmd("TARGET POWER")
+        raiden.cmd("SWD DISCONNECT")
+
+    def test_sync_auto_powers_target(self, raiden):
+        raiden.cmd("TARGET LPC")
+        raiden.cmd("TARGET POWER INT")
+        raiden.cmd("TARGET POWER OFF")
+        assert "(GP10/11/12): OFF" in raiden.cmd("TARGET POWER")
+        raiden.cmd("TARGET SYNC 115200 12000 50 1", wait=4)  # no target -> sync fails, powers on first
+        assert "(GP10/11/12): ON" in raiden.cmd("TARGET POWER")
 
 
 # ── API mode ─────────────────────────────────────────────────
@@ -307,6 +375,28 @@ class TestTrace:
     def test_trace_reset(self, raiden):
         r = raiden.cmd("TRACE RESET")
         assert "ERROR" not in r
+
+
+# ── ADC one-shot reads (official 0-based channel naming) ─────
+
+class TestAdc:
+
+    def test_adc_channel0_is_gp26(self, raiden):
+        r = raiden.cmd("ADC 0")
+        assert "ADC0" in r and "GP26" in r and "voltage" in r
+
+    def test_adc_channel1_is_gp27(self, raiden):
+        r = raiden.cmd("ADC 1")
+        assert "ADC1" in r and "GP27" in r and "voltage" in r
+
+    def test_adc_bare_reads_both(self, raiden):
+        r = raiden.cmd("ADC")
+        assert "ADC0" in r and "ADC1" in r
+
+    def test_adc_old_one_based_selector_rejected(self, raiden):
+        # Channels are 0-based now; the old 1-based 'ADC 2' must error.
+        r = raiden.cmd("ADC 2")
+        assert "ERROR" in r
 
 
 # ── Breakpoint management ────────────────────────────────────

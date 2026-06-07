@@ -26,7 +26,6 @@ add_executable(raiden_pico
     src/main.c
     src/uart_cli.c
     src/command_parser.c
-    src/platform.c
     src/glitch.c
     src/chipshot_uart.c
     src/target_uart.c
@@ -45,7 +44,6 @@ target_include_directories(raiden_pico PRIVATE
 
 # Generate PIO headers
 pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/glitch.pio)
-pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/platform.pio)
 # grbl.pio not used - Grbl now uses hardware UART1 on GP8/GP9 (alternate function)
 # pico_generate_pio_header(raiden_pico ${CMAKE_CURRENT_LIST_DIR}/src/grbl.pio)
 # uart.pio not used - target UART uses hardware UART (uart1), not PIO

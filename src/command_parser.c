@@ -168,6 +168,15 @@ static bool match_and_replace(char **part, const char **candidates, uint8_t coun
         api_error_printf("ERROR: Ambiguous %s '%s' - be more specific\r\n", context, *part);
         return false;
     }
+    // command_parser_match() returns the original string (same pointer) when it
+    // matches no candidate — a lenient passthrough that would let a mistyped
+    // sub-command (e.g. "TARGET POWER WIBBLE") slip through as if valid. A keyword
+    // gate must reject the unknown token, not silently accept it, so callers don't
+    // fall through to a wrong/no-op branch.
+    if (matched == *part) {
+        api_error_printf("ERROR: Unknown %s '%s'\r\n", context, *part);
+        return false;
+    }
     *part = (char*)matched;
     return true;
 }
@@ -249,11 +258,11 @@ void command_parser_execute(cmd_parts_t *parts) {
     // Match primary command
     const char *primary_commands[] = {
         "SET", "GET", "TRIGGER", "PINS",
-        "STATUS", "RESET", "PLATFORM", "CS", "TARGET", "ARM", "GLITCH",
+        "STATUS", "RESET", "CS", "TARGET", "ARM", "GLITCH",
         "HELP", "REBOOT", "DEBUG", "API", "ERROR", "SWD", "JTAG",
         "TRACE", "VERSION", "CLOCK", "GRBL", "ADC"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 23, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 22, "command")) {
         goto api_response;
     }
 
@@ -291,11 +300,6 @@ void command_parser_execute(cmd_parts_t *parts) {
     if (strcmp(parts->parts[0], "TRIGGER") == 0 && parts->count == 2) {
         const char *trigger_types[] = {"NONE", "UART", "GPIO"};
         if (!match_and_replace(&parts->parts[1], trigger_types, 3, "trigger type")) {
-            goto api_response;
-        }
-    } else if (strcmp(parts->parts[0], "PLATFORM") == 0 && strcmp(parts->parts[1], "SET") == 0 && parts->count == 3) {
-        const char *platform_types[] = {"MANUAL", "CHIPSHOUTER", "EMFI", "CROWBAR"};
-        if (!match_and_replace(&parts->parts[2], platform_types, 4, "platform type")) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "ARM") == 0 && parts->count == 2) {
@@ -379,6 +383,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE [ms]]  - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET POWER [INT|EXT [AHIGH|ALOW]] - Set power group mode\r\n");
+        uart_cli_send("                   INT = GP10/11/12 ganged power source (default)\r\n");
+        uart_cli_send("                   EXT = GP10 supply, GP11 crowbar gate, GP12 spare\r\n");
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
@@ -417,9 +424,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TRIGGER UART <byte> [TX|RX] - UART byte trigger (TX=Raiden TX, RX=Raiden RX)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ADC ==\r\n");
-        uart_cli_send("ADC                    - Read both: GP26 (target VDD) + GP27 (shunt)\r\n");
-        uart_cli_send("ADC 1                  - Read GP26 only (target VDD monitor)\r\n");
-        uart_cli_send("ADC 2                  - Read GP27 only (shunt current monitor)\r\n");
+        uart_cli_send("ADC                    - Read both: ADC0/GP26 (target VDD) + ADC1/GP27 (shunt)\r\n");
+        uart_cli_send("ADC 0                  - Read ADC0/GP26 only (target VDD monitor)\r\n");
+        uart_cli_send("ADC 1                  - Read ADC1/GP27 only (shunt current monitor)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ADC Trace (GP27/ADC1 shunt current) ==\r\n");
         uart_cli_send("TRACE                  - Show trace status\r\n");
@@ -474,7 +481,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.5\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.6\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -571,7 +578,15 @@ void command_parser_execute(cmd_parts_t *parts) {
             target_type_str = info ? info->name : "STM32";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
-        uart_cli_printf("Power (GP10): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+        if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
+            uart_cli_printf("Power mode:   EXTERNAL (GP10 supply enable, GP11 crowbar gate %s, GP12 spare)\r\n",
+                            target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
+                                                              : "active-LOW/idle-HIGH");
+            uart_cli_printf("Supply (GP10):%s\r\n", target_power_get_state() ? " ON" : " OFF");
+        } else {
+            uart_cli_send("Power mode:   INTERNAL (GP10/11/12 ganged source)\r\n");
+            uart_cli_printf("Power (GP10/11/12): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+        }
         uart_cli_printf("Reset (GP15): HIGH, LOW 300ms pulse\r\n");
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
@@ -904,9 +919,18 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  Pico GP9 <- controller pin 6 (controller TX)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");
-        uart_cli_send("GP11 - Target Power (ganged, default ON, 12mA drive)\r\n");
-        uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
+        if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
+            uart_cli_send("GP10 - Target Power supply enable (EXTERNAL mode)\r\n");
+            uart_cli_printf("GP11 - Crowbar gate, PIO-driven, same waveform as GP2 (%s)\r\n",
+                            target_crowbar_gate_active_high() ? "active-HIGH, idle LOW"
+                                                              : "active-LOW, idle HIGH");
+            uart_cli_send("GP12 - Reserved spare (EXTERNAL mode, no function)\r\n");
+        } else {
+            uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");
+            uart_cli_send("GP11 - Target Power (ganged, default ON, 12mA drive)\r\n");
+            uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
+        }
+        uart_cli_send("       (GP10/11/12 mode: TARGET POWER [INT|EXT])\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("GP13 - BOOT0 Control\r\n");
@@ -1099,6 +1123,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
 
+            // Ensure the target is powered before reset/bootloader entry (covers
+            // the power-off boot default — no host POWER ON needed).
+            target_power_ensure_on();
+
             // For STM32, set BOOT0 HIGH before reset (bootloader mode)
             bool is_stm32 = target_is_stm32(target_get_type());
             if (is_stm32) {
@@ -1233,11 +1261,23 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
             if (parts->count < 3) {
+                // Query: power on/off state + current group mode / crowbar polarity
                 bool power_state = target_power_get_state();
-                uart_cli_printf("Target power (GP10): %s\r\n", power_state ? "ON" : "OFF");
+                bool ext = (target_get_power_mode() == POWER_MODE_EXTERNAL);
+                uart_cli_printf("Target power (%s): %s\r\n",
+                                ext ? "GP10 supply" : "GP10/11/12", power_state ? "ON" : "OFF");
+                if (ext) {
+                    uart_cli_printf("Power mode: EXTERNAL (GP10 supply enable, GP11 crowbar gate %s, GP12 spare)\r\n",
+                                    target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
+                                                                      : "active-LOW/idle-HIGH");
+                } else {
+                    uart_cli_send("Power mode: INTERNAL (GP10/11/12 ganged power source)\r\n");
+                }
             } else {
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 3, "POWER command")) {
+                // ON/OFF/CYCLE drive the supply; INTERNAL/EXTERNAL set the GP10/11/12
+                // group mode directly (INT/EXT resolve via prefix match).
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "INTERNAL", "EXTERNAL"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 5, "POWER command")) {
                     goto api_response;
                 }
 
@@ -1254,6 +1294,31 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     target_power_cycle(cycle_time_ms);
+                } else {
+                    // INTERNAL / EXTERNAL — set the group mode. Changing mode while
+                    // armed would tear GP11 out from under the crowbar pulse SM, so
+                    // refuse and make the user disarm first.
+                    if (glitch_get_flags()->armed) {
+                        api_error("ERROR: disarm (ARM OFF) before changing power mode\r\n");
+                        goto api_response;
+                    }
+                    if (strcmp(parts->parts[2], "EXTERNAL") == 0) {
+                        // Optional crowbar gate polarity: AHIGH (default) | ALOW
+                        if (parts->count >= 4) {
+                            const char *pol_names[] = {"AHIGH", "ALOW"};
+                            if (!match_and_replace(&parts->parts[3], pol_names, 2, "gate polarity")) {
+                                goto api_response;
+                            }
+                            target_set_crowbar_polarity(strcmp(parts->parts[3], "AHIGH") == 0);
+                        }
+                        target_set_power_mode(POWER_MODE_EXTERNAL);
+                        uart_cli_printf("OK: Power mode EXTERNAL (GP10 supply, GP11 crowbar gate %s, GP12 spare)\r\n",
+                                        target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
+                                                                          : "active-LOW/idle-HIGH");
+                    } else {  // INTERNAL
+                        target_set_power_mode(POWER_MODE_INTERNAL);
+                        uart_cli_send("OK: Power mode INTERNAL (GP10/11/12 ganged power source)\r\n");
+                    }
                 }
             }
         } else if (strcmp(parts->parts[1], "BL") == 0) {
@@ -2157,6 +2222,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         }
 
         if (strcmp(parts->parts[1], "CONNECT") == 0) {
+            target_power_ensure_on();  // energise target first (power-off boot default)
             if (swd_connect()) {
                 uint32_t dpidr;
                 swd_read_dp(DP_DPIDR, &dpidr);
@@ -2166,6 +2232,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
 
         } else if (strcmp(parts->parts[1], "CONNECTRST") == 0) {
+            target_power_ensure_on();  // energise target first (power-off boot default)
             if (swd_connect_under_reset()) {
                 uart_cli_send("OK: Connected under reset, core halted\r\n");
             } else {
@@ -3445,10 +3512,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         }
 
     } else if (strcmp(parts->parts[0], "ADC") == 0) {
-        // One-shot read of the two ADC inputs.
+        // One-shot read of the two ADC inputs. Channels use the official
+        // RP2350 numbering, which starts at 0:
         //   ADC          → both channels
-        //   ADC 1        → GP26 / ADC0 only  (target VDD monitor)
-        //   ADC 2        → GP27 / ADC1 only  (shunt current monitor)
+        //   ADC 0        → ADC0 / GP26 only  (target VDD monitor)
+        //   ADC 1        → ADC1 / GP27 only  (shunt current monitor)
         //
         // NOTE: do NOT call adc_gpio_init() — on RP2350 it leaves the pin
         // in a state that latches HIGH and won't release until the next
@@ -3457,29 +3525,29 @@ void command_parser_execute(cmd_parts_t *parts) {
         // analog path is independent of the digital function.
         adc_init();
 
-        int which = 0;  // 0 = both
+        int which = -1;  // -1 = both
         if (parts->count >= 2) {
-            if (strcmp(parts->parts[1], "1") == 0) {
+            if (strcmp(parts->parts[1], "0") == 0) {
+                which = 0;
+            } else if (strcmp(parts->parts[1], "1") == 0) {
                 which = 1;
-            } else if (strcmp(parts->parts[1], "2") == 0) {
-                which = 2;
             } else {
-                api_error("ERROR: Usage: ADC [1|2]   (1=GP26 power, 2=GP27 shunt)\r\n");
+                api_error("ERROR: Usage: ADC [0|1]   (0=ADC0/GP26 power, 1=ADC1/GP27 shunt)\r\n");
                 goto api_response;
             }
         }
-        if (which == 0 || which == 1) {
+        if (which == -1 || which == 0) {
             adc_select_input(0);
             uint16_t raw = adc_read();
             float v = raw * 3.3f / 4095.0f;
-            uart_cli_printf("ADC1 (GP26, target VDD): raw=%u  voltage=%.3fV\r\n",
+            uart_cli_printf("ADC0 (GP26, target VDD): raw=%u  voltage=%.3fV\r\n",
                             raw, v);
         }
-        if (which == 0 || which == 2) {
+        if (which == -1 || which == 1) {
             adc_select_input(1);
             uint16_t raw = adc_read();
             float v = raw * 3.3f / 4095.0f;
-            uart_cli_printf("ADC2 (GP27, shunt):      raw=%u  voltage=%.3fV\r\n",
+            uart_cli_printf("ADC1 (GP27, shunt):      raw=%u  voltage=%.3fV\r\n",
                             raw, v);
         }
 

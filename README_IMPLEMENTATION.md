@@ -16,7 +16,7 @@ The original MicroPython implementation grew to over 2,145 lines and 73 KB of by
 - **Command-line interface** via UART (115200 baud on GP0/GP1)
 - **Non-ambiguous command shortcuts** for interactive use
 - **Multiple trigger modes**: GPIO edge detection, UART byte matching
-- **Platform support**: Manual, ChipShouter, EMFI, Crowbar
+- **Glitch outputs**: Manual pulse output, ChipShouter EMFI control, and crowbar voltage glitching
 - **PIO-based timing**: Precise glitch timing using RP2350 PIO state machines
 - **Target UART**: PIO-based UART for bootloader communication
 - **ChipShouter control**: Direct UART control of ChipShouter device
@@ -100,7 +100,6 @@ raiden-pico-c/
 │   ├── uart_cli.h         - CLI interface
 │   ├── command_parser.h   - Command parsing with shortcuts
 │   ├── glitch.h           - Glitch control API
-│   ├── platform.h         - Platform abstraction
 │   ├── chipshot_uart.h    - ChipShouter communication
 │   └── target_uart.h      - Target UART communication
 └── src/
@@ -108,11 +107,9 @@ raiden-pico-c/
     ├── uart_cli.c         - UART CLI implementation
     ├── command_parser.c   - Command parser with shortcut matching
     ├── glitch.c           - Core glitch functionality
-    ├── platform.c         - Platform control (voltage, charge, enable)
     ├── chipshot_uart.c    - ChipShouter UART commands
     ├── target_uart.c      - PIO-based target UART
     ├── glitch.pio         - PIO programs for glitching
-    ├── platform.pio       - PIO programs for platform control
     └── uart.pio           - PIO programs for UART
 ```
 
@@ -126,9 +123,6 @@ raiden-pico-c/
 | CLI RX | GP1 | Main UART RX (from host) |
 | Glitch Output | GP2 | Default glitch pulse output |
 | Trigger Input | GP3 | Default GPIO trigger input |
-| HV Enable | GP4 | Platform HV enable |
-| Voltage Control | GP5 | Platform voltage PWM |
-| Status Monitor | GP6 | Platform status input |
 | ChipShouter TX | GP8 | ChipShouter UART TX |
 | ChipShouter RX | GP9 | ChipShouter UART RX |
 | Target TX | GP10 | Target bootloader TX |
