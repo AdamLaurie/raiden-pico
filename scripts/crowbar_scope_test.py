@@ -106,9 +106,9 @@ SCENARIOS = [
 
 def configure(r, sc):
     if sc["mode"] == "EXT":
-        r.cmd(f"TARGET POWER MODE EXT {sc['pol']}")
+        r.cmd(f"TARGET POWER EXT {sc['pol']}")
     else:
-        r.cmd("TARGET POWER MODE INT")
+        r.cmd("TARGET POWER INT")
     r.cmd("TRIGGER NONE")
     r.cmd(f"SET PAUSE {sc['pause']}")
     r.cmd(f"SET WIDTH {sc['width']}")
@@ -165,7 +165,7 @@ def run_scenario(r, idx, sc, shots, rate):
         ok = ok and ok2
 
     # leave the part disarmed; INTERNAL is the safe resting mode
-    r.cmd("TARGET POWER MODE INT")
+    r.cmd("TARGET POWER INT")
     return ok
 
 
@@ -197,7 +197,7 @@ def main():
             if not args.only:
                 time.sleep(args.pause_between)
     finally:
-        r.cmd("TARGET POWER MODE INT")
+        r.cmd("TARGET POWER INT")
         r.cmd("ARM OFF")
         r.close()
 

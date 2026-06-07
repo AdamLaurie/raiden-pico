@@ -119,8 +119,6 @@ voltage_sm.put(pwm_params)
 ### SM5: HV Enable
 **Purpose**: Control high voltage enable with charge delay
 
-**PIO Program**: `platform_enable()`
-
 **Operation**:
 - Controls HV enable pin (HIGH = enabled, LOW = disabled)
 - Supports configurable charge delay (in microseconds)
@@ -347,9 +345,6 @@ print(f"SM4 active: {voltage_sm.active()}")
 ### Common Issues
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| No PWM output | SM4 not started | Call `platform_init()` |
-| Voltage incorrect | Wrong PWM duty | Check `PLATFORM VOLTAGE` setting |
-| HV won't enable | SM5 FIFO stalled | Reset with `platform_init()` |
 | Glitch jitter | Wrong PIO clock | Verify SM1 running at 1MHz |
 
 ---

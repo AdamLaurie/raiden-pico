@@ -30,10 +30,12 @@ pytest tests/ -v --config=swd      # requires SWD target wired
 pytest tests/ -v --config=sweep    # requires target power + ADC26 wiring
 pytest tests/ -v --config=trace    # requires shunt resistor + ADC1 wiring
 pytest tests/ -v --config=swd-rdp --destructive   # DESTRUCTIVE: mass-erases target flash
+pytest tests/ -v --config=power-int   # drives GP10/11/12 in INTERNAL mode — confirm ganged wiring / no target
+pytest tests/ -v --config=power-ext   # EXTERNAL mode + FIRES the crowbar gate — confirm crowbar wiring / no target
 pytest tests/test_config_swd.py::test_name -v      # single test
 ```
 
-Tests are gated by `--config` wiring markers (see `tests/conftest.py` and `pyproject.toml`); without flags only hardware-free tests run. `RAIDEN_PORT` env var overrides the serial port.
+Tests are gated by `--config` wiring markers (see `tests/conftest.py` and `pyproject.toml`); without flags only hardware-free tests run. **The power-group tests (`TARGET POWER` modes + crowbar fire) are gated behind `power-int`/`power-ext` and never run by default** — on the wrong wiring they can damage a connected target or short GP10 against GP11/12. `RAIDEN_PORT` env var overrides the serial port.
 
 ## Architecture
 
@@ -43,9 +45,8 @@ Raiden Pico is RP2350 firmware that turns a Pico 2 into a fault-injection / glit
 
 ### Subsystem map (`src/` + matching `include/` headers)
 
-- **`command_parser.c`** — the hub (~3500 lines). A flat `if/strcmp` dispatch over the first token (`SET`, `GET`, `TRIGGER`, `ARM`, `GLITCH`, `TARGET`, `SWD`, `JTAG`, `GRBL`, `CS`, `TRACE`, `ADC`, `PLATFORM`, …). Supports non-ambiguous command abbreviation via `command_parser_match`. **New CLI commands go here**, dispatched out to the relevant subsystem.
+- **`command_parser.c`** — the hub (~3500 lines). A flat `if/strcmp` dispatch over the first token (`SET`, `GET`, `TRIGGER`, `ARM`, `GLITCH`, `TARGET`, `SWD`, `JTAG`, `GRBL`, `CS`, `TRACE`, `ADC`, …). Supports non-ambiguous command abbreviation via `command_parser_match`. **New CLI commands go here**, dispatched out to the relevant subsystem.
 - **`glitch.c` + `glitch.pio`** — core glitch engine. Uses PIO state machines for trigger detection and precise pulse generation. Config lives in `glitch_config_t` (`config.h`): `PAUSE/WIDTH/GAP/COUNT` in 150 MHz cycles (6.67 ns each), plus `VMIN`.
-- **`platform.c` + `platform.pio`** — glitch "platform" abstraction: `MANUAL`, `CHIPSHOUTER` (EMFI), `EMFI`, `CROWBAR`.
 - **`target_uart.c`** — large subsystem (~4900 lines) for talking to targets over UART1: bootloader entry, LPC ISP + STM32 USART bootloader (AN3155) commands, power control, and the power-glitch / ADC-gated bypass routines.
 - **`chipshot_uart.c`** — ChipSHOUTER control over UART0 (GP0/GP1).
 - **`swd.c`, `jtag.c`** — bit-banged SWD (GP17/GP18, nRST GP15) and JTAG for ARM debug, flash dumping, RDP/CRP inspection.
@@ -56,7 +57,7 @@ Raiden Pico is RP2350 firmware that turns a Pico 2 into a fault-injection / glit
 
 1. **UART1 is shared between Target (GP4/GP5) and GRBL (GP8/GP9)** via pin alternate-functions — only one can be live at a time. Commands auto-switch, but switching breaks the other connection. **After any GRBL command you must re-run `TARGET SYNC` before `TARGET SEND` works again.** (Full workflow in the section below.)
 
-2. **VMIN = ADC-gated glitching.** `SET VMIN <mV>` (0 = disabled) switches the glitch from a fixed-time PIO pulse to a CPU-side primitive that drops the rail and polls **ADC1 on GP26** until the probed voltage reaches the threshold, then holds for `WIDTH` cycles of minimum dwell. **Requires the target rail wired to GP26.** Currently routes through `TARGET GLITCH LPCBYPASS` and the STM32 sweep/test paths; PIO triggers (UART/GPIO) still use WIDTH-only timed pulses. See `VMIN.md`.
+2. **VMIN = ADC-gated glitching.** `SET VMIN <mV>` (0 = disabled) switches the glitch from a fixed-time PIO pulse to a CPU-side primitive that drops the rail and polls **ADC0 on GP26** until the probed voltage reaches the threshold, then holds for `WIDTH` cycles of minimum dwell. **Requires the target rail wired to GP26.** Currently routes through `TARGET GLITCH LPCBYPASS` and the STM32 sweep/test paths; PIO triggers (UART/GPIO) still use WIDTH-only timed pulses. See `VMIN.md`.
 
 ### Pin assignments
 
@@ -66,7 +67,7 @@ Authoritative source is `include/config.h` (and `swd.h` for debug pins); the liv
 
 ## Reference docs
 
-Extensive Markdown docs at the repo root document specific workflows and findings: `README.md` (full CLI command reference), `VMIN.md`, `TARGET_UART.md`, `CHIPSHOT_UART.md`, `GLITCHING_GUIDE.md`, `PLATFORM_GUIDE.md`, `PIO_ARCHITECTURE.md`, `SHORTCUTS.md`, and the various `*_RESULTS.md` / `*_FINDINGS.md` campaign notes.
+Extensive Markdown docs at the repo root document specific workflows and findings: `README.md` (full CLI command reference), `VMIN.md`, `TARGET_UART.md`, `CHIPSHOT_UART.md`, `GLITCHING_GUIDE.md`, `PIO_ARCHITECTURE.md`, `SHORTCUTS.md`, and the various `*_RESULTS.md` / `*_FINDINGS.md` campaign notes.
 
 ## UART Switching (Target vs Grbl)
 

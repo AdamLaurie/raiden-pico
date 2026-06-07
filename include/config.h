@@ -35,14 +35,6 @@ typedef enum {
     POWER_MODE_EXTERNAL        // GP10 supply enable, GP11 crowbar gate, GP12 spare
 } power_mode_t;
 
-// Platform Types
-typedef enum {
-    PLATFORM_MANUAL = 0,
-    PLATFORM_CHIPSHOUTER,
-    PLATFORM_EMFI,
-    PLATFORM_CROWBAR
-} platform_type_t;
-
 // Trigger Types
 typedef enum {
     TRIGGER_NONE = 0,
@@ -128,16 +120,6 @@ typedef struct {
     uint8_t trigger_uart_pin;  // GPIO pin for UART trigger snooping (GP4=TX, GP5=RX)
     // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 } glitch_config_t;
-
-// Platform Configuration
-typedef struct {
-    platform_type_t type;
-    uint8_t hv_pin;
-    uint8_t voltage_pin;
-    uint8_t armed_pin;
-    uint16_t voltage;
-    uint32_t charge_time_us;
-} platform_config_t;
 
 // Target UART Configuration
 typedef struct {

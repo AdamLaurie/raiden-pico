@@ -28,7 +28,7 @@ A GPIO assignment lives in **four** places that must stay consistent. When you a
 1. **The definition** — `include/config.h` (or the relevant header, e.g. `swd.h`, `jtag.h`, target headers). This is the source of truth.
 2. **The `PINS` CLI command** — its output in `src/command_parser.c` must list the new/changed pin. (Also update any `HELP`/usage strings that name the pin.)
 3. **`README.md`** — the pin/wiring reference section.
-4. **Per-target wiring docs** — e.g. `NRF52840_WIRING_*.md`, `PIC18_ICSP.md`, `EFM32_GLITCH.md`, `PLATFORM_GUIDE.md` — whichever describe the affected wiring.
+4. **Per-target wiring docs** — e.g. `NRF52840_WIRING_*.md`, `PIC18_ICSP.md`, `EFM32_GLITCH.md` — whichever describe the affected wiring.
 
 A pin change that updates the `#define` but not the `PINS` output or the docs is incomplete — reviewers should request the doc/CLI updates before merge.
 

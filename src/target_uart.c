@@ -255,6 +255,9 @@ static bool reset_pin_initialized = false;
 #define POWER_PIN2  11  // GP11
 #define POWER_PIN3  12  // GP12
 #define POWER_MASK  ((1u << POWER_PIN1) | (1u << POWER_PIN2) | (1u << POWER_PIN3))
+// Settle time after energising a cold target (rail rise + power-on reset) before
+// the connect/sync that follows. Applied only on an OFF->ON transition. Tunable.
+#define POWER_ON_SETTLE_MS  100
 static uint32_t power_cycle_time_ms = 300;  // Default 300ms cycle time
 static bool power_pin_initialized = false;
 
@@ -329,14 +332,19 @@ void target_init(void) {
     // This ensures TARGET RESET works without explicit configuration
     target_reset_config(reset_pin, reset_period_ms, reset_active_high);
 
-    // Initialize power pins - ganged for higher current, default ON
+    // Initialize power pins - ganged for higher current. Boot default is OFF
+    // (de-energized) for both power modes: the boot mode is INTERNAL and the
+    // whole GP10/11/12 group is driven LOW. The target is energized on demand
+    // by TARGET POWER ON, or automatically by the auto-power-on at the
+    // TARGET SYNC / SWD CONNECT choke points. (Switching modes honours this
+    // off state, so EXTERNAL also comes up de-energized.)
     const uint8_t power_pins[] = {POWER_PIN1, POWER_PIN2, POWER_PIN3};
     for (int i = 0; i < 3; i++) {
         gpio_init(power_pins[i]);
         gpio_set_dir(power_pins[i], GPIO_OUT);
         gpio_set_drive_strength(power_pins[i], GPIO_DRIVE_STRENGTH_12MA);
     }
-    gpio_set_mask(POWER_MASK);  // All ON
+    gpio_clr_mask(POWER_MASK);  // boot default OFF (de-energized)
     power_pin_initialized = true;
 
     // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
@@ -1318,14 +1326,32 @@ static void power_ensure_init(void) {
             gpio_set_dir(pins[i], GPIO_OUT);
             gpio_set_drive_strength(pins[i], GPIO_DRIVE_STRENGTH_12MA);
         }
-        gpio_set_mask(POWER_MASK);  // Default ON
+        gpio_clr_mask(POWER_MASK);  // boot default OFF (matches target_init)
         power_pin_initialized = true;
     }
 }
 
-void target_power_on(void) {
+// Power the target on WITHOUT emitting a CLI line. Used by the auto-power-on at
+// the connect/sync choke points (TARGET SYNC, SWD CONNECT) so a target that boots
+// unpowered (power-off boot default) is energised before we reset/connect — no
+// host script needs its own POWER ON. Respects the mode: drives GP10 only in
+// EXTERNAL, the full GP10/11/12 group in INTERNAL.
+void target_power_ensure_on(void) {
     power_ensure_init();
+    // Only settle if we actually transition the supply OFF->ON. A cold target
+    // (power-off boot default) needs its rail to rise and finish its power-on
+    // reset before SWD DPIDR / bootloader sync will answer; without this the
+    // auto-power-on at the connect/sync choke points races the target's bring-up.
+    // If the supply is already on (e.g. repeated SYNC per heatmap shot), no delay.
+    bool was_on = gpio_get(POWER_PIN1);   // GP10 = supply state in both modes
     power_drive(power_active_mask(), true);
+    if (!was_on) {
+        sleep_ms(POWER_ON_SETTLE_MS);
+    }
+}
+
+void target_power_on(void) {
+    target_power_ensure_on();   // silent core: power_ensure_init + power_drive(...on)
     uart_cli_send("OK: Target power ON\r\n");
 }
 
@@ -1390,7 +1416,7 @@ void target_set_crowbar_polarity(bool active_high) {
 // Switch the GP10/11/12 group between INTERNAL (ganged power source) and
 // EXTERNAL (GP10 supply enable, GP11 crowbar gate, GP12 reserved spare).
 // Both directions honour the current GP10 supply on/off state (boot default is
-// ON; an explicit POWER OFF before the switch stays off).
+// OFF; an explicit POWER ON / choke-point auto-power-on before the switch stays on).
 void target_set_power_mode(power_mode_t mode) {
     power_ensure_init();
     bool supply_on = gpio_get(POWER_PIN1);
@@ -1435,7 +1461,7 @@ static bool power_group_glitch_blocked(void) {
     if (power_mode == POWER_MODE_EXTERNAL) {
         uart_cli_send("ERROR: power-group glitch unavailable in EXTERNAL mode "
                       "(GP11 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
-                      "or switch back with 'TARGET POWER MODE INT'.\r\n");
+                      "or switch back with 'TARGET POWER INT'.\r\n");
         return true;
     }
     return false;

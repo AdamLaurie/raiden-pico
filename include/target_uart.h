@@ -69,6 +69,7 @@ void target_power_on(void);
 void target_power_off(void);
 void target_power_cycle(uint32_t time_ms);
 bool target_power_get_state(void);
+void target_power_ensure_on(void);  // silent power-on for connect/sync choke points
 
 // Power mode (GP10/11/12 group: INTERNAL source vs EXTERNAL supply + crowbar gate)
 void target_set_power_mode(power_mode_t mode);

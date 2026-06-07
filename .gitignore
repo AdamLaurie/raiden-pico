@@ -47,4 +47,5 @@ node_modules/
 *.log
 *.csv
 *.uue
+glitch_log_*.html
 .claude/settings.local.json

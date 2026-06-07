@@ -6,8 +6,7 @@
 #include "config.h"
 #include <stdio.h>
 
-// Forward declarations for platform and UART modules
-extern void platform_init(void);
+// Forward declarations for UART modules
 extern void chipshot_uart_init(void);
 extern void chipshot_uart_process(void);
 extern void target_uart_process(void);
@@ -42,9 +41,6 @@ int main() {
 
     printf("Initializing glitch...\n");
     glitch_init();
-
-    printf("Initializing platform...\n");
-    platform_init();
 
     printf("Initializing ChipShouter UART...\n");
     chipshot_uart_init();

@@ -6,6 +6,8 @@ markers = [
     "config_trace: Shunt resistor + ADC1 wiring required",
     "config_swd: STM32 target via SWD required",
     "config_swd_rdp: Destructive RDP tests (mass erases flash)",
+    "config_power_int: Drives the GP10/11/12 group in INTERNAL mode — confirm INTERNAL/ganged wiring (or no target)",
+    "config_power_ext: Drives GP10/11/12 in EXTERNAL mode and fires the crowbar gate — confirm EXTERNAL/crowbar wiring (or no target)",
     "destructive: Test modifies target state permanently",
 ]
 addopts = "--strict-markers"

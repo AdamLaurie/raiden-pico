@@ -21,7 +21,7 @@ Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.co
 - **Precise timing control**: PIO-based glitch generation with 6.67ns resolution (150 MHz system clock)
 - **8 x Hardware UART**: Alternate configs are leveraged to share UART0/1 across multiple pinouts
 - **Multiple trigger modes**: GPIO, UART byte matching, or software triggers
-- **Platform support**: Manual, ChipSHOUTER EMFI, generic EMFI, and crowbar voltage glitching
+- **Glitch outputs**: Manual pulse output (GP2/GP7), ChipSHOUTER EMFI control (`CS` commands), and crowbar voltage glitching (EXTERNAL power mode, GP11)
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
 - **GRBL XYZ support**: Direct UART control of GRBL CNC platform
@@ -135,7 +135,7 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Displays chip variant, armed state, glitch parameters, trigger mode, and pin configuration
 
 **`PINS`** - Show pin configuration
-- Lists current GPIO assignments for glitch output, triggers, and platform control
+- Lists current GPIO assignments for glitch output, triggers, and power/target control
 
 **`RESET`** - Reset system to default state
 - Clears all configuration and returns to power-on defaults
@@ -162,9 +162,9 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 **`SET VMIN <mV>`** - ADC-gated glitch-depth threshold (millivolts)
 - **Wiring required:** the target's reference rail (e.g. JTAG `VTref`,
   the chip's VDD pin, or whichever rail you intend to monitor while
-  glitching) must be wired to **GP26 (ADC1)**. Without that wire the
+  glitching) must be wired to **GP26 (ADC0)**. Without that wire the
   CPU has nothing to gate on and the glitch will never reach its
-  threshold. Verify with `ADC 1` — should return the target's idle
+  threshold. Verify with `ADC 0` — should return the target's idle
   voltage (or a divided version of it).
 - `0` (default) = disabled. Glitches use the standard time-based PIO pulse
   defined by WIDTH/GAP/PAUSE/COUNT.
@@ -211,34 +211,6 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `TRIGGER UART 0D` (trigger on '\r' from target)
 - Example: `TRIGGER UART EE TX` (trigger on 0xEE sent to target)
 - PIO-based decoder works with 8N1, 8E1, or any parity mode
-
-#### Platform Control
-
-Raiden Pico supports multiple glitching platforms with different control requirements.
-
-**`PLATFORM SET <MANUAL|CHIPSHOUTER|EMFI|CROWBAR>`**
-- `MANUAL` - Direct control, no automatic platform management
-- `CHIPSHOUTER` - NewAE ChipSHOUTER EMFI tool (UART control)
-- `EMFI` - Generic EMFI platform with HV enable control
-- `CROWBAR` - Voltage glitching with crowbar circuit
-
-**`PLATFORM VOLTAGE <mv>`** - Set platform voltage
-- For voltage glitching platforms
-- Value in millivolts
-- Example: `PLATFORM VOLTAGE 3300` (3.3V)
-
-**`PLATFORM CHARGE <ms>`** - Set charge time
-- For EMFI platforms that require capacitor charging
-- Value in milliseconds
-- Example: `PLATFORM CHARGE 100`
-
-**`PLATFORM HVPIN <pin>`** - Set HV enable pin
-- GPIO pin that controls high voltage enable
-- Example: `PLATFORM HVPIN 15`
-
-**`PLATFORM VPIN <pin>`** - Set voltage control pin
-- GPIO pin for voltage control (PWM or analog)
-- Example: `PLATFORM VPIN 14`
 
 #### Glitch Execution
 
@@ -330,7 +302,7 @@ Single-run traces contain large periodic current dips (~every 4-5 seconds) unrel
 
 Raiden Pico includes built-in support for entering bootloader mode on common microcontrollers.
 
-**`TARGET <LPC|STM32>`** - Set target microcontroller type
+**`TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4>`** - Set target microcontroller type
 - Configures bootloader entry protocol
 - `LPC` - NXP LPC series (ISP protocol)
 - `STM32` - STMicroelectronics STM32 series
@@ -344,8 +316,9 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 **`TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries]`** - Reset and enter bootloader
 - Performs target reset, waits, then enters bootloader
 - Includes automatic retry logic for reliability
-- Defaults: 115200 baud, 12000 kHz crystal, 10ms reset delay, 5 retries
-- Example: `TARGET SYNC 115200 12000 10 5`
+- Energises the target first, so no separate `TARGET POWER ON` is needed
+- Defaults: 115200 baud, 12000 kHz crystal, 500ms reset delay, 5 retries
+- Example: `TARGET SYNC 115200 12000 500 5`
 
 **`TARGET SEND <hex|"text">`** - Send data to target
 - Send hex bytes or quoted text to target UART
@@ -366,29 +339,33 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - `OFF` - Disable power
 - `CYCLE` - Power cycle with optional duration (default: 300ms)
 - In `EXTERNAL` mode these drive **GP10 only** (the supply enable); GP11/GP12 are not touched.
+- **Boot default is OFF** (de-energized) in both modes. The target is powered on demand
+  by `TARGET POWER ON`, or automatically by the auto-power-on at the `TARGET SYNC` /
+  `SWD CONNECT` choke points. Scripts that drive the target without going through a choke
+  point (e.g. `TARGET RESET`-only or JTAG flows) must issue `TARGET POWER ON` first.
 
-**`TARGET POWER MODE [INT|EXT [AHIGH|ALOW]]`** - Select how the GP10/11/12 group is driven
+**`TARGET POWER [INT|EXT [AHIGH|ALOW]]`** - Select how the GP10/11/12 group is driven
 - `INT` (default) - GP10/11/12 ganged as the target power source/sink (current behaviour).
 - `EXT` - GP10 = supply enable, **GP11 = crowbar gate** (PIO-driven, emits the same glitch
   waveform as GP2 for any trigger type), GP12 = reserved spare.
 - `AHIGH` (default) - crowbar gate asserts HIGH, idle LOW (low-side N-FET).
 - `ALOW` - crowbar gate asserts LOW, idle HIGH (high-side P-FET / active-low driver).
-- Bare `TARGET POWER MODE` prints the current mode + gate polarity. Disarm (`ARM OFF`)
+- Bare `TARGET POWER` prints the power on/off state, the current mode, and gate polarity. Disarm (`ARM OFF`)
   before switching. The CPU-side power-group glitch routines (`SWEEP`/`GLITCH`/`PAYLOAD`/
   `BYPASS`/LPC bypass) are refused in `EXT` mode — use the PIO crowbar (`ARM` + trigger).
 
-**`TARGET POWER SWEEP`** - Calibrate voltage glitch threshold
+**`TARGET GLITCH SWEEP`** - Calibrate voltage glitch threshold
 - Ramps target power down via ADC monitoring to find brown-out reset voltage
 - Required before PAYLOAD or BYPASS commands
 
-**`TARGET POWER GLITCH <voltage> [count]`** - Power glitch attack
+**`TARGET GLITCH TEST <voltage> [count]`** - Power glitch attack
 - Glitch target power to specified voltage threshold
 - Default: 1 attempt
 
-**`TARGET POWER PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
+**`TARGET GLITCH PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
 - Power glitch then re-enter bootloader to check for ISP code readout bypass
 
-**`TARGET POWER BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
+**`TARGET GLITCH BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
 - Two-stage attack: POR glitch → FPB redirect → UART flash dump at 115200 baud
 - Default: 20 attempts, full flash size
 - See [STM32F1 RDP1 Bypass Workflow](#4-stm32f1-rdp1-bypass) below
@@ -451,6 +428,7 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD CONNECT`** - Connect to target via SWD
 - Performs line reset + JTAG-to-SWD switch sequence
 - Reads and displays DPIDR on success
+- Energises the target first (SWD READ/WRITE/HALT auto-connect and do the same), so no separate `TARGET POWER ON` is needed
 
 **`SWD CONNECTRST`** - Connect under reset
 - Holds nRST, connects via SWD, halts core, releases nRST
@@ -580,10 +558,6 @@ SET COUNT 1         # Single pulse (output on GP2/GP7)
 # Set up trigger on GP3
 TRIGGER GPIO RISING
 
-# Configure platform
-PLATFORM SET CROWBAR
-PLATFORM VOLTAGE 3300
-
 # Arm and test
 ARM ON
 STATUS              # Verify configuration
@@ -632,11 +606,11 @@ ARM ON
 
 Extract flash from an RDP Level 1 protected STM32F103 using voltage fault injection and FPB (Flash Patch and Breakpoint) redirect.
 
-This attack is based on the original [stimpik](https://github.com/xobs/stimpik) research by Sean Cross (xobs), which demonstrated STM32F1 RDP bypass via voltage fault injection to achieve SRAM boot with memory retention. Raiden Pico's implementation improves on this by replacing the non-deterministic timing-based glitch (which requires many random attempts to hit the right moment) with a **deterministic approach** based on known ARM Cortex-M brown-out reset (BOR) behaviour at specific voltage thresholds. The `TARGET POWER SWEEP` command characterises the target's exact BOR threshold and SRAM retention window, meaning the subsequent attack glitch is calibrated to land in the proven-working voltage range every time — typically succeeding on the first attempt.
+This attack is based on the original [stimpik](https://github.com/xobs/stimpik) research by Sean Cross (xobs), which demonstrated STM32F1 RDP bypass via voltage fault injection to achieve SRAM boot with memory retention. Raiden Pico's implementation improves on this by replacing the non-deterministic timing-based glitch (which requires many random attempts to hit the right moment) with a **deterministic approach** based on known ARM Cortex-M brown-out reset (BOR) behaviour at specific voltage thresholds. The `TARGET GLITCH SWEEP` command characterises the target's exact BOR threshold and SRAM retention window, meaning the subsequent attack glitch is calibrated to land in the proven-working voltage range every time — typically succeeding on the first attempt.
 
 #### Tuning
 
-If `TARGET POWER SWEEP` shows nRST being triggered at every threshold but no SRAM retention (all reads fail), the power rail capacitance is too low — the voltage drops below the BOR threshold too quickly for SRAM to retain its contents. Add decoupling capacitors (10-100µF) across the target VDD/GND to slow the voltage decay. Conversely, if nRST never triggers, the capacitance is too high and the voltage doesn't drop fast enough — reduce or remove external capacitors on VDD. The goal is a sweep that shows a range of thresholds where nRST fires AND SRAM contents are fully retained.
+If `TARGET GLITCH SWEEP` shows nRST being triggered at every threshold but no SRAM retention (all reads fail), the power rail capacitance is too low — the voltage drops below the BOR threshold too quickly for SRAM to retain its contents. Add decoupling capacitors (10-100µF) across the target VDD/GND to slow the voltage decay. Conversely, if nRST never triggers, the capacitance is too high and the voltage doesn't drop fast enough — reduce or remove external capacitors on VDD. The goal is a sweep that shows a range of thresholds where nRST fires AND SRAM contents are fully retained.
 
 A healthy sweep on a well-decoupled STM32F103 looks like this — nRST fires at every threshold, SRAM is fully retained down to ~0.81V, and the BOR floor is found at ~0.76V where the first retention failure appears:
 
@@ -673,7 +647,7 @@ BOR threshold: ~0.76V
 Calibration saved: optimal threshold=0.81V
 ```
 
-The saved threshold (0.81V — the lowest still-retaining row) is what gets passed automatically to `TARGET POWER BYPASS`/`PAYLOAD` for the attack glitch.
+The saved threshold (0.81V — the lowest still-retaining row) is what gets passed automatically to `TARGET GLITCH BYPASS`/`PAYLOAD` for the attack glitch.
 
 #### Wiring
 
@@ -692,7 +666,7 @@ The saved threshold (0.81V — the lowest still-retaining row) is what gets pass
 
 #### How it works
 
-1. **Calibrate**: `TARGET POWER SWEEP` ramps power down to find the brown-out reset (BOR) threshold voltage
+1. **Calibrate**: `TARGET GLITCH SWEEP` ramps power down to find the brown-out reset (BOR) threshold voltage
 2. **Upload**: Payload is written to SRAM via SWD — contains a NOP sled, FPB configuration (stage 1), and UART flash dump code (stage 2)
 3. **BOOT0=HIGH, POR glitch**: Power is cut below BOR threshold then restored. The glitch causes a power-on reset while BOOT0 is held high, forcing SRAM boot. The NOP sled catches all possible SRAM entry points
 4. **Stage 1**: Code configures FPB to redirect the reset vector fetch (address 0x04) to a remap table in SRAM containing stage 2's address, then signals ready via LED
@@ -707,13 +681,13 @@ The saved threshold (0.81V — the lowest still-retaining row) is what gets pass
 SWD RDP
 
 # Calibrate glitch threshold
-TARGET POWER SWEEP
+TARGET GLITCH SWEEP
 
 # Full flash dump (128KB for F103)
-TARGET POWER BYPASS
+TARGET GLITCH BYPASS
 
 # Partial dump (first 256 bytes, up to 50 attempts)
-TARGET POWER BYPASS 50 256
+TARGET GLITCH BYPASS 50 256
 ```
 
 #### Example output
@@ -876,7 +850,7 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 
 ### STM32 Attack / RDP Bypass
 
-- **GPIO 10/11/12** - Target Power (ganged, default ON, 12mA drive each) — *INTERNAL power mode*
+- **GPIO 10/11/12** - Target Power (ganged, **boot default OFF**, 12mA drive each) — *INTERNAL power mode*
 - **GPIO 13** - BOOT0 control
 - **GPIO 14** - BOOT1 control
 - **GPIO 15** - nRST (shared with Target Reset)
@@ -886,7 +860,7 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 
 ### EXTERNAL Power / Crowbar Mode
 
-When the GP10/11/12 group is switched to EXTERNAL mode (`TARGET POWER MODE EXT`), the
+When the GP10/11/12 group is switched to EXTERNAL mode (`TARGET POWER EXT`), the
 three pins are re-tasked (they are mutually exclusive with INTERNAL power-source use):
 
 - **GPIO 10** - Supply enable (driven by `TARGET POWER ON/OFF/CYCLE`)
