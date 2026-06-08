@@ -49,3 +49,4 @@ node_modules/
 *.uue
 glitch_log_*.html
 .claude/settings.local.json
+.claude/scheduled_tasks.*

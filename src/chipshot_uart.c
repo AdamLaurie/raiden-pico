@@ -222,11 +222,17 @@ void chipshot_get_status(void) {
 }
 
 void chipshot_get_hv_out(void) {
-    chipshot_uart_send("help\n");
+    // "get voltage" reports the capacitor-bank charge voltage: the set value
+    // plus the actual MEASURED HV when armed (invalid/off when disarmed).
+    // (Was wrongly sending "help", which dumped the console command list.)
+    chipshot_uart_send("get voltage\n");
 }
 
 void chipshot_get_faults(void) {
-    chipshot_uart_send("get faults_current\n");
+    // ChipSHOUTER serial console uses "fault" (singular), not the Python API's
+    // "faults_current". "get fault" prints the current state of all faults.
+    // (See the CW520 manual serial command list.)
+    chipshot_uart_send("get fault\n");
 }
 
 bool chipshot_is_armed(void) {
@@ -241,6 +247,13 @@ void chipshot_set_trigger_hw(bool active_high) {
     extern glitch_config_t* glitch_get_config(void);
     glitch_config_t *cfg = glitch_get_config();
 
+    // High-impedance (~2KOhm) trigger input so the Pico's 3.3V GP2 GPIO can cross
+    // the ChipSHOUTER's 2V trigger threshold. The 50Ohm default (which a CS RESET
+    // restores) pulls a weak GPIO below threshold, so the CS arms + charges but
+    // never fires. hwtrig_term takes 1/0; 0 = high-impedance.
+    chipshot_uart_send("set hwtrig_term 0\r\n");
+    sleep_ms(50);
+
     // Configure pull resistor on glitch output pin based on active high/low
     if (active_high) {
         // Active high: configure pull-down so pin idles low
@@ -254,10 +267,11 @@ void chipshot_set_trigger_hw(bool active_high) {
 }
 
 void chipshot_set_trigger_sw(void) {
-    // Disable hardware trigger by moving it to unused port
-    // This requires two commands: set hwtrig_term and set emode
-    chipshot_uart_send("set hwtrig_term True\n");
-    sleep_ms(100);  // Give ChipSHOUTER time to process
-    chipshot_uart_send("set emode True\n");
-    // Note: In SW mode, glitches must be fired by calling chipshot_fire() from interrupt routine
+    // Software-triggered mode: fire via the "pulse" command (chipshot_fire).
+    // Terminate the unused hardware-trigger SMB input at 50Ohm so a floating
+    // input can't trigger stray pulses. hwtrig_term takes 1/0 (1 = 50Ohm term).
+    // (Was sending "set hwtrig_term True" — wrong, takes 1/0 — and "set emode
+    //  True", which the ChipSHOUTER console does not recognize.)
+    chipshot_uart_send("set hwtrig_term 1\r\n");
+    // Note: In SW mode, glitches must be fired by calling chipshot_fire().
 }

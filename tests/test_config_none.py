@@ -430,6 +430,37 @@ class TestSWDSpeed:
         raiden.cmd("SWD SPEED 1")
 
 
+# ── ChipSHOUTER command guardrails (error paths) ─────────────
+# These reject bad input in the firmware BEFORE anything is sent to the
+# ChipSHOUTER, so they're safe with no CS connected (no arm/fire). Happy paths
+# (CS ARM/FIRE/VOLTAGE) drive HV and need the CS, so they're not tested here.
+
+class TestCsCommands:
+
+    def test_cs_unknown_subcommand(self, raiden):
+        assert "ERROR" in raiden.cmd("CS WIBBLE")
+
+    def test_cs_voltage_out_of_range(self, raiden):
+        r = raiden.cmd("CS VOLTAGE 999")          # > 500V max
+        assert "ERROR" in r and "range" in r.lower()
+
+    def test_cs_voltage_too_low(self, raiden):
+        assert "ERROR" in raiden.cmd("CS VOLTAGE 100")   # < 150V min
+
+    def test_cs_voltage_garbage(self, raiden):
+        assert "ERROR" in raiden.cmd("CS VOLTAGE abc")
+
+    def test_cs_pulse_out_of_range(self, raiden):
+        r = raiden.cmd("CS PULSE 50")             # < 80ns min
+        assert "ERROR" in r and "range" in r.lower()
+
+    def test_cs_pulse_garbage(self, raiden):
+        assert "ERROR" in raiden.cmd("CS PULSE xyz")
+
+    def test_cs_trigger_bad_polarity(self, raiden):
+        assert "ERROR" in raiden.cmd("CS TRIGGER HW BOGUS")
+
+
 # ── Prefix matching ──────────────────────────────────────────
 
 class TestPrefixMatching:

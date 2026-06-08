@@ -55,9 +55,13 @@ parser.add_argument('--no-dump', action='store_true',
 parser.add_argument('--dump-size', type=lambda v: int(v, 0), default=0x7E000,
                     help='Bytes to dump on a successful glitch (default 0x7E000 = 504 KB, LPC2468 user flash)')
 parser.add_argument('--shots', type=int, default=15,
-                    help='Shots per cell (default 15). In quickmap mode this is the TOTAL shot budget per cell across all voltage levels (settle count is --confirm). In slow mode this is shots per voltage level. In fixed mode this is total shots per cell.')
+                    help='Shots per cell (default 15). In quickmap mode this caps shots PER VOLTAGE LEVEL (a non-converging cell can\'t loop forever) — it does NOT stop the descent, which always continues to the floor. In slow mode this is shots per voltage level. In fixed mode this is total shots per cell.')
 parser.add_argument('--confirm', type=int, default=5,
                     help='QUICKMAP only — consecutive normals at one voltage to declare the cell "settled" (default 5). Smaller = faster; larger = more confident the voltage is safe.')
+parser.add_argument('--drop', type=int, default=1,
+                    help='Consecutive non-normals (hits) at one voltage before dropping to the next lower voltage (default 1 = drop on the first hit). Larger = require a run of hits before stepping down, so a single noise hit does not move the voltage.')
+parser.add_argument('--pause', type=int, default=0,
+                    help='Glitch PAUSE in 150 MHz cycles (6.67 ns each) — delay from the 0x0D trigger to the pulse. Default 0 = immediate, the value that bypassed the LPC1114 in the original campaign (SUCCESS_FOUND.md). Was 5000 (33 us), much too long.')
 parser.add_argument('--always-sync', action='store_true',
                     help='Re-sync the target before every shot (strict cycling). Default skips sync after a clean rc=19 (normal) shot since the LPC stays in ISP-ready state, which is ~3x faster but assumes the previous read didn\'t leave the bootloader in an unknown state.')
 parser.add_argument('--slow-sweep', action='store_true',
@@ -107,6 +111,9 @@ CS_VOLTAGE = 500  # Starting voltage in V (ChipSHOUTER max: 500V)
 CS_VOLTAGE_MIN = 150  # Minimum voltage (ChipSHOUTER range: 150-500V)
 CS_VOLTAGE_STEP = 50  # Voltage reduction step
 CS_PULSE_WIDTH = 50  # Pulse width in us
+CS_FAULT_COOLDOWN = 5  # seconds to let the ChipSHOUTER settle after a fault-reset
+CS_RESET_AFTER = 3     # consecutive cs_errors before an (expensive) CS RESET; most
+                       # cs_errors are a transient "not armed" read that clears on a plain retry
 
 # Current voltage (can be reduced during optimization)
 current_voltage = CS_VOLTAGE
@@ -1104,7 +1111,7 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
     hits = 0
     completed = 0
     retries = 0
-    max_retries = 3
+    max_retries = 5  # consecutive cs_errors before skipping the cell (reset fires at CS_RESET_AFTER)
     glitch_found = False
     # After a clean rc=19 response the LPC stays in ISP-ready state, so we
     # can skip the full TARGET SYNC handshake on the next shot (~3x faster).
@@ -1127,13 +1134,19 @@ def test_position(x, y, voltage, shots=SHOTS_PER_POSITION):
         result = run_glitch_test(x, y, voltage)
 
         if result == 'cs_error':
-            # ChipSHOUTER error - retry this shot (don't count)
+            # Most cs_errors are a transient "not armed" read that clears on a
+            # plain retry; only force a CS RESET + cooldown once faults persist
+            # (CS_RESET_AFTER), so we don't burn ~25s resetting for a one-off.
             retries += 1
             print("R", end='', flush=True)  # R = retry
             log_test(x, y, voltage, completed + 1, 'cs_error')
             if retries > max_retries:
                 print("\n  [Too many CS errors, skipping]", flush=True)
                 break
+            if retries == CS_RESET_AFTER:
+                send_cmd("CS RESET")
+                time.sleep(CS_FAULT_COOLDOWN)
+                ensure_cs_ready()
             continue
 
         retries = 0  # Reset retry counter on success
@@ -1167,18 +1180,16 @@ def test_position_quickmap(x, y, start_voltage):
     """Quickmap voltage sweep at one position.
 
     Walk from start_voltage downward in CS_VOLTAGE_STEP increments. At each
-    voltage, take shots until we either see CONFIRM_NORMALS consecutive
-    'normal' results (settled — return that voltage) or get a non-normal
-    (immediately drop voltage and start again). Bail at CS_VOLTAGE_MIN or
-    when SHOTS_PER_POSITION total shots have been taken.
-
-    --shots and --confirm are independent: --shots caps the total work per
-    cell (across all voltage levels), --confirm sets how many consecutive
-    normals at one voltage we need to call the cell "settled".
+    voltage, take shots until we either see --confirm consecutive 'normal'
+    results (settled — return that voltage) or accumulate --drop consecutive
+    non-normals (drop to the next lower voltage). The descent ALWAYS continues
+    down to CS_VOLTAGE_MIN; --shots only bounds the work at a SINGLE voltage so
+    a non-converging cell can't loop forever — it does not stop the sweep from
+    reaching the floor.
 
     Returns: (settle_voltage, glitch_found, perturbable)
-        settle_voltage — lowest voltage we got CONFIRM_NORMALS consecutive
-                         normals at, or CS_VOLTAGE_MIN if we never settled.
+        settle_voltage — lowest voltage we got --confirm consecutive normals
+                         at, or CS_VOLTAGE_MIN if we never settled.
         glitch_found   — True if any shot at any voltage was 'glitch'.
         perturbable    — True if any shot at any voltage was non-normal.
     """
@@ -1190,27 +1201,30 @@ def test_position_quickmap(x, y, start_voltage):
     last_result = None
     total_shots = 0
     cs_error_retries = 0
-    cs_error_max = 5  # bail if CS keeps faulting (independent of total_shots cap)
-    confirm_target = args.confirm
-    total_cap = SHOTS_PER_POSITION  # already = args.shots, total budget per cell
+    cs_error_max = 5  # bail if CS keeps faulting (per-voltage, independent of shot caps)
+    confirm_target = args.confirm  # consecutive normals → settled
+    drop_target = args.drop         # consecutive non-normals → drop voltage
+    per_voltage_cap = SHOTS_PER_POSITION  # = args.shots, max shots at ONE voltage
 
-    while voltage >= CS_VOLTAGE_MIN and total_shots < total_cap and cs_error_retries < cs_error_max:
+    while voltage >= CS_VOLTAGE_MIN and cs_error_retries < cs_error_max:
         if current_voltage != voltage:
             set_chipshouter_voltage(voltage)
             current_voltage = voltage
             last_result = None  # voltage change → re-sync
 
         consecutive_normals = 0
-        non_normal_seen = False
+        consecutive_hits = 0
+        shots_at_voltage = 0
 
-        while (consecutive_normals < confirm_target and total_shots < total_cap
+        while (consecutive_normals < confirm_target and shots_at_voltage < per_voltage_cap
                and cs_error_retries < cs_error_max):
             need_sync = (last_result != 'normal') or args.always_sync
             if need_sync and not sync_target():
                 print('S', end='', flush=True)
                 total_shots += 1
+                shots_at_voltage += 1
                 log_test(x, y, voltage, total_shots, 'sync_fail')
-                broadcast_shot(x, y, total_shots, total_cap, voltage, 'sync_fail')
+                broadcast_shot(x, y, total_shots, per_voltage_cap, voltage, 'sync_fail')
                 last_result = 'sync_fail'
                 continue
 
@@ -1220,34 +1234,44 @@ def test_position_quickmap(x, y, start_voltage):
                 print('R', end='', flush=True)
                 log_test(x, y, voltage, total_shots + 1, 'cs_error')
                 cs_error_retries += 1
-                # don't count toward total_shots
-                continue
+                # Most cs_errors are a transient "not armed" status read that
+                # clears on a plain retry — don't burn ~25s on a CS RESET for
+                # those. Only force a reset + cooldown once faults PERSIST (a real
+                # trip): without it, a CS that trips without the literal "fault"
+                # string would loop forever (the overnight scan stalled on a cell).
+                if cs_error_retries == CS_RESET_AFTER:
+                    send_cmd("CS RESET")
+                    time.sleep(CS_FAULT_COOLDOWN)
+                    ensure_cs_ready()
+                continue  # don't count toward the shot budget
 
             cs_error_retries = 0  # reset on any non-cs_error shot
             last_result = result
             total_shots += 1
+            shots_at_voltage += 1
             log_test(x, y, voltage, total_shots, result)
-            broadcast_shot(x, y, total_shots, total_cap, voltage, result)
+            broadcast_shot(x, y, total_shots, per_voltage_cap, voltage, result)
 
             if result == 'normal':
                 consecutive_normals += 1
+                consecutive_hits = 0  # a normal breaks the hit streak
                 print('.', end='', flush=True)
-            elif result == 'glitch':
-                glitch_found = True
+            else:  # 'glitch' or 'effect' — a non-normal hit
                 perturbable = True
-                print('+', end='', flush=True)
-                non_normal_seen = True
-                break  # drop voltage immediately
-            else:  # 'effect'
-                perturbable = True
-                print('!', end='', flush=True)
-                non_normal_seen = True
-                break  # drop voltage immediately
+                consecutive_normals = 0  # a hit breaks the normal streak
+                consecutive_hits += 1
+                if result == 'glitch':
+                    glitch_found = True
+                    print('+', end='', flush=True)
+                else:
+                    print('!', end='', flush=True)
+                if consecutive_hits >= drop_target:
+                    break  # enough consecutive hits → drop voltage
 
             time.sleep(0.2)
 
-        if consecutive_normals >= confirm_target and not non_normal_seen:
-            # Settled — all-normal at this voltage
+        if consecutive_normals >= confirm_target:
+            # Settled — --confirm consecutive normals at this voltage
             return (voltage, glitch_found, perturbable)
 
         if cs_error_retries >= cs_error_max:
@@ -1255,7 +1279,9 @@ def test_position_quickmap(x, y, start_voltage):
             print(f' [CS-STUCK]', end='', flush=True)
             return (voltage, glitch_found, perturbable)
 
-        # Non-normal seen → drop voltage and re-test
+        # Couldn't settle here (--drop consecutive hits, or ran out of the
+        # per-voltage shot budget) → step the voltage down and re-test. The
+        # descent always continues to the floor regardless of total shots taken.
         voltage -= CS_VOLTAGE_STEP
         if voltage >= CS_VOLTAGE_MIN:
             print(f' [{voltage}V]', end='', flush=True)
@@ -1429,8 +1455,8 @@ setup_chipshouter()
 print("=== Configuring glitch trigger ===", flush=True)
 print(f"  TRIGGER UART {TRIGGER_BYTE_HEX}", flush=True)
 send_cmd(f"TRIGGER UART {TRIGGER_BYTE_HEX}")
-print("  SET PAUSE 5000  (33.3 us @ 150 MHz)", flush=True)
-send_cmd("SET PAUSE 5000")
+print(f"  SET PAUSE {str(args.pause)+' ':<7}({args.pause * 6.67 / 1000:.2f} us @ 150 MHz)", flush=True)
+send_cmd(f"SET PAUSE {args.pause}")
 print("  SET WIDTH 150   (1.0 us @ 150 MHz)", flush=True)
 send_cmd("SET WIDTH 150")
 print("  SET COUNT 1     (one-shot per ARM)", flush=True)
@@ -1521,7 +1547,7 @@ if SCAN_MODE == 'fixed':
 elif SCAN_MODE == 'slow':
     print(f"  Slow sweep: --shots {SHOTS_PER_POSITION} per voltage + binary-search optimizer", flush=True)
 else:
-    print(f"  Quickmap: drop voltage on first non-normal, settle on {args.confirm} consecutive normals (total cap --shots {SHOTS_PER_POSITION})", flush=True)
+    print(f"  Quickmap: drop voltage after {args.drop} consecutive non-normal(s), settle on {args.confirm} consecutive normals (--shots {SHOTS_PER_POSITION} per voltage; descent always reaches the floor)", flush=True)
 
 # Process each point
 for i, (x, y) in enumerate(spiral_points):

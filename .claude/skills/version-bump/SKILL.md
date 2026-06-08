@@ -34,13 +34,26 @@ Glitcher v` prefix** — host tooling and `tests/conftest.py` gate on the word
   (new CLI command, new mode, a refactor that changes timing/behavior/output).
 - **Patch** (add a `.Z` field if needed) for a small bug fix.
 - One bump per logical change/PR — don't double-bump for the same change.
+  **Bump from the version that is LIVE on `main` (committed/pushed), not your local
+  working-tree value** — if nothing's been pushed since the last release, the whole
+  uncommitted batch is one bump (don't re-increment for each edit/flash cycle).
+
+## Also update the CHANGELOG
+
+Every version bump MUST add a matching entry to **`CHANGELOG.md`** in the same
+change — that's the only place changes are tracked outside commit messages. Add a
+`## [X.Y] — <date>` section with `Added` / `Changed` / `Fixed` / `Removed`
+subsections as appropriate. Keep it user-facing (what the device now does), not a
+code diff.
 
 ## Checklist
 
 - [ ] Did this change alter firmware behavior or output (`src/*.c`, `src/*.pio`,
       `include/*.h`)? → bump the version.
-- [ ] Version string in `src/command_parser.c` (VERSION handler) updated.
-- [ ] The bump rides in the **same commit** as the firmware change, not a follow-up.
+- [ ] Version string in `src/command_parser.c` (VERSION handler) updated, bumped
+      from the LIVE-on-`main` version (one bump per uncommitted batch).
+- [ ] **`CHANGELOG.md` entry added** for the new version (Added/Changed/Fixed/Removed).
+- [ ] The bump + changelog ride in the **same commit** as the firmware change.
 - [ ] Flashed + verified `VERSION` on the device matches the bumped source
       (so you know the new firmware actually landed).
 

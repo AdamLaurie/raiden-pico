@@ -161,6 +161,24 @@ static void api_error_printf(const char *format, ...) {
     }
 }
 
+// Print a ChipSHOUTER reply under `label`, and surface a rejection so a bad
+// command string can't masquerade as success (e.g. the old "get faults_current"
+// / "help" bugs). Returns true on no-response or a rejected command.
+static bool cs_print_response(const char *label, const char *response) {
+    if (!response) {
+        api_error("ERROR: No response from ChipSHOUTER (check UART0 wiring / power)\r\n");
+        return true;
+    }
+    uart_cli_printf("ChipSHOUTER %s:\r\n", label);
+    send_multiline_response(response);
+    uart_cli_send("\r\n");
+    if (strstr(response, "Command Not Found")) {
+        api_error("ERROR: ChipSHOUTER rejected the command (firmware sent an unknown command string)\r\n");
+        return true;
+    }
+    return false;
+}
+
 // Helper function to match and replace a part
 static bool match_and_replace(char **part, const char **candidates, uint8_t count, const char *context) {
     const char *matched = command_parser_match(*part, candidates, count);
@@ -335,12 +353,12 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
         uart_cli_send("CS DISARM                 - Disarm ChipSHOUTER\r\n");
         uart_cli_send("CS FIRE                   - Trigger ChipSHOUTER\r\n");
-        uart_cli_send("CS PULSE [<ns>]           - Set/get ChipSHOUTER pulse width\r\n");
+        uart_cli_send("CS PULSE [<80-1000>]      - Set/get ChipSHOUTER pulse width (ns)\r\n");
         uart_cli_send("CS RESET                  - Reset ChipSHOUTER and verify errors cleared\r\n");
         uart_cli_send("CS STATUS                 - Get ChipSHOUTER status\r\n");
         uart_cli_send("CS TRIGGER HW <HIGH|LOW>  - Set HW trigger (active high/low w/ pull)\r\n");
         uart_cli_send("CS TRIGGER SW             - Set SW trigger (fires via interrupt)\r\n");
-        uart_cli_send("CS VOLTAGE [<V>]          - Set/get ChipSHOUTER voltage\r\n");
+        uart_cli_send("CS VOLTAGE [<150-500>]    - Set/get ChipSHOUTER voltage (V)\r\n");
         uart_cli_send("CS HVOUT                  - Query HV output status\r\n");
         uart_cli_send("CS FAULTS                 - Get ChipSHOUTER fault status\r\n");
         uart_cli_send("\r\n");
@@ -481,7 +499,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.6\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1780,84 +1798,45 @@ void command_parser_execute(cmd_parts_t *parts) {
             chipshot_arm();
             uart_cli_send("ChipSHOUTER: Sent arm command\r\n");
 
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("response", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "DISARM") == 0) {
             chipshot_disarm();
             uart_cli_send("ChipSHOUTER: Sent disarm command\r\n");
 
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("response", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "FIRE") == 0) {
             chipshot_fire();
             uart_cli_send("ChipSHOUTER: Sent trigger command\r\n");
 
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("response", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "STATUS") == 0) {
             chipshot_get_status();
             uart_cli_send("ChipSHOUTER: Sent status command\r\n");
 
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("response", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "VOLTAGE") == 0) {
             if (parts->count < 3) {
                 // Show current voltage by querying status
                 uart_cli_send("ChipSHOUTER: Querying status for voltage...\r\n");
                 chipshot_get_status();
-                const char* response = chipshot_uart_read_response_blocking(2000);
-                if (response) {
-                    send_multiline_response(response);
-                    uart_cli_send("\r\n");
-                } else {
-                    uart_cli_send("No response from ChipSHOUTER\r\n");
-                }
+                cs_print_response("status", chipshot_uart_read_response_blocking(2000));
             } else {
-                uint32_t voltage = atoi(parts->parts[2]);
+                uint32_t voltage;
+                if (!parse_u32(parts->parts[2], 10, &voltage)) {
+                    api_error("ERROR: Invalid voltage. Usage: CS VOLTAGE <150-500>\r\n");
+                    goto api_response;
+                }
+                if (voltage < 150 || voltage > 500) {
+                    api_error_printf("ERROR: CS voltage %u out of range (150-500 V)\r\n", voltage);
+                    goto api_response;
+                }
                 chipshot_set_voltage(voltage);
                 uart_cli_printf("ChipSHOUTER: Sent voltage %u command\r\n", voltage);
-
-                // Blocking read with 2 second timeout
-                const char* response = chipshot_uart_read_response_blocking(2000);
-                if (response) {
-                    uart_cli_send("ChipSHOUTER response:\r\n");
-                    send_multiline_response(response);
-                    uart_cli_send("\r\n");
-                } else {
-                    uart_cli_send("No response from ChipSHOUTER\r\n");
-                }
+                cs_print_response("response", chipshot_uart_read_response_blocking(2000));
             }
 
         } else if (strcmp(parts->parts[1], "PULSE") == 0) {
@@ -1865,27 +1844,20 @@ void command_parser_execute(cmd_parts_t *parts) {
                 // Show current pulse width by querying status
                 uart_cli_send("ChipSHOUTER: Querying status for pulse width...\r\n");
                 chipshot_get_status();
-                const char* response = chipshot_uart_read_response_blocking(2000);
-                if (response) {
-                    send_multiline_response(response);
-                    uart_cli_send("\r\n");
-                } else {
-                    uart_cli_send("No response from ChipSHOUTER\r\n");
-                }
+                cs_print_response("status", chipshot_uart_read_response_blocking(2000));
             } else {
-                uint32_t pulse_ns = atoi(parts->parts[2]);
+                uint32_t pulse_ns;
+                if (!parse_u32(parts->parts[2], 10, &pulse_ns)) {
+                    api_error("ERROR: Invalid pulse width. Usage: CS PULSE <80-1000> (ns)\r\n");
+                    goto api_response;
+                }
+                if (pulse_ns < 80 || pulse_ns > 1000) {
+                    api_error_printf("ERROR: CS pulse width %u out of range (80-1000 ns)\r\n", pulse_ns);
+                    goto api_response;
+                }
                 chipshot_set_pulse(pulse_ns);
                 uart_cli_printf("ChipSHOUTER: Sent pulse %u ns command\r\n", pulse_ns);
-
-                // Blocking read with 2 second timeout
-                const char* response = chipshot_uart_read_response_blocking(2000);
-                if (response) {
-                    uart_cli_send("ChipSHOUTER response:\r\n");
-                    send_multiline_response(response);
-                    uart_cli_send("\r\n");
-                } else {
-                    uart_cli_send("No response from ChipSHOUTER\r\n");
-                }
+                cs_print_response("response", chipshot_uart_read_response_blocking(2000));
             }
 
         } else if (strcmp(parts->parts[1], "RESET") == 0) {
@@ -1970,43 +1942,19 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("ChipSHOUTER: Sent set trigger sw commands\r\n");
             }
 
-            // Blocking read with 2 second timeout
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER response:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("response", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "HVOUT") == 0) {
             extern void chipshot_get_hv_out(void);
             chipshot_get_hv_out();
             uart_cli_send("ChipSHOUTER: Querying HV output status...\r\n");
-
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER HV status:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("HV status", chipshot_uart_read_response_blocking(2000));
 
         } else if (strcmp(parts->parts[1], "FAULTS") == 0) {
             extern void chipshot_get_faults(void);
             chipshot_get_faults();
             uart_cli_send("ChipSHOUTER: Querying faults...\r\n");
-
-            const char* response = chipshot_uart_read_response_blocking(2000);
-            if (response) {
-                uart_cli_send("ChipSHOUTER faults:\r\n");
-                send_multiline_response(response);
-                uart_cli_send("\r\n");
-            } else {
-                uart_cli_send("No response from ChipSHOUTER\r\n");
-            }
+            cs_print_response("faults", chipshot_uart_read_response_blocking(2000));
         } else {
             api_error_printf("ERROR: Unknown CS command '%s'\r\n", parts->parts[1]);
         }

@@ -393,13 +393,14 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 - Queries voltage, armed state, and configuration
 - Returns UART response from ChipSHOUTER
 
-**`CS VOLTAGE [<V>]`** - Set/get ChipSHOUTER voltage
-- Configure pulse voltage (device-specific range)
+**`CS VOLTAGE [<150-500>]`** - Set/get ChipSHOUTER voltage (V)
+- Configure pulse voltage; valid range 150-500 V (out-of-range is rejected)
 - Example: `CS VOLTAGE 250`
 
-**`CS PULSE [<ns>]`** - Set/get ChipSHOUTER pulse width
-- Configure pulse duration in nanoseconds
-- Example: `CS PULSE 50`
+**`CS PULSE [<80-1000>]`** - Set/get ChipSHOUTER pulse width (ns)
+- Configure pulse duration in ns; valid range 80-1000 (out-of-range is rejected)
+- Ignored in HW-trigger mode (the output follows the GP2 trigger pulse width)
+- Example: `CS PULSE 160`
 
 **`CS TRIGGER HW <HIGH|LOW>`** - Set hardware trigger mode
 - Configures ChipSHOUTER to trigger on glitch output pin
@@ -587,7 +588,7 @@ TARGET SEND "R 0 516096"
 ```bash
 # Configure ChipSHOUTER
 CS VOLTAGE 250
-CS PULSE 50
+CS PULSE 160
 CS ARM
 
 # Set up hardware trigger
