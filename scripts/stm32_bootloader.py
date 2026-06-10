@@ -203,7 +203,10 @@ def main():
     parser.add_argument('port', nargs='?', default='/dev/ttyACM0', help='Serial port')
     parser.add_argument('--dump', action='store_true', help='Dump entire flash')
     parser.add_argument('--size', type=lambda x: int(x, 0), default=0x100000, help='Flash size (default 1MB)')
-    parser.add_argument('-o', '--output', default='flash_dump.bin', help='Output filename')
+    parser.add_argument('-o', '--output',
+                        default=f"stm32_flash_dump_{time.strftime('%Y%m%d_%H%M%S')}.bin",
+                        help='Output filename (default: a UNIQUE timestamped file, so dumps never '
+                             'overwrite prior findings)')
     args = parser.parse_args()
 
     print(f"Connecting to {args.port}...")

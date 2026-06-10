@@ -6,6 +6,9 @@
 #include "grbl.h"
 #include "swd.h"
 #include "jtag.h"
+#include "nrf_target.h"
+#include "pic18_target.h"
+#include "efm32_target.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/pio.h"
@@ -292,9 +295,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
+
             const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 18, "TARGET sub-command")) {
+                                            "NRF52840",  "NRF", "PIC18", "PIC", "EFM32", "EFM",
+                                            "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"
+                                            };
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 24, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -594,6 +600,12 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (target_is_stm32(target_type)) {
             const stm32_target_info_t *info = stm32_get_target_info(target_type);
             target_type_str = info ? info->name : "STM32";
+        } else if (target_is_nrf(target_type)) {
+            target_type_str = "nRF52840";
+        } else if (target_is_pic18(target_type)) {
+            target_type_str = "PIC18";
+        } else if (target_is_efm32(target_type)) {
+            target_type_str = "EFM32LG";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
         if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
@@ -1055,7 +1067,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|NRF52840|NRF|PIC18|PIC|EFM32|EFM|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
             goto api_response;
         }
 
@@ -1078,6 +1090,150 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "STM32L4") == 0) {
             target_set_type(TARGET_STM32L4);
             uart_cli_send("OK: Target type set to STM32L4 (Cortex-M4, 256KB flash)\r\n");
+        } else if (strcmp(parts->parts[1], "NRF52840") == 0) {
+            target_set_type(TARGET_NRF52840);
+            swd_init();
+            uart_cli_send("OK: Target type set to nRF52840 (Cortex-M4F, SWD GP17/GP18)\r\n");
+            uart_cli_send("    Glitch DEC1 via crowbar on GP2; attack: TARGET GLITCH APPROTECT\r\n");
+        } else if (strcmp(parts->parts[1], "NRF") == 0) {
+            // nRF52840 operations: INFO | STATUS | DUMP [addr] [bytes] | RESET
+            if (target_get_type() != TARGET_NRF52840) {
+                target_set_type(TARGET_NRF52840);
+                swd_init();
+            }
+            if (parts->count < 3 || strcmp(parts->parts[2], "INFO") == 0) {
+                nrf_cmd_info();
+            } else if (strcmp(parts->parts[2], "STATUS") == 0) {
+                uint32_t dpidr = nrf_connect();
+                if (dpidr == 0) {
+                    uart_cli_send("nRF: NOT CONNECTED\r\n");
+                } else {
+                    uart_cli_printf("nRF: DPIDR=0x%08X  APPROTECT=%s\r\n", (unsigned)dpidr,
+                                    nrf_is_unlocked() ? "UNPROTECTED" : "PROTECTED");
+                }
+            } else if (strcmp(parts->parts[2], "DUMP") == 0) {
+                uint32_t addr = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 0;
+                uint32_t bytes = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 256;
+                nrf_connect();
+                uint32_t got = nrf_dump_mem(addr, bytes);
+                uart_cli_printf("Dumped %u bytes from 0x%08X\r\n", (unsigned)got, (unsigned)addr);
+            } else if (strcmp(parts->parts[2], "RESET") == 0) {
+                nrf_connect();
+                nrf_soft_reset();
+                uart_cli_send("OK: nRF soft reset via CTRL-AP\r\n");
+            } else if (strcmp(parts->parts[2], "SHOT") == 0) {
+                uint32_t delay_us = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 5000;
+                uint32_t width    = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 200;
+                nrf_glitch_shot(delay_us, width);
+            } else if (strcmp(parts->parts[2], "SHOTRST") == 0) {
+                uint32_t delay_us = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 3;
+                uint32_t width    = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 300;
+                uint32_t hold     = (parts->count >= 6) ? (uint32_t)strtoul(parts->parts[5], NULL, 0) : 200;
+                nrf_glitch_shot_reset(delay_us, width, hold);
+            } else if (strcmp(parts->parts[2], "ERASE") == 0) {
+                nrf_erase_all();
+            } else {
+                uart_cli_send("Usage: TARGET NRF [INFO|STATUS|DUMP [addr] [bytes]|RESET|SHOT [delay_us] [width_cyc]|"
+                              "SHOTRST [delay_us] [width_cyc] [reset_hold_us]|ERASE]\r\n");
+            }
+        } else if (strcmp(parts->parts[1], "PIC18") == 0) {
+            target_set_type(TARGET_PIC18);
+            uart_cli_send("OK: Target type set to PIC18 (classic, ICSP PGC=GP17/PGD=GP18, MCLR=GP15, PGM=GP19)\r\n");
+            uart_cli_send("    LVP entry: KEY (FX320, default) | PGM (F4321 family); set via TARGET PIC LVP PGM\r\n");
+            uart_cli_send("    Glitch VDD via crowbar on GP2; attack: TARGET PIC GLITCH <probe_addr>\r\n");
+        } else if (strcmp(parts->parts[1], "PIC") == 0) {
+            // PIC18 operations: INFO | STATUS | DUMP [addr] [bytes] | SHOT | GLITCH
+            if (target_get_type() != TARGET_PIC18) {
+                target_set_type(TARGET_PIC18);
+            }
+            if (parts->count < 3 || strcmp(parts->parts[2], "INFO") == 0) {
+                pic18_cmd_info();
+            } else if (strcmp(parts->parts[2], "LVP") == 0) {
+                if (parts->count >= 4 && strcmp(parts->parts[3], "PGM") == 0) {
+                    pic18_set_lvp(PIC_LVP_MODE_PGM);
+                    uart_cli_send("OK: LVP entry = PGM-pin (RB5/PGM high; PIC18F4321 family)\r\n");
+                } else if (parts->count >= 4 && strcmp(parts->parts[3], "KEY") == 0) {
+                    pic18_set_lvp(PIC_LVP_MODE_KEY);
+                    uart_cli_send("OK: LVP entry = MCHP key sequence (FX220/X320 family)\r\n");
+                } else {
+                    uart_cli_send("Usage: TARGET PIC LVP [KEY|PGM]\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "STATUS") == 0) {
+                uint16_t devid = pic18_connect();
+                if (devid == 0 || devid == 0xFFFF) {
+                    uart_cli_send("PIC18: NOT CONNECTED\r\n");
+                } else {
+                    uart_cli_printf("PIC18: DEVID=0x%04X  CP=%s\r\n", (unsigned)devid,
+                                    pic18_is_protected() ? "PROTECTED" : "OPEN");
+                }
+                pic18_disconnect();
+            } else if (strcmp(parts->parts[2], "DUMP") == 0) {
+                uint32_t addr  = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 0;
+                uint32_t bytes = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 256;
+                pic18_connect();
+                uint32_t got = pic18_dump_mem(addr, bytes);
+                pic18_disconnect();
+                uart_cli_printf("Dumped %u bytes from 0x%06X\r\n", (unsigned)got, (unsigned)addr);
+            } else if (strcmp(parts->parts[2], "SHOT") == 0) {
+                uint32_t delay_us = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 1000;
+                uint32_t width    = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 150;
+                pic18_glitch_shot(delay_us, width);
+            } else if (strcmp(parts->parts[2], "GLITCH") == 0) {
+                // TARGET PIC GLITCH [probe_addr] [d_start] [d_end] [d_step] [w_start] [w_end] [w_step] [max]
+                uint32_t probe   = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 0x001800; // CP3 block
+                uint32_t d_start = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 0;
+                uint32_t d_end   = (parts->count >= 6) ? (uint32_t)strtoul(parts->parts[5], NULL, 0) : 50;
+                uint32_t d_step  = (parts->count >= 7) ? (uint32_t)strtoul(parts->parts[6], NULL, 0) : 1;
+                uint32_t w_start = (parts->count >= 8) ? (uint32_t)strtoul(parts->parts[7], NULL, 0) : 30;
+                uint32_t w_end   = (parts->count >= 9) ? (uint32_t)strtoul(parts->parts[8], NULL, 0) : 150;
+                uint32_t w_step  = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9], NULL, 0) : 10;
+                uint32_t maxatt  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 5000;
+                pic18_glitch_cp(d_start, d_end, d_step, w_start, w_end, w_step,
+                                probe, 50, 5, maxatt);
+            } else {
+                uart_cli_send("Usage: TARGET PIC [INFO|LVP [KEY|PGM]|STATUS|DUMP [addr] [bytes]|SHOT [delay_us] [width_cyc]|"
+                              "GLITCH [probe_addr] [d_start d_end d_step w_start w_end w_step max]]\r\n");
+            }
+        } else if (strcmp(parts->parts[1], "EFM32") == 0) {
+            target_set_type(TARGET_EFM32LG);
+            uart_cli_send("OK: Target type set to EFM32LG (Leopard Gecko, Cortex-M3, SWD SWCLK=GP17/SWDIO=GP18, nRST=GP15)\r\n");
+            uart_cli_send("    Crowbar GP2 -> DECOUPLE pin (core LDO). Attack: TARGET GLITCH DEBUGUNLOCK\r\n");
+        } else if (strcmp(parts->parts[1], "EFM") == 0) {
+            // EFM32 operations: INFO | STATUS | DUMP [addr] [bytes] | SHOT | SHOTRST | AAP | ERASE | RESET
+            if (target_get_type() != TARGET_EFM32LG) {
+                target_set_type(TARGET_EFM32LG);
+                swd_init();
+            }
+            if (parts->count < 3 || strcmp(parts->parts[2], "INFO") == 0) {
+                efm32_cmd_info();
+            } else if (strcmp(parts->parts[2], "STATUS") == 0) {
+                uint32_t dpidr = efm32_connect();
+                uart_cli_printf("EFM32: DPIDR=0x%08X  DEBUG=%s\r\n", (unsigned)dpidr,
+                                efm32_is_unlocked() ? "UNLOCKED" : "LOCKED");
+            } else if (strcmp(parts->parts[2], "AAP") == 0) {
+                efm32_aap_probe();
+            } else if (strcmp(parts->parts[2], "ERASE") == 0) {
+                bool ok = efm32_device_erase();
+                uart_cli_printf("AAP DEVICEERASE %s\r\n", ok ? "SUCCEEDED (debug unlocked)" : "did not unlock");
+            } else if (strcmp(parts->parts[2], "DUMP") == 0) {
+                uint32_t addr  = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 0;
+                uint32_t bytes = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 256;
+                efm32_connect();
+                uint32_t got = efm32_dump_mem(addr, bytes);
+                uart_cli_printf("Dumped %u bytes from 0x%08X\r\n", (unsigned)got, (unsigned)addr);
+            } else if (strcmp(parts->parts[2], "SHOT") == 0) {
+                uint32_t delay_us = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 160;
+                uint32_t width    = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 100;
+                efm32_glitch_shot(delay_us, width);
+            } else if (strcmp(parts->parts[2], "SHOTRST") == 0) {
+                uint32_t delay_us = (parts->count >= 4) ? (uint32_t)strtoul(parts->parts[3], NULL, 0) : 50;
+                uint32_t width    = (parts->count >= 5) ? (uint32_t)strtoul(parts->parts[4], NULL, 0) : 100;
+                uint32_t hold     = (parts->count >= 6) ? (uint32_t)strtoul(parts->parts[5], NULL, 0) : 200;
+                efm32_glitch_shot_reset(delay_us, width, hold);
+            } else {
+                uart_cli_send("Usage: TARGET EFM [INFO|STATUS|AAP|ERASE|DUMP [addr] [bytes]|"
+                              "SHOT [delay_us] [width_cyc]|SHOTRST [delay_us] [width_cyc] [hold_us]]\r\n");
+            }
         } else if (strcmp(parts->parts[1], "BOOT0") == 0) {
             gpio_init(PIN_BOOT0);
             gpio_set_dir(PIN_BOOT0, GPIO_OUT);
@@ -1637,10 +1793,186 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  RESETTEST                  - Reset/low-power disruption test\r\n");
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
+                uart_cli_send("  APPROTECT [d_start d_end d_step] [w_start w_end w_step] [off settle tries]\r\n");
+                uart_cli_send("                             - nRF52840 APPROTECT 2D glitch sweep (delay x width, DEC1)\r\n");
+                uart_cli_send("  APPROTECTRST [d0 d1 dstep] [w0 w1 wstep] [reset_hold_us settle tries]\r\n");
+                uart_cli_send("  APPROTECTCAP [d0 d1 dstep] [w0 w1 wstep] [reset_hold_us settle tries]  (CTRL-AP reset, no nRST pad)\r\n");
+                uart_cli_send("                             - same, but reboot via nRST(GP15), VDD stays on; delay from reset edge\r\n");
+                uart_cli_send("  DEBUGUNLOCK [d_start d_end d_step] [w_start w_end w_step] [off settle tries]\r\n");
+                uart_cli_send("                             - EFM32LG debug-lock 2D glitch sweep (delay x width, DECOUPLE)\r\n");
+                uart_cli_send("  DEBUGUNLOCKRST [d0 d1 dstep] [w0 w1 wstep] [reset_hold_us settle tries]\r\n");
+                uart_cli_send("                             - same, but reboot via nRST(GP15), VDD stays on; delay from reset edge\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
-                                             "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
-                if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS", 
+                                             "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING",
+                                             "APPROTECT", "APPROTECTRST", "APPROTECTCAP", "DEBUGUNLOCK", "DEBUGUNLOCKRST"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, 16, "GLITCH command")) {
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "APPROTECT") == 0) {
+                    // 2D sweep, defaults aligned to atc1441's nRF52840 recipe:
+                    // delay 2000..30000us, power-off 50ms, swd-wait (settle) 100ms,
+                    // width inner / delay outer. Width kept in the 1-3us safe band
+                    // (150..450 cyc) per the mass-erase rule. If tries omitted it
+                    // defaults to one full grid pass (n_delays * n_widths). All positional.
+                    uint32_t d_start = (parts->count >= 4)  ? (uint32_t)strtoul(parts->parts[3],  NULL, 0) : 2000;
+                    uint32_t d_end   = (parts->count >= 5)  ? (uint32_t)strtoul(parts->parts[4],  NULL, 0) : 30000;
+                    uint32_t d_step  = (parts->count >= 6)  ? (uint32_t)strtoul(parts->parts[5],  NULL, 0) : 25;
+                    uint32_t w_start = (parts->count >= 7)  ? (uint32_t)strtoul(parts->parts[6],  NULL, 0) : 150;
+                    uint32_t w_end   = (parts->count >= 8)  ? (uint32_t)strtoul(parts->parts[7],  NULL, 0) : 450;
+                    uint32_t w_step  = (parts->count >= 9)  ? (uint32_t)strtoul(parts->parts[8],  NULL, 0) : 50;
+                    uint32_t off_ms  = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9],  NULL, 0) : 50;
+                    uint32_t settle  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 100;
+                    uint32_t tries;
+                    if (parts->count >= 12) {
+                        tries = (uint32_t)strtoul(parts->parts[11], NULL, 0);
+                    } else {
+                        // one full grid pass
+                        uint32_t ds = d_step ? d_step : 1;
+                        uint32_t ws = w_step ? w_step : 1;
+                        uint32_t n_delays = (d_end >= d_start) ? ((d_end - d_start) / ds + 1) : 1;
+                        uint32_t n_widths = (w_end >= w_start) ? ((w_end - w_start) / ws + 1) : 1;
+                        tries = n_delays * n_widths;
+                    }
+                    if (target_get_type() != TARGET_NRF52840) {
+                        target_set_type(TARGET_NRF52840);
+                        swd_init();
+                    }
+                    bool ok = nrf_glitch_approtect(d_start, d_end, d_step, w_start, w_end, w_step,
+                                                   off_ms, settle, tries);
+                    uart_cli_printf("APPROTECT glitch %s\r\n", ok ? "SUCCEEDED" : "did not unlock");
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "APPROTECTRST") == 0) {
+                    // RESET-based variant: VDD stays ON, reboot via nRST(GP15) each attempt.
+                    // delay is measured from the nRST RELEASE edge (read is ~tens of us after,
+                    // not ~1.3ms). De-jitters the boot without a stiff PSU. All positional:
+                    // APPROTECTRST [d_start d_end d_step] [w_start w_end w_step] [reset_hold_us settle tries]
+                    uint32_t d_start = (parts->count >= 4)  ? (uint32_t)strtoul(parts->parts[3],  NULL, 0) : 0;
+                    uint32_t d_end   = (parts->count >= 5)  ? (uint32_t)strtoul(parts->parts[4],  NULL, 0) : 300;
+                    uint32_t d_step  = (parts->count >= 6)  ? (uint32_t)strtoul(parts->parts[5],  NULL, 0) : 2;
+                    uint32_t w_start = (parts->count >= 7)  ? (uint32_t)strtoul(parts->parts[6],  NULL, 0) : 165;
+                    uint32_t w_end   = (parts->count >= 8)  ? (uint32_t)strtoul(parts->parts[7],  NULL, 0) : 175;
+                    uint32_t w_step  = (parts->count >= 9)  ? (uint32_t)strtoul(parts->parts[8],  NULL, 0) : 2;
+                    uint32_t rhold   = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9],  NULL, 0) : 200;
+                    uint32_t settle  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 8;
+                    uint32_t tries;
+                    if (parts->count >= 12) {
+                        tries = (uint32_t)strtoul(parts->parts[11], NULL, 0);
+                    } else {
+                        uint32_t ds = d_step ? d_step : 1;
+                        uint32_t ws = w_step ? w_step : 1;
+                        uint32_t n_delays = (d_end >= d_start) ? ((d_end - d_start) / ds + 1) : 1;
+                        uint32_t n_widths = (w_end >= w_start) ? ((w_end - w_start) / ws + 1) : 1;
+                        tries = n_delays * n_widths;
+                    }
+                    if (target_get_type() != TARGET_NRF52840) {
+                        target_set_type(TARGET_NRF52840);
+                        swd_init();
+                    }
+                    bool ok = nrf_glitch_approtect_reset(d_start, d_end, d_step, w_start, w_end, w_step,
+                                                         rhold, settle, tries, false);
+                    uart_cli_printf("APPROTECTRST glitch %s\r\n", ok ? "SUCCEEDED" : "did not unlock");
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "APPROTECTCAP") == 0) {
+                    // CTRL-AP RESET variant of APPROTECTRST: reboots over SWD (no nRST pad).
+                    // Same positional args. delay is from the CTRL-AP RESET release.
+                    // APPROTECTCAP [d_start d_end d_step] [w_start w_end w_step] [reset_hold_us settle tries]
+                    uint32_t d_start = (parts->count >= 4)  ? (uint32_t)strtoul(parts->parts[3],  NULL, 0) : 0;
+                    uint32_t d_end   = (parts->count >= 5)  ? (uint32_t)strtoul(parts->parts[4],  NULL, 0) : 300;
+                    uint32_t d_step  = (parts->count >= 6)  ? (uint32_t)strtoul(parts->parts[5],  NULL, 0) : 2;
+                    uint32_t w_start = (parts->count >= 7)  ? (uint32_t)strtoul(parts->parts[6],  NULL, 0) : 165;
+                    uint32_t w_end   = (parts->count >= 8)  ? (uint32_t)strtoul(parts->parts[7],  NULL, 0) : 175;
+                    uint32_t w_step  = (parts->count >= 9)  ? (uint32_t)strtoul(parts->parts[8],  NULL, 0) : 2;
+                    uint32_t rhold   = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9],  NULL, 0) : 200;
+                    uint32_t settle  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 8;
+                    uint32_t tries;
+                    if (parts->count >= 12) {
+                        tries = (uint32_t)strtoul(parts->parts[11], NULL, 0);
+                    } else {
+                        uint32_t ds = d_step ? d_step : 1;
+                        uint32_t ws = w_step ? w_step : 1;
+                        uint32_t n_delays = (d_end >= d_start) ? ((d_end - d_start) / ds + 1) : 1;
+                        uint32_t n_widths = (w_end >= w_start) ? ((w_end - w_start) / ws + 1) : 1;
+                        tries = n_delays * n_widths;
+                    }
+                    if (target_get_type() != TARGET_NRF52840) {
+                        target_set_type(TARGET_NRF52840);
+                        swd_init();
+                    }
+                    bool ok = nrf_glitch_approtect_reset(d_start, d_end, d_step, w_start, w_end, w_step,
+                                                         rhold, settle, tries, true);
+                    uart_cli_printf("APPROTECTCAP glitch %s\r\n", ok ? "SUCCEEDED" : "did not unlock");
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "DEBUGUNLOCK") == 0) {
+                    // EFM32LG debug-lock 2D glitch sweep (power-cycle entry).
+                    // Defaults centre the delay on the tRESET ~163us boot window where
+                    // the DLW latch is committed; width band sub-us..~3us on DECOUPLE.
+                    // DEBUGUNLOCK [d_start d_end d_step] [w_start w_end w_step] [off settle tries]
+                    uint32_t d_start = (parts->count >= 4)  ? (uint32_t)strtoul(parts->parts[3],  NULL, 0) : 100;
+                    uint32_t d_end   = (parts->count >= 5)  ? (uint32_t)strtoul(parts->parts[4],  NULL, 0) : 220;
+                    uint32_t d_step  = (parts->count >= 6)  ? (uint32_t)strtoul(parts->parts[5],  NULL, 0) : 1;
+                    uint32_t w_start = (parts->count >= 7)  ? (uint32_t)strtoul(parts->parts[6],  NULL, 0) : 10;
+                    uint32_t w_end   = (parts->count >= 8)  ? (uint32_t)strtoul(parts->parts[7],  NULL, 0) : 200;
+                    uint32_t w_step  = (parts->count >= 9)  ? (uint32_t)strtoul(parts->parts[8],  NULL, 0) : 10;
+                    uint32_t off_ms  = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9],  NULL, 0) : 50;
+                    uint32_t settle  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 20;
+                    uint32_t tries;
+                    if (parts->count >= 12) {
+                        tries = (uint32_t)strtoul(parts->parts[11], NULL, 0);
+                    } else {
+                        uint32_t ds = d_step ? d_step : 1;
+                        uint32_t ws = w_step ? w_step : 1;
+                        uint32_t n_delays = (d_end >= d_start) ? ((d_end - d_start) / ds + 1) : 1;
+                        uint32_t n_widths = (w_end >= w_start) ? ((w_end - w_start) / ws + 1) : 1;
+                        tries = n_delays * n_widths;
+                    }
+                    if (target_get_type() != TARGET_EFM32LG) {
+                        target_set_type(TARGET_EFM32LG);
+                        swd_init();
+                    }
+                    bool ok = efm32_glitch_unlock(d_start, d_end, d_step, w_start, w_end, w_step,
+                                                  off_ms, settle, tries);
+                    uart_cli_printf("DEBUGUNLOCK glitch %s\r\n", ok ? "SUCCEEDED" : "did not unlock");
+                    goto api_response;
+                }
+
+                if (strcmp(parts->parts[2], "DEBUGUNLOCKRST") == 0) {
+                    // RESET-based variant: VDD stays ON, reboot via nRST(GP15). delay is
+                    // from the nRST RELEASE edge. De-jitters the boot without a stiff PSU.
+                    // DEBUGUNLOCKRST [d_start d_end d_step] [w_start w_end w_step] [reset_hold_us settle tries]
+                    uint32_t d_start = (parts->count >= 4)  ? (uint32_t)strtoul(parts->parts[3],  NULL, 0) : 0;
+                    uint32_t d_end   = (parts->count >= 5)  ? (uint32_t)strtoul(parts->parts[4],  NULL, 0) : 200;
+                    uint32_t d_step  = (parts->count >= 6)  ? (uint32_t)strtoul(parts->parts[5],  NULL, 0) : 1;
+                    uint32_t w_start = (parts->count >= 7)  ? (uint32_t)strtoul(parts->parts[6],  NULL, 0) : 10;
+                    uint32_t w_end   = (parts->count >= 8)  ? (uint32_t)strtoul(parts->parts[7],  NULL, 0) : 200;
+                    uint32_t w_step  = (parts->count >= 9)  ? (uint32_t)strtoul(parts->parts[8],  NULL, 0) : 10;
+                    uint32_t rhold   = (parts->count >= 10) ? (uint32_t)strtoul(parts->parts[9],  NULL, 0) : 200;
+                    uint32_t settle  = (parts->count >= 11) ? (uint32_t)strtoul(parts->parts[10], NULL, 0) : 8;
+                    uint32_t tries;
+                    if (parts->count >= 12) {
+                        tries = (uint32_t)strtoul(parts->parts[11], NULL, 0);
+                    } else {
+                        uint32_t ds = d_step ? d_step : 1;
+                        uint32_t ws = w_step ? w_step : 1;
+                        uint32_t n_delays = (d_end >= d_start) ? ((d_end - d_start) / ds + 1) : 1;
+                        uint32_t n_widths = (w_end >= w_start) ? ((w_end - w_start) / ws + 1) : 1;
+                        tries = n_delays * n_widths;
+                    }
+                    if (target_get_type() != TARGET_EFM32LG) {
+                        target_set_type(TARGET_EFM32LG);
+                        swd_init();
+                    }
+                    bool ok = efm32_glitch_unlock_reset(d_start, d_end, d_step, w_start, w_end, w_step,
+                                                        rhold, settle, tries);
+                    uart_cli_printf("DEBUGUNLOCKRST glitch %s\r\n", ok ? "SUCCEEDED" : "did not unlock");
+
                     goto api_response;
                 }
 

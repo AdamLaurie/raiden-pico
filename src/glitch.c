@@ -99,6 +99,13 @@ void glitch_init(void) {
     gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
     gpio_put(PIN_GLITCH_FIRED, 0);  // Start LOW
 
+    // Crowbar gate (GP2): force OFF (LOW) at startup. The MOSFET gate has NO
+    // external pull-down, so an uninitialised/floating GP2 leaves the crowbar
+    // ON and holds DEC1 shorted to GND. Drive it hard low until a shot fires.
+    gpio_init(PIN_GLITCH_OUT);
+    gpio_set_dir(PIN_GLITCH_OUT, GPIO_OUT);
+    gpio_put(PIN_GLITCH_OUT, 0);
+
     // Reset glitch count
     glitch_count = 0;
 
@@ -638,6 +645,13 @@ void glitch_disarm(void) {
         offset_irq_trigger = pio_add_program(glitch_pio, &irq_trigger_program);
         irq_trigger_removed = false;
     }
+
+    // Hand the crowbar gate back to plain GPIO held LOW so it can't float ON
+    // while idle (no external gate pull-down). Next glitch_arm() reclaims it for
+    // PIO via pio_gpio_init().
+    gpio_init(PIN_GLITCH_OUT);
+    gpio_set_dir(PIN_GLITCH_OUT, GPIO_OUT);
+    gpio_put(PIN_GLITCH_OUT, 0);
 
     flags.armed = false;
 }
