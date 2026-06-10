@@ -875,7 +875,7 @@ server_thread.start()
 server_ready.wait()
 
 # Serial connection to Raiden
-s = serial.Serial('/dev/ttyACM0', 115200, timeout=5)
+s = serial.Serial('/dev/ttyACM0', 115200, timeout=1.0)  # low timeout: no read should block long
 time.sleep(1)
 
 def send_cmd(cmd, timeout=5):
@@ -1007,14 +1007,19 @@ def run_glitch_test(x, y, voltage):
     send_cmd("ARM ON")
 
     # Pick read size based on mode.
+    # idle_limit only decides "no reply yet -> it's an effect"; once ANY byte
+    # arrives last_data resets, so a real dump still streams to completion under
+    # deadline_after. The LPC's rc=19 lands in ~0.02 s and a bypass starts
+    # streaming just as fast, so a few hundred ms is a safe, ~15x margin — the
+    # old 1.5/15 s just made every no-reply 'effect' shot crawl.
     if args.no_dump:
         read_bytes = 4
-        idle_limit = 1.5          # cheap mode — small reply
+        idle_limit = 0.3          # cheap mode — small reply (was 1.5)
         deadline_after = 5
     else:
         read_bytes = FLASH_DUMP_SIZE
-        idle_limit = 15.0         # 30-line group at 11.5 KB/s ≈ 0.5 s; plenty
-        deadline_after = 240      # 504 KB at ~5.5 KB/s ≈ 90 s; allow slack
+        idle_limit = 0.5          # was 15.0; only gates no-reply effects
+        deadline_after = 240      # 504 KB at ~5.5 KB/s ≈ 90 s; hard safety cap
 
     # Issue the read — trigger fires on the echoed \r byte
     send_raw(f"TARGET BL READ 0 {read_bytes}")
@@ -1047,13 +1052,15 @@ def run_glitch_test(x, y, voltage):
                 elif "ERROR" in ln:
                     saw_other_error = True
             if saw_ok_marker or saw_rc19 or saw_other_error:
-                # Command terminated — short drain to swallow the trailing
-                # prompt so the next shot's send_cmd doesn't trip on it.
-                drain_end = time.time() + 0.2
-                while time.time() < drain_end:
-                    d2 = s.read(s.in_waiting or 1)
-                    if not d2:
-                        break
+                # Command terminated — swallow the trailing prompt so the next
+                # shot's send_cmd doesn't trip on it. MUST stay non-blocking:
+                # the old `s.read(s.in_waiting or 1)` read 1 byte on an empty
+                # buffer, blocking the full serial timeout (~5 s) on almost every
+                # shot (~15x slowdown of all scans; bench 2026-06-08: 5.2 -> 0.5
+                # s/shot after this fix).
+                time.sleep(0.05)
+                if s.in_waiting:
+                    s.read(s.in_waiting)
                 break
         elif time.time() - last_data > idle_limit:
             break
