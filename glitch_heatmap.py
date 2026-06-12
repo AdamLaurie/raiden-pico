@@ -317,7 +317,7 @@ HTML_PAGE = '''<!DOCTYPE html>
                 <canvas id="gridVoltage" width="375" height="375"></canvas>
             </div>
             <div class="legend">
-                <span>0V</span>
+                <span>150V</span>
                 <div class="gradient-voltage"></div>
                 <span>500V</span>
             </div>
@@ -343,6 +343,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         const CELL_SIZE = 15;
         const GRID_SIZE = 25;
         const VOLTAGE_MAX = 500;
+        const VOLTAGE_MIN = 150;  // ChipSHOUTER usable floor; scale + gradient span [MIN, MAX]
         let prevPos = null;
 
         // Store cell data for tooltips
@@ -373,11 +374,11 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         function voltageToColor(voltage) {
-            // 0V = dark blue (#000033), 500V = red (#ff0000)
-            if (voltage <= 0) {
+            // 150V = dark blue (#000033), 500V = red (#ff0000) — matches CS usable range.
+            if (voltage <= VOLTAGE_MIN) {
                 return '#000033';
             }
-            const ratio = Math.min(voltage / VOLTAGE_MAX, 1.0);
+            const ratio = Math.min((voltage - VOLTAGE_MIN) / (VOLTAGE_MAX - VOLTAGE_MIN), 1.0);
             let r, g, b;
             if (ratio <= 0.25) {
                 const t = ratio / 0.25;
@@ -534,7 +535,9 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
         function setVoltageBar(v) {
             if (v == null) v = 0;
-            const pct = Math.min(Math.max(v / VOLTAGE_MAX * 100, 0), 100);
+            // Bar spans CS usable range [VOLTAGE_MIN, VOLTAGE_MAX]; clamp so values
+            // at or below the floor read empty rather than as a fraction of 500.
+            const pct = Math.min(Math.max((v - VOLTAGE_MIN) / (VOLTAGE_MAX - VOLTAGE_MIN) * 100, 0), 100);
             voltageFill.style.height = pct + '%';
             voltageText.textContent = v + ' V';
         }
