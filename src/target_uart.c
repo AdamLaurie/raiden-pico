@@ -1361,6 +1361,21 @@ void target_power_off(void) {
     uart_cli_send("OK: Target power OFF\r\n");
 }
 
+// Silent power control for glitch timing paths: NO uart_cli_send, because
+// uart_cli_send() does printf()+fflush() on USB CDC which BLOCKS for tens of us
+// (variable, USB-frame-dependent). Calling it between power-on and the glitch
+// delay added ~74 us of offset AND jitter to the fire time. These variants just
+// toggle the power GPIOs so busy_wait_us(delay) measures cleanly from power-on.
+void target_power_on_silent(void) {
+    power_ensure_init();
+    gpio_set_mask(POWER_MASK);
+}
+
+void target_power_off_silent(void) {
+    power_ensure_init();
+    gpio_clr_mask(POWER_MASK);
+}
+
 void target_power_cycle(uint32_t time_ms) {
     power_ensure_init();
     power_drive(power_active_mask(), false);
