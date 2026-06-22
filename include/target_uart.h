@@ -67,6 +67,8 @@ uint32_t target_get_timeout(void);
 // Target power control
 void target_power_on(void);
 void target_power_off(void);
+void target_power_on_silent(void);   // no UART; for glitch timing-critical paths
+void target_power_off_silent(void);  // no UART; for glitch timing-critical paths
 void target_power_cycle(uint32_t time_ms);
 bool target_power_get_state(void);
 void target_power_ensure_on(void);  // silent power-on for connect/sync choke points
