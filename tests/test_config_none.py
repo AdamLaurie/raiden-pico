@@ -261,6 +261,31 @@ class TestTargetType:
         assert "ERROR" in r
 
 
+# ── UART1 switching (Target <-> GRBL bleed regression) ───────
+#
+# UART1 is shared between the Target (GP4/5) and GRBL (GP8/9). Regression for the
+# TTL bleed where a TARGET command after a GRBL command wrote to UART1 while it
+# was still routed to GP8/9 (bleeding bootloader traffic onto the GRBL
+# controller). The fix makes target TX auto-reclaim UART1 from GRBL. No target
+# or GRBL controller is attached — this only observes the pin-routing handover.
+
+class TestUartSwitching:
+
+    def test_target_send_reclaims_uart_from_grbl(self, raiden):
+        raiden.cmd("GRBL POS", wait=3)     # inits GRBL UART on GP8/9 (grbl active)
+        raiden.cmd("TARGET STM32F1")       # valid target so SEND is accepted
+        r = raiden.cmd("TARGET SEND 7F", wait=2)
+        assert "reclaimed from GRBL" in r  # auto-switched back to GP4/5
+        assert "ERROR" not in r
+
+    def test_grbl_still_works_after_target(self, raiden):
+        """The reverse direction stays clean: a GRBL command after a target
+        command re-inits the GRBL UART (grbl_init deinits GP4/5)."""
+        raiden.cmd("TARGET SEND 7F", wait=1)   # target owns UART1
+        r = raiden.cmd("GRBL POS", wait=3)      # must re-init GRBL on GP8/9
+        assert "Grbl UART initialized" in r or "GP8" in r
+
+
 # ── Glitch execution ─────────────────────────────────────────
 
 class TestGlitch:

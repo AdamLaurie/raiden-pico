@@ -124,6 +124,10 @@ static const char *lpc_rc_str(int rc) {
 // ----- Low-level UART helpers -----
 
 static void lpc_begin(void) {
+    // Switch UART1 back to the target pins (GP4/5) if GRBL currently owns it —
+    // otherwise LPC ISP bytes would bleed onto the GRBL controller (GP8/9).
+    extern void target_uart_ensure_active(void);
+    target_uart_ensure_active();
     // Disable UART RX IRQ so we own the FIFO during the transaction
     uart_set_irq_enables(TARGET_UART_ID, false, false);
     while (uart_is_readable(TARGET_UART_ID))

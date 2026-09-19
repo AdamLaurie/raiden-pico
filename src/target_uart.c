@@ -558,7 +558,28 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 #define BL_ACK  0x79
 #define BL_NACK 0x1F
 
+// Ensure UART1 is routed to the Target pins (GP4/5). target_uart_init() releases
+// GRBL (GP8/9) via grbl_deinit() and re-points the peripheral. We re-init when
+// the target UART was never set up OR when GRBL currently owns UART1.
+//
+// The grbl_is_active() check is the fix for the Target<->GRBL "TTL bleed":
+// target_initialized latches true and is never cleared when GRBL takes UART1, so
+// without this check a TARGET SEND / bootloader command after any GRBL command
+// would write to UART1 while it is still on GP8/9 — bleeding bootloader traffic
+// onto the GRBL controller (and leaving GRBL's pins live). Auto-switching here
+// also removes the old "run TARGET SYNC after GRBL first" requirement.
+void target_uart_ensure_active(void) {
+    extern bool grbl_is_active(void);
+    bool was_grbl = grbl_is_active();
+    if (!target_initialized || was_grbl) {
+        target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
+        if (was_grbl)
+            uart_cli_send("OK: UART1 reclaimed from GRBL for Target (GP4/5)\r\n");
+    }
+}
+
 static void stm32_bl_begin(void) {
+    target_uart_ensure_active();   // switch UART1 back to GP4/5 if GRBL had it
     uart_set_irq_enables(TARGET_UART_ID, false, false);
     while (uart_is_readable(TARGET_UART_ID))
         uart_getc(TARGET_UART_ID);
@@ -1009,10 +1030,8 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
 }
 
 void target_uart_send_byte(uint8_t byte) {
-    // Auto-initialize UART with defaults if not already initialized
-    if (!target_initialized) {
-        target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
-    }
+    // Ensure UART1 is on the target pins (re-claims from GRBL if needed).
+    target_uart_ensure_active();
 
     uart_putc_raw(TARGET_UART_ID, byte);
     // Wait for TX FIFO to actually transmit the byte
@@ -1029,10 +1048,8 @@ void target_uart_send_byte(uint8_t byte) {
 }
 
 void target_uart_send_string(const char *str) {
-    // Auto-initialize UART with defaults if not already initialized
-    if (!target_initialized) {
-        target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
-    }
+    // Ensure UART1 is on the target pins (re-claims from GRBL if needed).
+    target_uart_ensure_active();
 
     // Disable UART RX interrupt
     uart_set_irq_enables(TARGET_UART_ID, false, false);
@@ -1078,10 +1095,8 @@ void target_uart_send_string(const char *str) {
 }
 
 void target_uart_send_hex(const char *hex_str) {
-    // Auto-initialize UART with defaults if not already initialized
-    if (!target_initialized) {
-        target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
-    }
+    // Ensure UART1 is on the target pins (re-claims from GRBL if needed).
+    target_uart_ensure_active();
 
     // Disable UART RX interrupt
     uart_set_irq_enables(TARGET_UART_ID, false, false);

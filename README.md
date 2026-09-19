@@ -842,7 +842,7 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 8** - GRBL UART TX (UART1 alternate function)
 - **GPIO 9** - GRBL UART RX (UART1 alternate function)
 
-**Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
+**Note**: GRBL uses UART1, shared with the Target UART (GP4/GP5). Only one pin-set is live at a time, but commands auto-switch in both directions: a Target/bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 and prints `OK: UART1 reclaimed from GRBL for Target (GP4/5)`. No manual `TARGET SYNC` is needed after GRBL.
 
 **CNC3018 Woodpecker controller wiring** (offline controller 8-pin header):
 - Pico GND → controller pin 3 or 4 (GND)

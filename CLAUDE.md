@@ -55,7 +55,7 @@ Raiden Pico is RP2350 firmware that turns a Pico 2 into a fault-injection / glit
 
 ### Two cross-cutting hardware facts
 
-1. **UART1 is shared between Target (GP4/GP5) and GRBL (GP8/GP9)** via pin alternate-functions — only one can be live at a time. Commands auto-switch, but switching breaks the other connection. **After any GRBL command you must re-run `TARGET SYNC` before `TARGET SEND` works again.** (Full workflow in the section below.)
+1. **UART1 is shared between Target (GP4/GP5) and GRBL (GP8/GP9)** via pin alternate-functions — only one pin-set can be live at a time. Commands auto-switch in both directions: a target TX / bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 (via `target_uart_ensure_active()`), so a manual `TARGET SYNC` is no longer required. (Full workflow in the section below.)
 
 2. **VMIN = ADC-gated glitching.** `SET VMIN <mV>` (0 = disabled) switches the glitch from a fixed-time PIO pulse to a CPU-side primitive that drops the rail and polls **ADC0 on GP26** until the probed voltage reaches the threshold, then holds for `WIDTH` cycles of minimum dwell. **Requires the target rail wired to GP26.** Currently routes through `TARGET GLITCH LPCBYPASS` and the STM32 sweep/test paths; PIO triggers (UART/GPIO) still use WIDTH-only timed pulses. See `VMIN.md`.
 
@@ -72,20 +72,28 @@ Extensive Markdown docs at the repo root document specific workflows and finding
 ## UART Switching (Target vs Grbl)
 
 The system uses UART1 for both Target (GP4/GP5) and Grbl XY platform (GP8/GP9 via alternate function).
-Only one can be active at a time - switching between them requires reconfiguration.
+Only one pin-set can be live at a time - switching between them reconfigures UART1. Switching is now
+**automatic in both directions** (previously only Target→GRBL auto-switched; the reverse required a
+manual `TARGET SYNC` and, if skipped, bled bootloader traffic onto the GRBL controller — fixed).
 
-**Important Limitation:**
-- Switching from Target to Grbl (or vice versa) breaks the active UART connection
-- After using GRBL commands, TARGET SYNC must be run again before TARGET SEND commands will work
-- This is a hardware limitation - UART1 can only be on one set of pins at a time
+**Behaviour:**
+- Switching from Target to Grbl (or vice versa) reconfigures UART1 and releases the other pin-set.
+- GRBL commands auto-claim UART1 on GP8/GP9 (grbl_init deinits GP4/5).
+- Target TX / bootloader / ISP commands auto-reclaim UART1 on GP4/5 from GRBL via
+  `target_uart_ensure_active()` — it re-inits when `!target_initialized` OR `grbl_is_active()`, so a
+  `TARGET SEND` / `TARGET BL` / `TARGET SYNC` after a GRBL command switches back automatically and
+  prints `OK: UART1 reclaimed from GRBL for Target (GP4/5)`.
+- `TARGET SYNC` after GRBL is therefore no longer required (still harmless to run).
 
-**Workflow:**
-1. TARGET SYNC → TARGET SEND commands (works)
-2. GRBL commands (auto-switches, breaks target connection)
-3. TARGET SYNC → TARGET SEND commands (re-establishes connection, works)
+**The bleed bug (fixed):** `target_initialized` latched true and was never cleared when GRBL took
+UART1, so the old `if (!target_initialized)` guard on the target TX path skipped the switch-back and
+wrote to UART1 while it was still on GP8/9. The `grbl_is_active()` term in `target_uart_ensure_active()`
+is the fix; the same guard is applied at the STM32 (`stm32_bl_begin`) and LPC (`lpc_begin`) ISP entry
+points.
 
-**Auto-switching behavior:**
-- GRBL commands automatically initialize Grbl UART (GP8/GP9) if not active
-- TARGET commands automatically initialize Target UART (GP4/GP5) if not active
-- Switching happens transparently but breaks the other connection
-- TRIGGER UART functionality continues to work correctly after auto-switching
+**Workflow (still works, SYNC now optional):**
+1. TARGET SYNC → TARGET SEND (works)
+2. GRBL commands (auto-switch to GP8/9)
+3. TARGET SEND / TARGET BL / TARGET SYNC (auto-reclaims GP4/5 - no manual step needed)
+
+- TRIGGER UART functionality continues to work correctly after auto-switching.

@@ -93,6 +93,12 @@ void target_power_regdump(void);
 void target_power_glitch_regdump(uint32_t max_attempts);
 void target_power_resettest(void);
 
+// Ensure UART1 is routed to the target pins (GP4/5), re-claiming it from GRBL
+// (GP8/9) if GRBL currently owns it. Called by the target TX/bootloader paths so
+// a TARGET SEND / BL command after a GRBL command auto-switches instead of
+// bleeding onto the GRBL controller.
+void target_uart_ensure_active(void);
+
 // STM32 USART bootloader commands (AN3155)
 void stm32_bl_get(void);
 void stm32_bl_get_version(void);
