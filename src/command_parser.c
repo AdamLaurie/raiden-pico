@@ -965,7 +965,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP21 - RTCK (JTAG adaptive clocking, optional)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
-        uart_cli_send("GP25 - Status LED\r\n");
+#ifdef PICO_DEFAULT_LED_PIN
+        uart_cli_printf("GP%u - Status LED\r\n", PICO_DEFAULT_LED_PIN);
+#else
+        uart_cli_send("Status LED - on CYW43 wireless chip (Pico 2 W), no GPIO\r\n");
+#endif
         uart_cli_send("\r\n");
         uart_cli_send("== External Reset (suggested) ==\r\n");
         uart_cli_send("EN   - Tie to FTDI DTR (on /dev/ttyUSB0) for host-driven reset.\r\n");

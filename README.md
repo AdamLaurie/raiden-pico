@@ -831,6 +831,19 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 5** - Target UART RX (bootloader/bypass, also PIO monitored for UART triggers)
 - **GPIO 15** - Target reset / nRST (active low)
 
+### Status LED (board-aware)
+
+The heartbeat LED uses the SDK's `PICO_DEFAULT_LED_PIN`, so it follows the board:
+
+- **Pico 2** (`BOARD=pico2`) - GP25 (onboard LED)
+- **Pico 2 W** (`BOARD=pico2_w`) - no GPIO LED. The onboard LED is on the CYW43
+  wireless chip, and GP25 is the CYW43 chip-select (WL_CS), so the firmware
+  **no-ops the LED** rather than driving GP25. All glitching functions are
+  unaffected; no wireless stack is pulled in.
+- **Olimex RP2350-XXL** (`BOARD=xxl`) - whatever LED pin the board header defines.
+
+Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
+
 ### ChipSHOUTER Connection
 
 - **GPIO 0** - ChipSHOUTER UART TX

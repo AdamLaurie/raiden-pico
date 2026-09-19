@@ -12,8 +12,24 @@ extern void chipshot_uart_process(void);
 extern void target_uart_process(void);
 extern void target_init(void);
 
-// LED pin for status indication
-#define LED_PIN 25
+// Board-aware status LED.
+// On the base Pico 2 (and XXL) the SDK board header defines PICO_DEFAULT_LED_PIN
+// (GP25 on Pico 2) and we drive it directly. On the Pico 2 W the onboard LED
+// hangs off the CYW43 wireless chip, so PICO_DEFAULT_LED_PIN is undefined there;
+// we no-op instead of driving GP25, which on the W is the CYW43 SPI chip-select
+// (WL_CS). This keeps the LED working on Pico 2 / XXL without pulling in the
+// wireless stack, and avoids a pin conflict on the Pico 2 W.
+#ifdef PICO_DEFAULT_LED_PIN
+static inline void status_led_init(void) {
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 1);  // Turn on LED
+}
+static inline void status_led_set(bool on) { gpio_put(PICO_DEFAULT_LED_PIN, on); }
+#else
+static inline void status_led_init(void) { }        // Pico 2 W: LED is on CYW43, no GPIO
+static inline void status_led_set(bool on) { (void)on; }
+#endif
 
 int main() {
     // Initialize standard I/O
@@ -25,10 +41,8 @@ int main() {
     // Send early test message
     printf("Raiden Pico starting...\n");
 
-    // Initialize LED
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 1);  // Turn on LED
+    // Initialize LED (board-aware; no-op on Pico 2 W)
+    status_led_init();
 
     printf("LED initialized\n");
 
@@ -52,9 +66,9 @@ int main() {
 
     // Blink LED to indicate ready
     for (int i = 0; i < 3; i++) {
-        gpio_put(LED_PIN, 0);
+        status_led_set(false);
         sleep_ms(100);
-        gpio_put(LED_PIN, 1);
+        status_led_set(true);
         sleep_ms(100);
     }
 

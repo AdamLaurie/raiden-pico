@@ -1,10 +1,16 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Board variant selection: BOARD=pico2 (default) or BOARD=xxl (Olimex RP2350-XXL)
-set(BOARD "pico2" CACHE STRING "Board variant: pico2 or xxl")
+# Board variant selection: BOARD=pico2 (default), pico2_w (Pico 2 W), or xxl (Olimex RP2350-XXL)
+set(BOARD "pico2" CACHE STRING "Board variant: pico2, pico2_w or xxl")
 if(BOARD STREQUAL "xxl")
     set(PICO_BOARD olimex_rp2350_xxl CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Olimex RP2350-XXL")
+elseif(BOARD STREQUAL "pico2_w")
+    # Pico 2 W: onboard LED is on the CYW43 wireless chip (PICO_DEFAULT_LED_PIN
+    # is undefined), so the firmware's status LED no-ops rather than driving
+    # GP25 (= CYW43 WL_CS on this board). No wireless stack is pulled in.
+    set(PICO_BOARD pico2_w CACHE STRING "Board type" FORCE)
+    set(BOARD_NAME "Raspberry Pi Pico 2 W")
 else()
     set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Raspberry Pi Pico 2")

@@ -128,7 +128,7 @@ raiden-pico-c/
 | Target TX | GP10 | Target bootloader TX |
 | Target RX | GP11 | Target bootloader RX |
 | Reset | GP15 | Target reset control |
-| LED | GP25 | Status LED |
+| LED | `PICO_DEFAULT_LED_PIN` | Status LED — GP25 on Pico 2; no GPIO on Pico 2 W (LED on CYW43, so no-op) |
 
 All pins are configurable via commands.
 

@@ -45,8 +45,12 @@ class TestSystemInfo:
 
     def test_pins_output(self, raiden):
         r = raiden.cmd("PINS", wait=2)
-        for pin in ["GP2", "GP7", "GP15", "GP17", "GP18", "GP25"]:
+        for pin in ["GP2", "GP7", "GP15", "GP17", "GP18"]:
             assert pin in r, f"PINS missing: {pin}"
+        # Status LED is board-aware: GP25 on Pico 2, on the CYW43 (no GPIO) on
+        # a Pico 2 W build.
+        assert "GP25" in r or "CYW43" in r or "wireless" in r.lower(), \
+            "PINS missing status-LED line"
         assert "Glitch Output (normal)" in r
         assert "Glitch Output (inverted)" in r
 
