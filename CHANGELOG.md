@@ -7,6 +7,30 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.9] — 2026-09-27 — External PSU control (TENMA / Multicomp Pro 72-2540)
+
+### Added
+- **External programmable PSU control.** New `PSU` command family
+  (`VOLT/CURR/ON/OFF/STATUS/ID/RELEASE`) driving a TENMA 72-2540 / Korad-protocol
+  supply over UART1 routed to GP10/11 (9600 8N1) via the RP2350 alternate
+  funcsel. `src/psu.c` + `include/psu.h`. Needs a MAX3232 on the PSU's RS-232 DB9.
+- Mutually exclusive with the GP10/11/12 target power group: a PSU command
+  releases the power group and claims the pins; `TARGET POWER` refuses while the
+  PSU holds them (run `PSU RELEASE`). New `power_group_release()` in target_uart.c.
+- **Verified end-to-end on real hardware** through the Pico: Pico GP10/11 →
+  YL-97 (MAX3232) → RS-232 DB9 → 72-2540. `PSU ID` returns the unit's identity
+  (tested on `Multicomp Pro 72-2540 V6.1` and `TENMA 72-2540 V5.9`), `PSU VOLT`/
+  `CURR` set and read back, `PSU ON`/`OFF` drive the output with the correct
+  STATUS decode (bit0 CV/CC, bit4 beep, bit5 lock, bit6 output), `PSU STATUS`
+  reports live Vout/Iout, and the `TARGET POWER` mutual-exclusion guard fires.
+  Protocol: 9600 8N1, no terminator; `VSET1:NN.NN`/`ISET1:N.NNN` write formats.
+  Wiring note: the RS-232 DB9 needs pin-5 GND common to the converter, and the
+  converter↔PSU link must be wired for the DB9 orientation (both are DCE).
+  config_none tests cover the CLI error/parse paths.
+
+(Version 0.10 is the separate STM32F4 BYPASS branch, still bench-pending; the two branches
+reconcile at merge time — this PSU work lands first as 0.9.)
+
 ## [0.8] — 2026-09-19 — Pico 2 W support + Target/GRBL UART bleed fix
 
 ### Added

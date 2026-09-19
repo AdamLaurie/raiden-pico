@@ -1346,6 +1346,18 @@ static void power_ensure_init(void) {
     }
 }
 
+// Release the GP10/11/12 power-group GPIOs so another owner (the external PSU
+// UART on GP10/11) can retask them. Pins are re-initialised lazily by the next
+// power command via power_ensure_init(). Caller must ensure the supply is OFF.
+void power_group_release(void) {
+    if (power_pin_initialized) {
+        gpio_deinit(POWER_PIN1);
+        gpio_deinit(POWER_PIN2);
+        gpio_deinit(POWER_PIN3);
+        power_pin_initialized = false;
+    }
+}
+
 // Power the target on WITHOUT emitting a CLI line. Used by the auto-power-on at
 // the connect/sync choke points (TARGET SYNC, SWD CONNECT) so a target that boots
 // unpowered (power-off boot default) is energised before we reset/connect — no

@@ -41,6 +41,7 @@ add_executable(raiden_pico
     src/stm32_target.c
     src/stm32_breakpoints.c
     src/lpc_target.c
+    src/psu.c
 )
 
 # Include directories

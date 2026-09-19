@@ -16,6 +16,14 @@
 // GP0/GP1 used for ChipSHOUTER UART0
 // GP4/GP5 used for Target UART1
 // GP8/GP9 used for Grbl UART1 (alternate)
+// GP10/GP11 used for external PSU UART1 (alternate, RP2350 funcsel 0x0b) —
+//   mutually exclusive with the GP10/11/12 target power group (see psu.h).
+//   Requires an RS-232 level shifter (e.g. MAX3232) between the PSU DB9 and
+//   these 3.3V TTL pins.
+#define PSU_UART_ID      uart1
+#define PSU_UART_TX_PIN  10    // GP10 -> PSU RX (via MAX3232)
+#define PSU_UART_RX_PIN  11    // GP11 <- PSU TX (via MAX3232)
+#define PSU_UART_BAUD    9600  // TENMA 72-2540 / Korad default (8N1)
 #define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
 #define PIN_GLITCH_OUT_INV 7   // Glitch pulse output (inverted)
 #define PIN_CLOCK 6            // Clock generator output
