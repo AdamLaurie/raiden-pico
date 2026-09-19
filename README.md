@@ -546,6 +546,32 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 - Sends Ctrl-X (0x18) to reset GRBL controller
 - Use to recover from error states
 
+#### External PSU Control (TENMA 72-2540 / Korad)
+
+Control an external programmable bench supply over serial, for precise
+programmable target Vout/Iout and current limiting during voltage-sweep
+campaigns — beyond what the onboard GP10/11/12 switching can do.
+
+**`PSU VOLT <mV>`** - Set output voltage (0–30000 mV)
+**`PSU CURR <mA>`** - Set current limit (0–5000 mA)
+**`PSU ON` / `PSU OFF`** - Enable / disable the output
+**`PSU STATUS`** - Read back Vout / Iout, CV/CC mode, and output state
+**`PSU ID`** - Identify the PSU (connectivity check; sends `*IDN?`)
+**`PSU RELEASE`** - Return GP10/11 to the target power group
+
+- **UART:** UART1 routed to GP10 (TX) / GP11 (RX) at 9600 8N1, using the RP2350
+  alternate funcsel — the same on-the-fly UART-config switching used for
+  Target/GRBL.
+- **Wiring:** the 72-2540's DB9 is true RS-232 (±12 V), so a **MAX3232** (or
+  equivalent) transceiver is required between the DB9 and GP10/11. Alternatively
+  use the unit's USB port via a USB-serial adapter.
+- **Mutually exclusive with `TARGET POWER`:** GP10/11 are shared with the target
+  power group. A PSU command releases the power group and claims the pins; while
+  the PSU holds them, `TARGET POWER ON/OFF/CYCLE/INT/EXT` returns an error until
+  you run `PSU RELEASE`. Ensure `TARGET POWER OFF` before the first PSU command.
+- **Bench-untested** against the physical PSU — command terminator, response
+  format/latency, and baud are flagged as tunables in `src/psu.c` / `TODO.md`.
+
 ## Typical Workflow
 
 ### 1. Basic Voltage Glitching
@@ -865,6 +891,7 @@ Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
 ### STM32 Attack / RDP Bypass
 
 - **GPIO 10/11/12** - Target Power (ganged, **boot default OFF**, 12mA drive each) — *INTERNAL power mode*
+  - GP10/11 double as the **external PSU UART1** (via `PSU` commands, needs a MAX3232); mutually exclusive with the power group
 - **GPIO 13** - BOOT0 control
 - **GPIO 14** - BOOT1 control
 - **GPIO 15** - nRST (shared with Target Reset)

@@ -7,6 +7,26 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.10] — unreleased — External PSU control (TENMA 72-2540)
+
+### Added
+- **External programmable PSU control.** New `PSU` command family
+  (`VOLT/CURR/ON/OFF/STATUS/ID/RELEASE`) driving a TENMA 72-2540 / Korad-protocol
+  supply over UART1 routed to GP10/11 (9600 8N1) via the RP2350 alternate
+  funcsel. `src/psu.c` + `include/psu.h`. Needs a MAX3232 on the PSU's RS-232 DB9.
+- Mutually exclusive with the GP10/11/12 target power group: a PSU command
+  releases the power group and claims the pins; `TARGET POWER` refuses while the
+  PSU holds them (run `PSU RELEASE`). New `power_group_release()` in target_uart.c.
+- **Protocol bench-verified** against a real TENMA 72-2540 V5.9 (host ↔ PSU over
+  USB-RS232): 9600 8N1, no terminator, the `VSET1:`/`ISET1:` write formats and
+  `*IDN?`/`VSET1?`/`VOUT1?`/`STATUS?` reads all match. STATUS byte decoded
+  (bit0 CV/CC, bit4 beep, bit5 lock, bit6 output). The Pico↔converter link
+  itself is not yet flash-tested (done at the bench) — see `TODO.md`.
+  config_none tests cover the CLI error/parse paths.
+
+(Version 0.9 is the separate STM32F4 BYPASS branch; these two unmerged branches
+reconcile their versions at merge time.)
+
 ## [0.8] — 2026-09-19 — Pico 2 W support + Target/GRBL UART bleed fix
 
 ### Added

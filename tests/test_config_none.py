@@ -290,6 +290,51 @@ class TestUartSwitching:
         assert "Grbl UART initialized" in r or "GP8" in r
 
 
+# ── External PSU command (error/parse paths only) ────────────
+#
+# These stay on the safe paths that return BEFORE the PSU UART claims GP10/11:
+# unknown sub-command, missing/out-of-range args, and the power-ON exclusion
+# (which refuses before retasking any pin). Actual PSU comms need the wired
+# TENMA + MAX3232 and are bench-tested.
+
+class TestPsu:
+
+    def test_psu_usage_no_arg(self, raiden):
+        r = raiden.cmd("PSU")
+        assert "PSU" in r and ("VOLT" in r or "Usage" in r)
+        assert "ERROR" not in r  # bare PSU prints usage/state, not an error
+
+    def test_psu_unknown_subcommand_errors(self, raiden):
+        r = raiden.cmd("PSU FOOBAR")
+        assert "ERROR" in r
+
+    def test_psu_volt_missing_arg_errors(self, raiden):
+        r = raiden.cmd("PSU VOLT")
+        assert "ERROR" in r
+
+    def test_psu_volt_out_of_range_errors(self, raiden):
+        r = raiden.cmd("PSU VOLT 99999")
+        assert "ERROR" in r
+        assert "range" in r.lower()
+
+    def test_psu_curr_out_of_range_errors(self, raiden):
+        r = raiden.cmd("PSU CURR 99999")
+        assert "ERROR" in r
+        assert "range" in r.lower()
+
+    def test_psu_refused_while_target_power_on(self, raiden):
+        """With the target power group ON, a PSU command must refuse (shared
+        GP10/11) before retasking any pin."""
+        raiden.cmd("TARGET POWER INT")
+        raiden.cmd("TARGET POWER ON")
+        try:
+            r = raiden.cmd("PSU ID", wait=1)
+            assert "ERROR" in r
+            assert "power is ON" in r or "TARGET POWER OFF" in r
+        finally:
+            raiden.cmd("TARGET POWER OFF")
+
+
 # ── Glitch execution ─────────────────────────────────────────
 
 class TestGlitch:
