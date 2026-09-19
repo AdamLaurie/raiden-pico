@@ -7,6 +7,18 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.9] — unreleased — STM32F4 RDP1 BYPASS payload (bench-untested)
+
+### Added
+- **STM32F4 BYPASS payload + per-family selection.** `TARGET GLITCH BYPASS`
+  gains an F4-specific SRAM payload (`stm32_payloads/f4/rdp_bypass.S`): F4
+  peripheral map, loads at 0x20000000, and the FPB "reader" trick (a 2nd
+  comparator remaps a flash-range fetch so the PC stays in flash) because F4
+  blocks flash reads from SRAM-executing code under RDP1. `get_rdp_bypass_payload()`
+  selects the payload per target family; F1 unchanged, F4 added, F2/F3 error.
+- **Not yet bench-verified** against an F4 target — see `TODO.md`. Load base,
+  reader-trick validity, BOOT1 pin, and baud are flagged as bench tunables.
+
 ## [0.8] — 2026-09-19 — Pico 2 W support + Target/GRBL UART bleed fix
 
 ### Added

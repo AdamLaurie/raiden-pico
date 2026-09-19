@@ -288,6 +288,24 @@ class TestUartSwitching:
         raiden.cmd("TARGET SEND 7F", wait=1)   # target owns UART1
         r = raiden.cmd("GRBL POS", wait=3)      # must re-init GRBL on GP8/9
         assert "Grbl UART initialized" in r or "GP8" in r
+# ── BYPASS per-family payload selection (error path only) ────
+#
+# Only the unsupported-family ERROR path is exercised here: it returns from the
+# family gate BEFORE the sweep/POR glitch, so it drives no hardware and is safe
+# under config_none. The F1/F4 happy path fires the power glitch and needs a
+# wired target — it belongs in the power-int gated bench validation, not here.
+
+class TestBypassPayloadFamily:
+
+    def test_bypass_unsupported_family_errors(self, raiden):
+        """A family with no ported BYPASS payload (e.g. STM32L4) must error at
+        the family gate, before any sweep or glitch."""
+        raiden.cmd("TARGET POWER INT")   # ensure not EXTERNAL (default anyway)
+        raiden.cmd("TARGET STM32L4")
+        r = raiden.cmd("TARGET GLITCH BYPASS", wait=3)
+        assert "ERROR" in r
+        assert "No BYPASS payload" in r
+        assert "STM32F1" in r and "STM32F4" in r  # names the supported families
 
 
 # ── Glitch execution ─────────────────────────────────────────
