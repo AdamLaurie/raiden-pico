@@ -365,9 +365,16 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 **`TARGET GLITCH PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
 - Power glitch then re-enter bootloader to check for ISP code readout bypass
 
-**`TARGET GLITCH BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
+**`TARGET GLITCH BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1 / STM32F4]
 - Two-stage attack: POR glitch → FPB redirect → UART flash dump at 115200 baud
 - Default: 20 attempts, full flash size
+- Per-family payload is selected automatically from the set `TARGET` type.
+  Other families (F2/F3) return an explicit error — not yet ported
+- **F4 difference:** F4 blocks flash reads from SRAM-executing code under RDP1,
+  so the F4 payload adds the FPB "reader" trick (a 2nd comparator remaps a
+  flash-range instruction fetch so the PC stays in flash while reading). F4 UART
+  is USART1 TX on PA9 (AF7) — wire it to the Pico target UART RX
+- **F4 path is bench-untested** — see `TODO.md`
 - See [STM32F1 RDP1 Bypass Workflow](#4-stm32f1-rdp1-bypass) below
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
