@@ -7,6 +7,25 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.8] — 2026-09-19 — Pico 2 W support + Target/GRBL UART bleed fix
+
+### Added
+- **Pico 2 W support.** The status LED is now board-aware via the SDK's
+  `PICO_DEFAULT_LED_PIN` (GP25 on Pico 2). On the Pico 2 W the LED is on the
+  CYW43 chip and GP25 is its chip-select (WL_CS), so the firmware no-ops the LED
+  instead of driving GP25 — no wireless stack pulled in. New `BOARD=pico2_w`
+  build option; `PINS` output is board-aware.
+
+### Fixed
+- **Target↔GRBL UART1 "TTL bleed."** `target_initialized` latched true and was
+  never cleared when GRBL took UART1 (GP8/9), so a `TARGET SEND` / bootloader /
+  ISP command after any GRBL command wrote to UART1 while it was still on GP8/9,
+  bleeding bootloader traffic onto the GRBL controller. Target TX now
+  auto-reclaims UART1 to GP4/5 (via `target_uart_ensure_active()`, applied to
+  the send and STM32/LPC ISP-entry paths) and prints
+  `OK: UART1 reclaimed from GRBL for Target (GP4/5)`. The manual `TARGET SYNC`
+  after GRBL is no longer required. Verified electrically with dual FTDI probes.
+
 ## [0.7] — 2026-06-08 — ChipSHOUTER command fixes + hardening
 
 ### Fixed

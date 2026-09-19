@@ -1,6 +1,6 @@
 ---
 name: version-bump
-description: Firmware-change discipline for Raiden Pico — ANY change to the firmware (src/*.c, src/*.pio, include/*.h that alters the built raiden_pico.uf2's behavior or output) MUST bump the firmware version string in the SAME change. The version is what the VERSION command prints, in src/command_parser.c. Invoke whenever you edit firmware source, or are about to build + flash a firmware change.
+description: Firmware-change discipline for Raiden Pico — ANY change to the firmware (src/*.c, src/*.pio, include/*.h that alters the built raiden_pico.uf2's behavior or output) MUST bump the firmware version string in the SAME change. The version is what the VERSION command prints, in src/command_parser.c. Also: if any source file is touched between testing and committing/pushing, a full flash + retest is required before the push. Invoke whenever you edit firmware source, are about to build + flash a firmware change, or are about to commit/push firmware.
 ---
 
 # Every firmware change bumps the version
@@ -46,10 +46,33 @@ change — that's the only place changes are tracked outside commit messages. Ad
 subsections as appropriate. Keep it user-facing (what the device now does), not a
 code diff.
 
+## Re-flash + retest if source changed after the last test
+
+The proof that firmware works is only valid for the **exact binary that was on
+the chip when you tested it**. Any edit to firmware source (`src/*.c`,
+`src/*.pio`, `include/*.h`) after your last flash+test produces a *different*
+binary — the earlier "tests passed" no longer applies to what you're about to
+ship, however small the edit looks.
+
+**Rule: if ANY source file is touched between testing and committing/pushing, you
+MUST do a full flash of the freshly-built firmware and re-run the tests before
+the push.** No exceptions for "it's a one-liner" or "it obviously can't matter" —
+the whole point of the on-device test is to catch the case where it did. (This
+skill exists because a "trivial" post-test edit — e.g. a missed code path in one
+of several near-identical functions — shipped untested more than once.)
+
+Applies to the commit/push, not just the edit: the sequence must end
+`edit → build → flash → retest green → commit → push`, with no source edit after
+the retest. If you amend a commit or add "just one more fix," the clock resets —
+re-flash and retest again. Host-only edits (`tests/`, `scripts/`, `*.md`) don't
+change the binary, so they need a test re-run but not a re-flash.
+
 ## Checklist
 
 - [ ] Did this change alter firmware behavior or output (`src/*.c`, `src/*.pio`,
       `include/*.h`)? → bump the version.
+- [ ] **No firmware source edited since the last flash+test?** If any was, re-flash
+      the freshly-built firmware and re-run the tests green BEFORE committing/pushing.
 - [ ] Version string in `src/command_parser.c` (VERSION handler) updated, bumped
       from the LIVE-on-`main` version (one bump per uncommitted batch).
 - [ ] **`CHANGELOG.md` entry added** for the new version (Added/Changed/Fixed/Removed).
