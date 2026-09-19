@@ -407,7 +407,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
-        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 POR-glitch + flash dump [STM32F1/F4]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
@@ -499,7 +499,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.8\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.9\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
