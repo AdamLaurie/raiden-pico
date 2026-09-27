@@ -19,6 +19,11 @@
  *   5. VTOR     (0xE000ED08) — vector table offset (0=flash, 0x20000000=SRAM)
  *   6. FLASH_OBR(0x4002201C) — RDP status (bit 1 = RDPRT)
  *   7. RCC_CSR  (0x40021024) — reset cause flags
+ *
+ * RDP0 Phase A (rdp-payload-check skill) PASS — 2026-09-27, F1 unlocked to RDP0
+ * with marker 0xCAFEBABE @ 0x08000000: `TARGET GLITCH HALT 32` dumped
+ * BE BA FE CA FF... ("Dump complete", no FAULT; OBR RDPRT=0). Read path proven
+ * good, so the RDP1 FAULT is RDP enforcement, not a payload bug.
  */
 .syntax unified
 .thumb

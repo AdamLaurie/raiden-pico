@@ -67,13 +67,14 @@ and/or the relevant campaign doc / memory): date, target, address read, and the
 bytes returned. An RDP1 conclusion in a commit/doc should be able to point at the
 RDP0 pass that licenses it.
 
-## Current backlog (payloads NOT yet RDP0-proven)
+## RDP0 Phase A status
 
-- `stm32_payloads/f1/rdp_cleanwake.S` (`TARGET GLITCH CLEANWAKE`) — only faulted at
-  RDP1.
-- `stm32_payloads/f1/rdp_bypass_diag.S` (`TARGET GLITCH HALT`) — only faulted at
-  RDP1 (both the old FPB-reader-trick and the current direct-read version).
-- Check any other flash-reading diag payloads (`rdp_literal`, `rdp_regdump`,
-  `rdp_resettest`) the same way before citing their results.
-- `stm32_payloads/f1/rdp_bypass.S` (BYPASS) is already proven (dumps `DEADBEEF` at
-  RDP1). F2/F3/F4 payloads, when built, start at Phase A.
+- ✅ `stm32_payloads/f1/rdp_cleanwake.S` (`TARGET GLITCH CLEANWAKE`) — PASS
+  2026-09-27 (marker 0xCAFEBABE returned; DATA…DONE, no FAULT).
+- ✅ `stm32_payloads/f1/rdp_bypass_diag.S` (`TARGET GLITCH HALT`) — PASS 2026-09-27
+  (marker 0xCAFEBABE dumped; "Dump complete", no FAULT).
+- ✅ `stm32_payloads/f1/rdp_bypass.S` (BYPASS) — proven by success at RDP1 (dumps
+  real flash / `DEADBEEF`); no separate Phase A needed.
+- ⬜ Older diag payloads (`rdp_literal`, `rdp_regdump`, `rdp_resettest`) — run
+  Phase A before citing their results if ever reused.
+- ⬜ F2/F3/F4 payloads, when built — start at Phase A.

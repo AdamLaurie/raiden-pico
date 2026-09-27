@@ -13,7 +13,12 @@
  *
  * Deliberately does NOT touch DHCSR/DEMCR/DBGMCU/FPB — this is the pure test of
  * "does a genuinely non-debugged, self-timed wake let SRAM code read flash under
- * RDP1?".  Expectation: FAULT (RDP is the flash-controller POR latch, RDPRT=1).
+ * RDP1?".  Result at RDP1: FAULT (RDP is the flash-controller POR latch, RDPRT=1).
+ *
+ * RDP0 Phase A (rdp-payload-check skill) PASS — 2026-09-27, F1 unlocked to RDP0
+ * with marker 0xCAFEBABE @ 0x08000000: payload returned "DATA" + BE BA FE CA +
+ * FF... + "DONE" (OBR RDPRT=0). Read path proven good, so the RDP1 FAULT is RDP
+ * enforcement, not a payload bug.
  */
 .syntax unified
 .thumb
