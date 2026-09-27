@@ -89,8 +89,23 @@ can flip the branch outcome, making the bootloader believe RDP is not set.
 - Window: single instruction (~125ns at 8MHz)
 - Use DWT_CYCCNT to measure exact cycle count from reset
 
-### 3. Per-Command RDP Gates
-Each sensitive command re-checks an RDP flag (stored in a register or RAM):
+### 3. Per-Command RDP Gates — NO CACHED FLAG (verified 2026-09-27)
+
+**Correction to earlier prose:** `rdp_check` (0x1FFFF132) is a *subroutine* that
+reads `FLASH_OBR` **fresh** and returns 0/1 in r0 — it does NOT set/store an
+internal RAM flag. Every sensitive command re-invokes it (5 call sites:
+0x1FFFF2FC [via read_mem's 0x1FFFF2F8], 0x1FFFF4AE, 0x1FFFF672, 0x1FFFF700,
+0x1FFFF710). So each command re-reads `FLASH_OBR` — there is no single software
+flag to corrupt for a session-wide unlock.
+
+**Implication:** glitching the boot-time `bpl` at 0x1FFFF13A only affects that one
+invocation → you'd need a glitch per command (per-read timing). The ONLY
+single-point corruption that unlocks the whole session is the **hardware
+option-byte shadow load at POR** (the source of `FLASH_OBR`): corrupt it once and
+`FLASH_OBR` reads `RDPRT=0` all power cycle, so every `rdp_check` returns
+"unprotected". That is the mechanism `rdp_bypass.S` (BYPASS) already uses.
+
+Each sensitive command's gate (all re-reading via rdp_check):
 
 | Gate Address | Command | Branch | Effect |
 |-------------|---------|--------|--------|
@@ -103,10 +118,13 @@ Each sensitive command re-checks an RDP flag (stored in a register or RAM):
 
 1. **Reset** (0x1FFFF010): Load SP, branch to main init
 2. **main_init** (0x1FFFF34C): Configure IWDG, RCC (8MHz HSI), GPIO, USART
-3. **rdp_check** (0x1FFFF132): Read FLASH_OBR.RDPRT, set internal flag
+3. **main_init done** — NOTE: `rdp_check` is NOT called once here; it is a
+   subroutine re-invoked per command (see correction above).
 4. **cmd_loop** (0x1FFFF3FA): Wait for USART command byte
 5. **cmd_dispatch** (0x1FFFF416): Route to handler based on command
-6. Each handler checks RDP flag before executing
+6. Each sensitive handler calls `rdp_check` (0x1FFFF132) → fresh `FLASH_OBR` read
+   (no cached flag). Session-wide unlock therefore requires corrupting the POR
+   option-byte shadow load (source of FLASH_OBR), not a software flag.
 
 ## Attack Chains
 
