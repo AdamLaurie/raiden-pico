@@ -414,6 +414,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
         uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
+        uart_cli_send("TARGET GLITCH CLEANWAKE          - Control: SRAM-boot + STOP/wake, no debug, try flash read\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
         uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
@@ -514,7 +515,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.9\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.9.1\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1664,7 +1665,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
                 const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
-                                             "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
+                                             "HALT", "CLEANWAKE", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
                 }
@@ -1743,6 +1744,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     target_power_halt(dump_bytes);
+                } else if (strcmp(parts->parts[2], "CLEANWAKE") == 0) {
+                    target_power_cleanwake();
                 } else if (strcmp(parts->parts[2], "LITERAL") == 0) {
                     target_power_literal();
                 } else if (strcmp(parts->parts[2], "REGDUMP") == 0) {

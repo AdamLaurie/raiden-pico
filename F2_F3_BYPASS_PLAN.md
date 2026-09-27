@@ -5,7 +5,39 @@ to the STM32F2 and STM32F3 families, reusing the same per-family payload
 architecture. **Step 0 first: validate the deep-sleep debug-kill on a
 known-working F1** before committing to a method for F2/F3.
 
-## Step 0 (DO THIS FIRST) — validate the deep-sleep method on a known-good F1
+## Step 0 — RESOLVED (2026-09-27): deep-sleep FAILS, use POR-glitch BYPASS
+
+Tested on the known-good F1 (POR-glitch BYPASS proven as control). **Result:
+deep-sleep debug-disconnect is real but does NOT bypass RDP1.**
+
+- **Deep sleep DOES disconnect debug (clean test, `TARGET GLITCH CLEANWAKE`).**
+  The core was resumed with `C_DEBUGEN=1` and the payload never writes DHCSR; after
+  its own autonomous STOP/wake it read back `DHCSR=0x01010000` → `C_DEBUGEN=0`. The
+  only thing between the two is the sleep, so on F1 STOP genuinely clears
+  C_DEBUGEN. (The *earlier* HALT test's `C_DEBUGEN=0` was a confound — that path
+  clears C_DEBUGEN twice before the STOP: a DAP write in `target_power_halt` and
+  stage 1's own clear at `rdp_bypass_diag.S:88-90`. CLEANWAKE removes both, so its
+  result is real.)
+- **But debug-disconnect is NOT the RDP gate.** With `C_DEBUGEN=0` and no debugger
+  attached, the flash read still faults: `FLASH_OBR=0x03FFFFFE RDPRT=1`
+  (`DATA`+`"FAULT"`). RDP1 is the flash-controller POR latch, independent of debug
+  state — detaching/sleeping/waking never touches it. Only the POR voltage glitch
+  corrupts it (control: BYPASS on the same unit dumps `DEADBEEF`).
+- Ruled out the read *method*: switched the diag payload's stage 2 from the FPB
+  "reader" trick to a plain `ldr r3,[r5]` — still faults. So the fault is RDP
+  enforcement in the flash controller, not the reader trick.
+
+**Why:** RDP1 on F1 is enforced by the flash controller, whose RDP state is
+latched from the option bytes at POR. A *clean* reset (STOP/STANDBY wake) re-reads
+the option bytes and re-applies RDP1 — it cannot corrupt that latch. Only the POR
+*voltage glitch* corrupts the latch mid-latching, which is why BYPASS works and no
+low-power mode can. Confirms the prior `project_todo_run_rdp_resettest` finding.
+
+**Decision:** F2/F3 use the POR-glitch BYPASS with per-family payloads (below).
+Deep-sleep is dropped. (`TARGET GLITCH HALT` remains a useful diagnostic — it
+returns the register snapshot above — but is not an RDP bypass.)
+
+## (historical) Step 0 rationale — validate the deep-sleep method on a known-good F1
 
 An RDP1 flash dump needs the debug connection dropped so the flash controller
 permits reads, while the SRAM payload survives. Two ways to sever debug:

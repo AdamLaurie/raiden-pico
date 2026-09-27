@@ -212,6 +212,7 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 // Protocol: "RDP1" + CPUID(4B) + "DIAG" + 7 regs(28B) + flash bytes
 // Regs: DHCSR, DEMCR, FP_CTRL, FP_COMP0, VTOR, FLASH_OBR, RCC_CSR
 #include "../stm32_payloads/f1/rdp_bypass_diag_hex.h"
+#include "../stm32_payloads/f1/rdp_cleanwake_hex.h"
 #include "../stm32_payloads/f1/rdp_literal_hex.h"
 #include "../stm32_payloads/f1/rdp_regdump_hex.h"
 #include "../stm32_payloads/f1/rdp_resettest_hex.h"
@@ -3217,6 +3218,114 @@ halt_reset:
 halt_cleanup:
     gpio_put(BOOT0_PIN, 0);
     gpio_put(BOOT1_PIN, 0);
+}
+
+// Clean-wake control test (NO glitch, NO FPB, NO debugger-side debug clears).
+// Upload payload to SRAM, set SRAM-boot pins, DETACH SWD, then nRST so the target
+// cold-boots the payload with C_DEBUGEN=0 and no debugger. The payload sends
+// "CLN0", enters STOP, self-wakes via RTC (~2ms), sends "WAKE" + FLASH_OBR, then
+// tries a direct flash read ("DATA"+bytes, or "FAULT"). Captures raw target UART.
+void target_power_cleanwake(void) {
+    extern bool swd_connect_under_reset(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool swd_write_core_reg(uint8_t reg, uint32_t value);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info)
+        return;
+
+    uint32_t sram_base = info->sram_base;
+    uint32_t payload_words = (sizeof(f103_rdp_cleanwake_payload) + 3) / 4;
+    uint32_t entry = sram_base + 0x08 + 1;  // thumb entry (vector table = 8 bytes)
+
+    uart_cli_printf("CLEAN-WAKE test: %u byte payload -> 0x%08lX (no glitch, no debug clears)\r\n",
+                    (unsigned)sizeof(f103_rdp_cleanwake_payload), sram_base);
+
+    // Upload via SWD under reset
+    uart_cli_send("[1] Connecting under reset + uploading payload...\r\n");
+    swd_init();
+    if (!swd_connect_under_reset()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect under reset failed\r\n");
+        return;
+    }
+    if (swd_write_mem(sram_base, (const uint32_t *)f103_rdp_cleanwake_payload, payload_words)
+            != payload_words) {
+        swd_deinit();
+        uart_cli_send("ERROR: SRAM write failed\r\n");
+        return;
+    }
+    uint32_t readback[payload_words];
+    if (swd_read_mem(sram_base, readback, payload_words) != payload_words ||
+        memcmp(readback, f103_rdp_cleanwake_payload, sizeof(f103_rdp_cleanwake_payload)) != 0) {
+        swd_deinit();
+        uart_cli_send("ERROR: SRAM verify failed\r\n");
+        return;
+    }
+    uart_cli_send("    Payload uploaded and verified\r\n");
+
+    // Listen on target UART1 RX (GP5) before the payload starts talking
+    uart_deinit(TARGET_UART_ID);
+    gpio_deinit(TARGET_UART_RX_PIN);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    while (uart_is_readable(TARGET_UART_ID)) uart_getc(TARGET_UART_ID);
+
+    // Set SP + PC to the payload entry and RESUME with debug still enabled
+    // (C_DEBUGEN=1). We do NOT clear C_DEBUGEN ourselves — the payload reports
+    // its own DHCSR after the STOP/wake so we can see whether the sleep cleared it.
+    uart_cli_send("[2] Set PC=entry, resume (C_DEBUGEN left set), then detach...\r\n");
+    swd_write_core_reg(13, 0x20005000);   // SP
+    swd_write_core_reg(15, entry);        // PC
+    uint32_t dhcsr_run = 0xA05F0001;      // DBGKEY | C_DEBUGEN, C_HALT=0 -> run
+    swd_write_mem(0xE000EDF0, &dhcsr_run, 1);
+
+    // Stop the debug session: tri-state SWD. Core keeps running the payload.
+    swd_deinit();
+
+    // Capture raw bytes for up to 3s (500ms idle = done), hex+ASCII dump
+    uart_cli_send("[3] Capturing target UART (payload runs autonomously)...\r\n");
+    uint8_t buf[512];
+    uint32_t n = 0;
+    uint64_t start = time_us_64();
+    uint64_t last = start;
+    while (n < sizeof(buf)) {
+        if (uart_is_readable(TARGET_UART_ID)) {
+            buf[n++] = uart_getc(TARGET_UART_ID);
+            last = time_us_64();
+        } else {
+            if (time_us_64() - start > 3000000) break;
+            if (n > 0 && time_us_64() - last > 500000) break;
+        }
+    }
+
+    if (n == 0) {
+        uart_cli_send("    (nothing received — payload may not have booted)\r\n");
+    } else {
+        uart_cli_printf("    Received %lu bytes:\r\n", n);
+        for (uint32_t i = 0; i < n; i += 16) {
+            uart_cli_printf("  %04lX:", i);
+            uint32_t line = (n - i < 16) ? (n - i) : 16;
+            for (uint32_t j = 0; j < line; j++) uart_cli_printf(" %02X", buf[i + j]);
+            for (uint32_t j = line; j < 16; j++) uart_cli_send("   ");
+            uart_cli_send("  ");
+            for (uint32_t j = 0; j < line; j++) {
+                char c = buf[i + j];
+                uart_cli_printf("%c", (c >= 32 && c <= 126) ? c : '.');
+            }
+            uart_cli_send("\r\n");
+        }
+    }
+
+    uart_cli_send("[4] Power cycling target...\r\n");
+    gpio_clr_mask(POWER_MASK);
+    sleep_ms(100);
+    gpio_set_mask(POWER_MASK);
 }
 
 void target_power_literal(void) {

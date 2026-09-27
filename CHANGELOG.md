@@ -7,6 +7,28 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.9.1] — 2026-09-27 — RDP1 deep-sleep control test (research/diagnostic)
+
+### Added
+- **`TARGET GLITCH CLEANWAKE`** — a glitch-free control test for the STM32F1 RDP1
+  investigation. Uploads an SRAM payload, resumes with `C_DEBUGEN=1`, detaches
+  SWD, and lets the payload run autonomously: it announces itself (`CLN0`), enters
+  STOP, self-wakes via RTC (~2 ms, `WAKE`), reports its own `DHCSR` + `FLASH_OBR`,
+  then attempts a direct flash read. Payload: `stm32_payloads/f1/rdp_cleanwake.S`.
+
+### Changed
+- `TARGET GLITCH HALT` diag payload (`stm32_payloads/f1/rdp_bypass_diag.S`) now
+  reads flash with a direct `ldr` instead of the F2/F4-only FPB "reader" trick
+  (unneeded and fault-prone on F1).
+
+### Findings (bench, F1 at RDP1; BYPASS as proven control)
+- Deep sleep genuinely disconnects debug on F1: resumed with `C_DEBUGEN=1`, after
+  the autonomous STOP/wake the payload read back `C_DEBUGEN=0` (it never writes
+  DHCSR). **But this does not bypass RDP1** — `FLASH_OBR RDPRT=1` and the read
+  faults. RDP1 is the flash-controller POR latch, independent of debug state; only
+  the voltage glitch corrupts it. On F1, SRAM code reads flash directly once RDP is
+  down — the FPB reader trick is an F2/F4 requirement, not F1.
+
 ## [0.9] — 2026-09-27 — External PSU control (TENMA / Multicomp Pro 72-2540)
 
 ### Added

