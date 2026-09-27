@@ -41,8 +41,25 @@ for i in {1..10}; do
     fi
 done
 
-# Flash
+# Flash — the mount can appear before it is writable, so retry the copy and
+# check cp's exit status (never report success on a failed copy).
 echo "Flashing raiden_pico.uf2..."
-cp "$UF2_FILE" "$MOUNT_POINT/"
-sync
+CP_ERR=$(mktemp)
+flashed=0
+for attempt in 1 2 3 4 5; do
+    if cp "$UF2_FILE" "$MOUNT_POINT/" 2>"$CP_ERR"; then
+        sync 2>/dev/null || true   # device reboots on accept; sync is best-effort
+        flashed=1
+        break
+    fi
+    echo "  copy attempt $attempt failed, retrying..."
+    sleep 1
+done
+if [ "$flashed" -ne 1 ]; then
+    echo "✗ Flash FAILED — could not copy UF2 to $MOUNT_POINT"
+    [ -s "$CP_ERR" ] && echo "  $(cat "$CP_ERR")"
+    rm -f "$CP_ERR"
+    exit 1
+fi
+rm -f "$CP_ERR"
 echo "✓ Flash complete"
