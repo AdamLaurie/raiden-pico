@@ -546,7 +546,7 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 - Sends Ctrl-X (0x18) to reset GRBL controller
 - Use to recover from error states
 
-#### External PSU Control (TENMA 72-2540 / Korad)
+#### External PSU Control (TENMA / Multicomp Pro 72-2540, Korad protocol)
 
 Control an external programmable bench supply over serial, for precise
 programmable target Vout/Iout and current limiting during voltage-sweep
@@ -569,8 +569,11 @@ campaigns — beyond what the onboard GP10/11/12 switching can do.
   power group. A PSU command releases the power group and claims the pins; while
   the PSU holds them, `TARGET POWER ON/OFF/CYCLE/INT/EXT` returns an error until
   you run `PSU RELEASE`. Ensure `TARGET POWER OFF` before the first PSU command.
-- **Bench-untested** against the physical PSU — command terminator, response
-  format/latency, and baud are flagged as tunables in `src/psu.c` / `TODO.md`.
+- **Verified end-to-end on real hardware** (Pico → YL-97/MAX3232 → RS-232 DB9 →
+  72-2540): `PSU ID` returns the unit identity, `VOLT`/`CURR` set and read back,
+  `ON`/`OFF` drive the output with the correct STATUS decode, and the mutual-
+  exclusion guard fires. Wiring note: the RS-232 DB9 needs **pin-5 GND common**
+  to the converter.
 
 ## Typical Workflow
 
