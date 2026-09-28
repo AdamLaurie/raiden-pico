@@ -879,12 +879,14 @@ bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out) {
 // --- STM32 flash operations ---
 
 bool swd_stm32_flash_wait(const stm32_target_info_t *info, uint32_t timeout_ms) {
+    // BSY bit position differs by family: F1/F3 = SR bit 0; F4/L4 = SR bit 16.
+    uint32_t bsy = (info->flash_optr == 0x4002201C) ? (1u << 0) : (1u << 16);
     uint32_t start = to_ms_since_boot(get_absolute_time());
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
         uint32_t sr;
         if (!mem_read32(info->flash_sr, &sr))
             return false;
-        if (!(sr & 0x1))  // BSY bit
+        if (!(sr & bsy))
             return true;
         sleep_us(100);
     }
@@ -895,22 +897,29 @@ bool swd_stm32_flash_unlock(const stm32_target_info_t *info) {
     // Clear sticky errors
     swd_write_dp(DP_ABORT, 0x1E);
 
+    // LOCK bit: F1/F3 = bit 7; L4/F4 = bit 31.
+    uint32_t lock = (info->flash_base == 0x40022000) ? (1u << 7) : (1u << 31);
+
+    uint32_t cr;
+    if (!mem_read32(info->flash_cr, &cr))
+        return false;
+
+    // IDEMPOTENT: if already unlocked, do NOT re-write KEYR. On F4, writing the
+    // key sequence to an already-unlocked KEYR re-locks FLASH_CR (and can bus-fault),
+    // which is why a double-unlock (erase then write) failed on F4 but not F1.
+    if (!(cr & lock))
+        return true;
+
     // Write key sequence to FLASH_KEYR
     if (!mem_write32(info->flash_keyr, info->flash_key1))
         return false;
     if (!mem_write32(info->flash_keyr, info->flash_key2))
         return false;
 
-    // Verify unlock by reading CR — LOCK bit should be clear
-    uint32_t cr;
+    // Verify unlock
     if (!mem_read32(info->flash_cr, &cr))
         return false;
-
-    // F1/F3: LOCK is bit 7; L4: bit 31; F4: bit 31
-    if (info->flash_base == 0x40022000)
-        return !(cr & (1u << 7));    // F1/F3
-    else
-        return !(cr & (1u << 31));   // L4/F4
+    return !(cr & lock);
 }
 
 static bool stm32_opt_unlock(const stm32_target_info_t *info) {
@@ -1301,13 +1310,20 @@ bool swd_stm32_flash_erase_page(const stm32_target_info_t *info, uint32_t page) 
         if (!mem_write32(info->flash_cr, cr))
             return false;
     }
-    // F4: sector erase via OPTCR — different model, use SNB field
+    // F4: sector erase (SER + SNB[6:3]) with PSIZE=x32. Clear sticky SR error/EOP
+    // flags first (they block new operations), and clear CR (SER/SNB) afterward so
+    // a following program (PG) starts clean.
     else {
-        uint32_t cr = (page << 3)       // SNB
-                    | (1 << 1)          // SER
-                    | (1 << 16);        // STRT
+        mem_write32(info->flash_sr, 0x1F3);   // clear EOP/OPERR/WRPERR/PGAERR/PGPERR/PGSERR/RDERR
+        uint32_t cr = (2u << 8)         // PSIZE = x32
+                    | ((page & 0xF) << 3) // SNB
+                    | (1u << 1)          // SER
+                    | (1u << 16);        // STRT
         if (!mem_write32(info->flash_cr, cr))
             return false;
+        bool ok = swd_stm32_flash_wait(info, 5000);
+        mem_write32(info->flash_cr, 0);   // clear SER/SNB
+        return ok;
     }
 
     return swd_stm32_flash_wait(info, 5000);
@@ -1365,6 +1381,7 @@ uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
     }
     // F4: word (32-bit) programming with PSIZE
     else {
+        mem_write32(info->flash_sr, 0x1F3);  // clear sticky SR error/EOP flags first
         // PG | PSIZE=2 (32-bit)
         if (!mem_write32(info->flash_cr, (1 << 0) | (2 << 8)))
             return 0;

@@ -7,6 +7,34 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.10] — 2026-09-28 — STM32F4 RDP1 BYPASS + F4 flash-controller support
+
+### Added
+- **STM32F4 RDP1 BYPASS payload.** `TARGET GLITCH BYPASS` is now per-family via a
+  `get_rdp_bypass_payload()` selector: F1 unchanged, **F4 added** (F4 peripheral
+  map — RCC 0x40023800, GPIOA AHB1, USART1 PA9/AF7 @115200 — plus the FPB reader
+  trick F4 needs to read flash from SRAM-executing code under RDP1). F2/F3 return
+  an explicit error. Payload `stm32_payloads/f4/rdp_bypass.S`.
+- **`TARGET GLITCH SHADOWCHAR [n]`** — M1 of the deterministic POR option-byte
+  shadow-load glitch plan. Power-cycles the target and timestamps `t_vdd` (VDD
+  rising through ~2.0 V on ADC GP26) and `t_nrst` (nRST/GP15 release after POR)
+  over N iterations, reporting the `[t_vdd, t_nrst]` window (where the option-byte
+  shadow load happens) plus nRST jitter — i.e. how lockable a timed glitch delay
+  can be. Non-destructive; runs at RDP0 or RDP1.
+- `rdp-payload-check` skill (prove an RDP flash payload reads real flash at RDP0
+  before trusting any RDP1 result) and `tty-contention-check` skill (`fuser` the
+  serial port before use — empty CLI reads usually mean a second terminal, not a
+  dead device).
+
+### Fixed
+- **F4 flash-controller support** — SWD flash erase/write/fill worked on F1 but
+  failed on F4. Fixed in `swd.c`: `flash_wait` reads BSY at **bit 16** (F4/L4), not
+  bit 0; F4 erase/program clear the sticky SR error/EOP flags first; `flash_unlock`
+  is **idempotent** (on F4, re-writing KEYR while already unlocked re-locks it — the
+  double-unlock that broke erase+write). `SWD FILL` flash chunk capped at the 2 KB
+  buffer (F4's 16 KB sector `page_size` over-read it). All 16 SWD subcommands now
+  verified on an F401 (SRAM full 96 KB, flash, system memory, peripherals, regs).
+
 ## [0.9.1] — 2026-09-27 — RDP1 deep-sleep control test (research/diagnostic)
 
 ### Added

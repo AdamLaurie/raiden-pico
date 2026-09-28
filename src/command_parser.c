@@ -412,9 +412,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
-        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 POR-glitch + flash dump [STM32F1/F4]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
         uart_cli_send("TARGET GLITCH CLEANWAKE          - Control: SRAM-boot + STOP/wake, no debug, try flash read\r\n");
+        uart_cli_send("TARGET GLITCH SHADOWCHAR [n]     - Characterize POR power-up window (t_vdd..t_nrst) for shadow-load glitch\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
         uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
@@ -515,7 +516,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.9.1\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.10\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1665,7 +1666,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
                 const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
-                                             "HALT", "CLEANWAKE", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
+                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
                 }
@@ -1746,6 +1747,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                     target_power_halt(dump_bytes);
                 } else if (strcmp(parts->parts[2], "CLEANWAKE") == 0) {
                     target_power_cleanwake();
+                } else if (strcmp(parts->parts[2], "SHADOWCHAR") == 0) {
+                    uint32_t iters = 0;
+                    if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &iters)) {
+                        api_error("ERROR: Invalid count. Usage: TARGET GLITCH SHADOWCHAR [iterations]\r\n");
+                        goto api_response;
+                    }
+                    target_power_shadowchar(iters);
                 } else if (strcmp(parts->parts[2], "LITERAL") == 0) {
                     target_power_literal();
                 } else if (strcmp(parts->parts[2], "REGDUMP") == 0) {
@@ -2807,7 +2815,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uint32_t cur_addr = addr;
                 while (remaining > 0) {
                     uint32_t chunk = remaining;
-                    if (chunk > info->page_size) chunk = info->page_size;
+                    // Cap at the page_buf size, NOT page_size — on F4 page_size is
+                    // 16 KB (sector) but page_buf is 2 KB, so chunking by page_size
+                    // would over-read the buffer.
+                    if (chunk > sizeof(page_buf)) chunk = sizeof(page_buf);
                     uint32_t w = swd_stm32_flash_write(info, cur_addr, page_buf, chunk);
                     written_total += w;
                     if (w < chunk) {
