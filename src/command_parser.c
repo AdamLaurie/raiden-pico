@@ -1656,7 +1656,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             // target UART pins). Each command resets the target into the ROM
             // bootloader and drives I2C — never mixes with a USART 0x7F sync.
             if (parts->count < 3) {
-                api_error("ERROR: Usage: TARGET I2C <SCAN|SYNC|GET|GID|READ> [args] [addr7]\r\n");
+                api_error("ERROR: Usage: TARGET I2C <SCAN|SYNC|GET|GV|GID|READ <addr> <len>|WRITE <addr> <hex>|GO <addr>|PROBE <cmd_hex>|ERASE ALL WIPE|RP CONFIRM|RU WIPE> [addr7]\r\n");
                 goto api_response;
             }
             if (strcmp(parts->parts[2], "SCAN") == 0) {
@@ -1701,8 +1701,74 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
                 i2c_bl_enter();
                 i2c_bl_read((uint8_t)a, addr, len);
+            } else if (strcmp(parts->parts[2], "RU") == 0) {
+                // Readout Unprotect over I2C — DESTRUCTIVE (mass-erase). Require WIPE.
+                uint32_t a = I2C_BL_ADDR7_DEFAULT;
+                if (parts->count < 4 || strcmp(parts->parts[3], "WIPE") != 0) {
+                    api_error("ERROR: Readout unprotect erases all flash! Confirm: TARGET I2C RU WIPE\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &a)) {
+                    api_error("ERROR: Invalid addr7. Usage: TARGET I2C RU WIPE [addr7]\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_ru((uint8_t)a);
+            } else if (strcmp(parts->parts[2], "GV") == 0) {
+                i2c_bl_enter();
+                i2c_bl_gv(I2C_BL_ADDR7_DEFAULT);
+            } else if (strcmp(parts->parts[2], "PROBE") == 0) {
+                uint32_t op = 0;
+                if (parts->count < 4 || !parse_u32(parts->parts[3], 16, &op) || op > 0xFF) {
+                    api_error("ERROR: Usage: TARGET I2C PROBE <cmd_hex>\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_probe(I2C_BL_ADDR7_DEFAULT, (uint8_t)op);
+            } else if (strcmp(parts->parts[2], "GO") == 0) {
+                uint32_t addr = 0;
+                if (parts->count < 4 || !parse_u32(parts->parts[3], 0, &addr)) {
+                    api_error("ERROR: Usage: TARGET I2C GO <addr>\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_go(I2C_BL_ADDR7_DEFAULT, addr);
+            } else if (strcmp(parts->parts[2], "WRITE") == 0) {
+                uint32_t waddr = 0;
+                if (parts->count < 5 || !parse_u32(parts->parts[3], 0, &waddr)) {
+                    api_error("ERROR: Usage: TARGET I2C WRITE <addr> <hex>\r\n");
+                    goto api_response;
+                }
+                const char *hex = parts->parts[4];
+                size_t hl = strlen(hex);
+                if (hl == 0 || hl % 2 != 0 || hl > 512) {
+                    api_error("ERROR: Hex data must be even length, max 256 bytes\r\n");
+                    goto api_response;
+                }
+                uint8_t wbuf[256];
+                uint32_t wlen = hl / 2;
+                for (uint32_t i = 0; i < wlen; i++) {
+                    char bs[3] = { hex[i*2], hex[i*2+1], '\0' };
+                    wbuf[i] = (uint8_t)strtoul(bs, NULL, 16);
+                }
+                i2c_bl_enter();
+                i2c_bl_write(I2C_BL_ADDR7_DEFAULT, waddr, wbuf, wlen);
+            } else if (strcmp(parts->parts[2], "ERASE") == 0) {
+                if (parts->count < 5 || strcmp(parts->parts[3], "ALL") != 0 || strcmp(parts->parts[4], "WIPE") != 0) {
+                    api_error("ERROR: Erase is destructive! Confirm: TARGET I2C ERASE ALL WIPE\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_erase_mass(I2C_BL_ADDR7_DEFAULT);
+            } else if (strcmp(parts->parts[2], "RP") == 0) {
+                if (parts->count < 4 || strcmp(parts->parts[3], "CONFIRM") != 0) {
+                    api_error("ERROR: Readout protect re-locks the chip! Confirm: TARGET I2C RP CONFIRM\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_rp(I2C_BL_ADDR7_DEFAULT);
             } else {
-                api_error("ERROR: Unknown I2C subcommand. Use: SCAN, SYNC, GET, GID, READ\r\n");
+                api_error("ERROR: Unknown I2C subcommand. Use: SCAN, SYNC, GET, GV, GID, READ, WRITE, GO, ERASE, RP, RU, PROBE\r\n");
                 goto api_response;
             }
         } else if (strcmp(parts->parts[1], "GLITCH") == 0) {

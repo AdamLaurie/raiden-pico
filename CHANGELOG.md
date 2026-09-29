@@ -10,17 +10,29 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 ## [0.14] — 2026-09-29 — STM32 bootloader over I2C (bit-banged)
 
 ### Added
-- **`TARGET I2C <SCAN|SYNC|GET|GID|READ>`** — talks to the STM32 system bootloader
-  over a bit-banged I2C master (AN4221), to test the I2C boot interface the F401
-  boot ROM initialises but AN2606 doesn't document. Reuses the target UART1 pins
-  (**GP4=SCL, GP5=SDA**) since the bootloader locks to one interface, so UART-boot
-  and I2C-boot can never co-exist. Default 7-bit slave address **0x39** (decoded
-  from the ROM: `OAR1=0x4072`), overridable per command. Handles clock-stretching
-  and the AN4221 command/ACK framing; `SCAN` probes 0x08..0x77, `SYNC` = enter +
-  scan + Get. First cut covers Get/Get-ID/Read-Memory; Write/Erase/Go/RU/RP and
-  the No-Stretch variants are follow-ups. New `src/i2c_bootloader.c`.
-  Config_none tests cover the argument-validation paths. **Bench-untested** — needs
-  GP4/GP5 rewired to the target's I2C pins.
+- **`TARGET I2C <SCAN|SYNC|GET|GV|GID|READ|WRITE|GO|PROBE|ERASE|RP|RU>`** — talks to
+  the STM32 system bootloader over a bit-banged I2C master (AN4221), to test the I2C
+  boot interface the F401 boot ROM initialises but AN2606 doesn't document. Reuses
+  the target UART1 pins (**GP4=SCL, GP5=SDA**) since the bootloader locks to one
+  interface, so UART-boot and I2C-boot can never co-exist; on the target these are
+  the ROM's **I2C1 = PB6/PB7** (not PB8/PB9). Default 7-bit slave address **0x39**
+  (decoded from the ROM: `OAR1=0x4072`), overridable per command. Handles clock-
+  stretching (80 ms budget; measured worst case ~34 ms on write-commit) and the
+  AN4221 command/ACK framing. Full command set: `SCAN` (probe 0x08..0x77), `SYNC`
+  (enter+scan+Get), `GET`/`GV`/`GID`, `READ <addr> <len>`, `WRITE <addr> <hex>`,
+  `GO <addr>`, `PROBE <cmd_hex>` (gate mapping), and destructive `ERASE ALL WIPE` /
+  `RP CONFIRM` / `RU WIPE` (confirm tokens). New `src/i2c_bootloader.c`.
+- Config_none tests cover the argument-validation paths.
+
+### Verified (bench, F401 DEV_ID 0x433)
+- I2C boot interface **is reachable** on the F401 at slave 0x39 (undocumented in
+  AN2606). At RDP0 the full command set works (Write DEADBEEF → READ-back verified).
+- **RDP1 command gating mapped** (via `PROBE`): only **Get (0x00), GV (0x01),
+  GID (0x02)** and the RDP-management pair **RP/RU** are accepted; **Read (0x11),
+  Go (0x21), Write (0x31), Erase (0x44), Write-Protect (0x63) are all NACK'd**.
+  Corrects an earlier hypothesis — there is **no command-level Write+Go bypass** at
+  RDP1; the only remaining flash-read route stays the VCAP glitch of the ROM's
+  Read-Memory RDP check.
 
 ## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
 

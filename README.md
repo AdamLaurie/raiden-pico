@@ -320,20 +320,42 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Defaults: 115200 baud, 12000 kHz crystal, 500ms reset delay, 5 retries
 - Example: `TARGET SYNC 115200 12000 500 5`
 
-**`TARGET I2C <SCAN|SYNC|GET|GID|READ <addr> <len>> [addr7]`** - STM32 bootloader over I2C (AN4221)
+**`TARGET I2C <subcommand> [args] [addr7]`** - STM32 bootloader over I2C (AN4221)
 - Bit-banged I2C master on **GP4 (SCL) / GP5 (SDA)** — the *same* pins as the
   target UART, reused because the STM32 bootloader locks to a single interface
-  (UART-boot and I2C-boot can never co-exist). Wire GP4/GP5 to the target's I2C
-  boot pins (not its USART pins).
+  (UART-boot and I2C-boot can never co-exist). On the target side these are the
+  bootloader's **I2C1 = PB6 (SCL) / PB7 (SDA)** pins (found by reading the ROM's
+  GPIO AFR setup over SWD; *not* PB8/PB9). Needs pull-ups to 3V3 on both lines
+  (the Pico's internal pull-ups are enabled but weak — external ~2.2k–4.7k is
+  better for reliability).
 - Default 7-bit slave address **0x39** (`OAR1=0x4072`, decoded from the F401 boot
-  ROM); override with the optional `addr7` argument.
-- Each command resets the target into the ROM bootloader and drives I2C — it never
-  sends a USART `0x7F` sync (that would select the UART interface instead).
-- `SCAN` probes 0x08–0x77; `SYNC` = enter + scan + Get; `GET`/`GID` = Get / Get-ID;
-  `READ <addr> <len>` = Read Memory (len 1–256).
+  ROM); override with the optional trailing `addr7` argument.
+- Each command resets the target into the ROM bootloader (BOOT0=1, power-cycle if
+  SWD was attached so the debug halt clears) and drives I2C — it never sends a
+  USART `0x7F` sync (that would select the UART interface instead).
+
+  | Subcommand | Action |
+  |---|---|
+  | `SCAN` | probe addresses 0x08–0x77, list responders |
+  | `SYNC` | enter bootloader + scan + Get |
+  | `GET` | 0x00 Get (version + supported command list) |
+  | `GV` | 0x01 Get Version & Read-Protection status |
+  | `GID` | 0x02 Get ID (chip PID) |
+  | `READ <addr> <len>` | 0x11 Read Memory (len 1–256), hexdump |
+  | `WRITE <addr> <hex>` | 0x31 Write Memory (≤256 bytes, e.g. `WRITE 0x20001000 DEADBEEF`) |
+  | `GO <addr>` | 0x21 Go (jump to address) |
+  | `PROBE <cmd_hex>` | send a command byte only, report ACK/NACK (RDP gate mapping) |
+  | `ERASE ALL WIPE` | 0x45 Extended Erase, mass (**destructive**, confirm token) |
+  | `RP CONFIRM` | 0x83 Readout Protect → re-lock to RDP1 (**destructive**, confirm token) |
+  | `RU WIPE` | 0x93 Readout Unprotect → mass-erase + drop to RDP0 (**destructive**, confirm token) |
+
 - Purpose: test whether the F401's I2C boot interface (present in the ROM but
-  undocumented in AN2606) is reachable, and compare its Read-Memory path to the
-  UART one. See `stm32_payloads/f4/stm32f401_bootrom_analysis.md`.
+  undocumented in AN2606) is reachable, and map which bootloader commands the RDP
+  level gates. **Bench result (F401):** the interface *is* reachable at 0x39; at
+  **RDP1 only Get/GV/GID and the RDP-management pair (RP/RU) are accepted — Read,
+  Write, Go, Erase and Write-Protect are all NACK'd**, so there is no command-level
+  Write+Go bypass. At RDP0 every command works. See
+  `stm32_payloads/f4/stm32f401_bootrom_analysis.md`.
 
 **`TARGET SEND <hex|"text">`** - Send data to target
 - Send hex bytes or quoted text to target UART

@@ -30,5 +30,12 @@ bool i2c_bl_scan(uint8_t *found);
 bool i2c_bl_get(uint8_t addr7);                                  // 0x00 Get (version + cmd list)
 bool i2c_bl_get_id(uint8_t addr7);                               // 0x02 Get ID
 bool i2c_bl_read(uint8_t addr7, uint32_t address, uint32_t len); // 0x11 Read Memory (hexdump)
+bool i2c_bl_ru(uint8_t addr7);                                   // 0x93 Readout Unprotect (No-Stretch): mass-erase + remove RDP (destructive)
+bool i2c_bl_probe(uint8_t addr7, uint8_t cmd);                   // send any command byte, report ACK/NACK (gate mapping)
+bool i2c_bl_gv(uint8_t addr7);                                   // 0x01 Get Version & Read Protection Status
+bool i2c_bl_go(uint8_t addr7, uint32_t addr);                    // 0x21 Go
+bool i2c_bl_write(uint8_t addr7, uint32_t addr, const uint8_t *data, uint32_t len); // 0x31 Write Memory
+bool i2c_bl_erase_mass(uint8_t addr7);                           // 0x45 Extended Erase (mass) — destructive
+bool i2c_bl_rp(uint8_t addr7);                                   // 0x83 Readout Protect (re-lock RDP1) — destructive-ish
 
 #endif // I2C_BOOTLOADER_H

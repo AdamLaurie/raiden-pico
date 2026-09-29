@@ -13,8 +13,9 @@
 #define I2C_SCL_PIN 4   // GP4 (= TARGET_UART TX)
 #define I2C_SDA_PIN 5   // GP5 (= TARGET_UART RX)
 
-#define I2C_DLY_US       5      // ~100 kHz half-bit (conservative for weak pull-ups)
-#define I2C_STRETCH_US   10000  // max clock-stretch wait
+#define I2C_DLY_US       100    // ~5 kHz half-bit (slow, for weak/internal pull-ups only)
+#define I2C_STRETCH_US   80000  // max clock-stretch wait. Measured worst case on F401:
+                                // ~17 ms (read) / ~34 ms (write-commit); 80 ms is safe headroom.
 #define BL_ACK           0x79
 #define BL_NACK          0x1F
 
@@ -28,7 +29,7 @@ static inline bool scl_hi(void) {                 // release + honour clock-stre
     gpio_set_dir(I2C_SCL_PIN, GPIO_IN);
     uint64_t t = time_us_64();
     while (!gpio_get(I2C_SCL_PIN)) {
-        if (time_us_64() - t > I2C_STRETCH_US) return false;
+        if (time_us_64() - t > I2C_STRETCH_US) return false;  // stretch timed out
     }
     return true;
 }
@@ -105,20 +106,41 @@ static bool bl_wait_ack(uint8_t a, int retries) {
 // Send a command frame: START, W-addr, cmd, ~cmd, STOP; then wait for ACK.
 static bool bl_cmd(uint8_t a, uint8_t cmd) {
     i2c_start();
-    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); return false; }
-    i2c_wr(cmd);
-    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    bool a1 = i2c_wr(ADDR_W(a));
+    sleep_us(1000);                    // let the STM32 slave clear ADDR after the match
+    bool a2 = i2c_wr(cmd);
+    sleep_us(200);
+    bool a3 = i2c_wr((uint8_t)(cmd ^ 0xFF));
     i2c_stop();
-    return bl_wait_ack(a, 200);
+    (void)a2; (void)a3;                // cmd/xor byte-level ACKs unused (STM32 checks at wait)
+    if (!a1) return false;             // address itself NACKed -> device not present/ready
+    return bl_wait_ack(a, 400);
 }
 
 void i2c_bl_enter(void) {
+    extern void swd_deinit(void);
+    extern bool swd_is_connected(void);
+    extern void target_power_cycle(uint32_t time_ms);
+
+    // Release SWD so the reset produces a clean, free-running boot. On Cortex-M an
+    // nRST pulse alone does NOT clear a debug halt left by an attached SWD session,
+    // so if SWD was live we power-cycle (POR) to fully clear debug state — same
+    // approach as TARGET SYNC. Without this the bootloader can come up debug-held
+    // and never run its interface detection (no I2C ACK).
+    bool was_swd = swd_is_connected();
+    swd_deinit();
+
     target_power_ensure_on();
     gpio_init(PIN_BOOT0); gpio_set_dir(PIN_BOOT0, GPIO_OUT); gpio_put(PIN_BOOT0, 1); // system memory
     gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 0);
     i2c_pins_init();
-    swd_nrst_pulse(20);   // reset into the bootloader
-    sleep_ms(40);         // ROM comes up + interface detection arms
+
+    if (was_swd) {
+        target_power_cycle(150);   // POR with BOOT0=1 -> clean bootloader boot
+    } else {
+        swd_nrst_pulse(20);        // plain reset into the bootloader
+    }
+    sleep_ms(60);                  // ROM comes up + interface detection arms
     uart_cli_send("OK: target reset into bootloader; I2C master on GP4=SCL/GP5=SDA\r\n");
 }
 
@@ -213,4 +235,125 @@ bool i2c_bl_read(uint8_t a, uint32_t address, uint32_t len) {
     i2c_stop();
     uart_cli_printf("I2C Read complete: %lu bytes\r\n", (unsigned long)len);
     return true;
+}
+
+// Readout Unprotect (No-Stretch variant 0x93): mass-erase + remove RDP + reset.
+// No-Stretch is used because the erase is long — the device NACKs its address
+// while busy and we poll (bit-bang can't hold through a multi-second stretch).
+// Destructive: erases all flash. Target resets to RDP0 afterwards.
+bool i2c_bl_ru(uint8_t a) {
+    i2c_start();
+    bool a1 = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(0x93);
+    sleep_us(200);
+    i2c_wr((uint8_t)(0x93 ^ 0xFF));
+    i2c_stop();
+    if (!a1) { uart_cli_send("ERROR: I2C RU: no addr-ACK (device not in bootloader)\r\n"); return false; }
+    uart_cli_send("I2C RU (0x93): mass-erase + remove RDP in progress...\r\n");
+    // Poll for the completion ACK; erase can take a while. Big retry budget.
+    bool done = bl_wait_ack(a, 30000);
+    if (done) uart_cli_send("OK: I2C Readout-Unprotect complete (target now RDP0)\r\n");
+    else      uart_cli_send("ERROR: I2C RU: no completion ACK\r\n");
+    return done;
+}
+
+// --- Additional AN4221 commands -------------------------------------------
+// Generic gate-probe: send just a command byte + complement, report whether the
+// device ACKs it. Safe for multi-frame commands (Read/Write/Go/Erase/WP/GV need
+// more frames before they act) — maps RDP gating without executing anything.
+// NOTE: do NOT probe RU/RP (0x92/0x93/0x82/0x83): the command byte alone triggers
+// the action (mass-erase / re-lock). Probe only the multi-frame commands.
+bool i2c_bl_probe(uint8_t a, uint8_t cmd) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(cmd);
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    bool acc = bl_wait_ack(a, 400);
+    if (!addr_ok) {
+        uart_cli_printf("I2C PROBE cmd 0x%02X: no addr-ACK (device not in bootloader; re-run)\r\n", cmd);
+        return false;
+    }
+    uart_cli_printf("I2C PROBE cmd 0x%02X: %s\r\n", cmd, acc ? "ACK (accepted)" : "NACK (gated)");
+    return acc;
+}
+
+// 0x01 Get Version & Read Protection Status
+bool i2c_bl_gv(uint8_t a) {
+    if (!bl_cmd(a, 0x01)) { uart_cli_send("ERROR: I2C GV: no ACK\r\n"); return false; }
+    i2c_start();
+    if (!i2c_wr(ADDR_R(a))) { i2c_stop(); uart_cli_send("ERROR: I2C GV: read-addr NACK\r\n"); return false; }
+    uint8_t ver = i2c_rd(true), o1 = i2c_rd(true), o2 = i2c_rd(true);
+    i2c_rd(false);
+    i2c_stop();
+    uart_cli_printf("I2C GV: bootloader v%u.%u, RP-status bytes 0x%02X 0x%02X\r\n",
+                    (ver >> 4) & 0xF, ver & 0xF, o1, o2);
+    return true;
+}
+
+// 0x21 Go <addr>
+bool i2c_bl_go(uint8_t a, uint32_t addr) {
+    if (!bl_cmd(a, 0x21)) { uart_cli_send("ERROR: I2C GO: cmd no ACK (gated?)\r\n"); return false; }
+    uint8_t ab[4] = { (uint8_t)(addr>>24),(uint8_t)(addr>>16),(uint8_t)(addr>>8),(uint8_t)addr };
+    uint8_t xs = ab[0]^ab[1]^ab[2]^ab[3];
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); uart_cli_send("ERROR: I2C GO: addr-frame NACK\r\n"); return false; }
+    i2c_wr(ab[0]); i2c_wr(ab[1]); i2c_wr(ab[2]); i2c_wr(ab[3]); i2c_wr(xs);
+    i2c_stop();
+    bool ok = bl_wait_ack(a, 400);
+    uart_cli_printf("I2C GO 0x%08lX: %s\r\n", (unsigned long)addr, ok ? "accepted (jumped)" : "rejected");
+    return ok;
+}
+
+// 0x31 Write Memory <addr> <data[len]>
+bool i2c_bl_write(uint8_t a, uint32_t addr, const uint8_t *data, uint32_t len) {
+    if (len == 0 || len > 256) { uart_cli_send("ERROR: len 1..256\r\n"); return false; }
+    if (!bl_cmd(a, 0x31)) { uart_cli_send("ERROR: I2C WRITE: cmd no ACK (gated?)\r\n"); return false; }
+    uint8_t ab[4] = { (uint8_t)(addr>>24),(uint8_t)(addr>>16),(uint8_t)(addr>>8),(uint8_t)addr };
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); uart_cli_send("ERROR: I2C WRITE: addr-frame NACK\r\n"); return false; }
+    i2c_wr(ab[0]); i2c_wr(ab[1]); i2c_wr(ab[2]); i2c_wr(ab[3]); i2c_wr(ab[0]^ab[1]^ab[2]^ab[3]);
+    i2c_stop();
+    if (!bl_wait_ack(a, 400)) { uart_cli_send("ERROR: I2C WRITE: address rejected\r\n"); return false; }
+    uint8_t nm1 = (uint8_t)(len - 1), xs = nm1;
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); uart_cli_send("ERROR: I2C WRITE: data-frame NACK\r\n"); return false; }
+    i2c_wr(nm1);
+    for (uint32_t i = 0; i < len; i++) { i2c_wr(data[i]); xs ^= data[i]; }
+    i2c_wr(xs);
+    i2c_stop();
+    bool ok = bl_wait_ack(a, 2000);
+    uart_cli_printf("I2C WRITE 0x%08lX %lu bytes: %s\r\n", (unsigned long)addr, (unsigned long)len,
+                    ok ? "OK" : "rejected");
+    return ok;
+}
+
+// 0x45 Extended Erase (No-Stretch), mass erase
+bool i2c_bl_erase_mass(uint8_t a) {
+    if (!bl_cmd(a, 0x45)) { uart_cli_send("ERROR: I2C ERASE: cmd no ACK (gated?)\r\n"); return false; }
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); uart_cli_send("ERROR: I2C ERASE: frame NACK\r\n"); return false; }
+    i2c_wr(0xFF); i2c_wr(0xFF); i2c_wr(0x00);   // mass-erase special code + checksum
+    i2c_stop();
+    bool ok = bl_wait_ack(a, 30000);
+    uart_cli_printf("I2C ERASE (mass): %s\r\n", ok ? "OK" : "rejected/timeout");
+    return ok;
+}
+
+// 0x83 Readout Protect (No-Stretch) — re-lock to RDP1 (+ reset). Destructive-ish.
+bool i2c_bl_rp(uint8_t a) {
+    i2c_start();
+    bool a1 = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(0x83);
+    sleep_us(200);
+    i2c_wr((uint8_t)(0x83 ^ 0xFF));
+    i2c_stop();
+    if (!a1) { uart_cli_send("ERROR: I2C RP: no addr-ACK (device not in bootloader)\r\n"); return false; }
+    bool ok = bl_wait_ack(a, 5000);
+    uart_cli_printf("I2C RP (0x83): %s\r\n", ok ? "readout-protect set (RDP1)" : "rejected");
+    return ok;
 }
