@@ -1587,3 +1587,51 @@ void swd_snapshot(uint32_t sram_addr, uint32_t sram_len) {
 
     if (!was_halted) swd_resume();
 }
+
+// ---------------------------------------------------------------------------
+// SWD LEAKPROBE <addr> — rigorous flash-read-leak probe. Does a MEM-AP read of a
+// (possibly RDP-blocked) address and captures the raw data phase, RDBUFF, and
+// sticky-error state ATOMICALLY, with NO swd_clear_errors() in between, so the
+// per-command auto-clear cannot wipe any transient residue. Baselines with a
+// known SRAM read first, so a leak (flash data appearing in the captured values)
+// is distinguishable from stale pipeline data. See RDP1_DEBUG_MATRIX.md.
+// ---------------------------------------------------------------------------
+void swd_leakprobe(uint32_t addr) {
+    if (!swd_init_ahb_ap()) { uart_cli_send("ERROR: AHB-AP init failed\r\n"); return; }
+
+    // Baseline: a known SRAM word flows through the AP read pipeline into RDBUFF.
+    uint32_t base = 0xA5A5A5A5;
+    swd_read_mem(0x20000000, &base, 1);
+    uart_cli_printf("LEAKPROBE 0x%08lX (baseline SRAM[0x20000000]=0x%08lX)\r\n",
+                    (unsigned long)addr, (unsigned long)base);
+
+    // Point the MEM-AP at the target and post a DRW read, capturing the raw data
+    // phase regardless of ACK — this is where flash data would appear if latched.
+    swd_write_ap(0, AP_TAR, addr);
+    swd_select_ap(0, AP_DRW);
+    uint8_t req = make_request(true, true, AP_DRW & 0xC);
+    swd_seq_out(req, 8);
+    uint8_t ack = swd_seq_in(3);
+    uint32_t drw_raw = 0;
+    bool par = swd_seq_in_parity(&drw_raw);
+    swd_seq_out(0, 8);                       // trailing idle + turnaround to drive
+    uart_cli_printf("  DRW ack=%u (1=OK 2=WAIT 4=FAULT) rawdata=0x%08lX parity_ok=%d\r\n",
+                    ack, (unsigned long)drw_raw, par);
+
+    // RDBUFF + sticky flags, still WITHOUT clearing.
+    uint32_t rdbuff = 0, stat = 0;
+    swd_read_dp(DP_RDBUFF, &rdbuff);
+    swd_read_dp(DP_CTRL_STAT, &stat);
+    uart_cli_printf("  RDBUFF=0x%08lX  CTRL/STAT=0x%08lX STICKYERR=%lu\r\n",
+                    (unsigned long)rdbuff, (unsigned long)stat,
+                    (unsigned long)((stat >> 5) & 1));
+
+    // Verdict hint.
+    if (drw_raw != base && drw_raw != 0xFFFFFFFF && drw_raw != 0x00000000)
+        uart_cli_printf("  *** DRW rawdata is neither baseline nor idle — inspect for leak ***\r\n");
+    else
+        uart_cli_send("  DRW rawdata = baseline/idle (no obvious leak)\r\n");
+
+    swd_clear_errors();     // safe to recover now
+    uart_cli_send("LEAKPROBE done\r\n");
+}
