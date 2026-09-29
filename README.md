@@ -365,10 +365,20 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 **`TARGET GLITCH PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
 - Power glitch then re-enter bootloader to check for ISP code readout bypass
 
-**`TARGET GLITCH BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
+**`TARGET GLITCH BYPASS [attempts] [count] [voltage_mv]`** - RDP1 flash dump via FPB redirect [STM32F1/F4]
 - Two-stage attack: POR glitch → FPB redirect → UART flash dump at 115200 baud
 - Default: 20 attempts, full flash size
+- `voltage_mv` (0–3300): use this glitch depth directly and **skip the sweep** —
+  establish it once with `TARGET GLITCH SWEEP` (its optimal threshold), then
+  re-apply it every run without re-sweeping. Omit (or 0) to auto-sweep as before.
 - See [STM32F1 RDP1 Bypass Workflow](#4-stm32f1-rdp1-bypass) below
+
+**`TARGET GLITCH SHADOWBYPASS [attempts] [count] [voltage_mv]`** - RDP1 shadow-load glitch + FPB dump [STM32]
+- Brownout→POR then a timed dip during recovery to corrupt the RDP option-byte
+  shadow load; sweeps dip offset × dwell.
+- `voltage_mv` (0–3300): ADC-gates the recovery dip to that depth (drop rail, poll
+  ADC0/GP26 until ≤ threshold, then dwell) instead of the legacy uncontrolled
+  fixed-time low pull. Get the value from `TARGET GLITCH SWEEP`.
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms

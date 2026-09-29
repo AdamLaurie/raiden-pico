@@ -77,4 +77,15 @@ RDP0 pass that licenses it.
   real flash / `DEADBEEF`); no separate Phase A needed.
 - ⬜ Older diag payloads (`rdp_literal`, `rdp_regdump`, `rdp_resettest`) — run
   Phase A before citing their results if ever reused.
-- ⬜ F2/F3/F4 payloads, when built — start at Phase A.
+- ✅ `stm32_payloads/f4/rdp_bypass.S` (F4 BYPASS) — **Phase A PASS 2026-09-28** on
+  F401RE @ RDP0: `TARGET GLITCH BYPASS 40 256` dumped `RDP1` header, CPUID
+  0x410FC241 (Cortex-M4), and flash `0x08000000 = DEADBEEF` (+ 0xFF erased). Full
+  two-stage path proven: POR-glitch→SRAM-boot stage1→FPB config→nRST warm-reset→
+  stage2 via reset-vector remap→FPB reader-trick read→UART dump. The initial
+  "RDP1 header not received" was NOT a payload bug — **nRST (GP15) was wired to
+  CN7-5 (VDD) instead of the NRST pin**; moving it to CN8 NRST fixed it. RM0368
+  §23.11 confirms the design: system reset (nRST/SYSRESETREQ) resets the core but
+  NOT the debug/FPB (only PORRESETn does), so the FPB remap survives step-5's nRST.
+  Now RDP1-ready — Phase B is re-lock to RDP1 + re-run BYPASS. See
+  [[project_todo_f4_bypass_bench_test]].
+- ⬜ F2/F3 payloads, when built — start at Phase A.
