@@ -823,6 +823,34 @@ bool swd_resume(void) {
     return mem_write32(DHCSR, DBGKEY | 0x1);
 }
 
+// Single-step one instruction. Core must already be halted (S_HALT set).
+// Writes DHCSR = DBGKEY | C_MASKINTS | C_STEP | C_DEBUGEN (interrupts masked so
+// the step lands on the next in-line instruction, not an ISR), then waits for the
+// core to re-halt. Returns true once S_HALT is observed again.
+bool swd_step(void) {
+    // ARMv7-M: C_MASKINTS may only change while C_HALT=1, so mask interrupts in a
+    // first (still-halted) write, then step in a second. A combined
+    // C_MASKINTS=1+C_HALT=0 write is UNPREDICTABLE and gets ignored (the step
+    // silently no-ops — PC/regs don't advance).
+    // 1st: C_HALT=1, C_DEBUGEN=1, C_MASKINTS=1  (0x0B)
+    if (!mem_write32(DHCSR, DBGKEY | 0x0B))
+        return false;
+    // 2nd: C_HALT=0, C_STEP=1, C_MASKINTS=1, C_DEBUGEN=1  (0x0D)
+    if (!mem_write32(DHCSR, DBGKEY | 0x0D))
+        return false;
+    uint32_t dhcsr = 0;
+    for (int i = 0; i < 200; i++) {
+        if (!mem_read32(DHCSR, &dhcsr))
+            return false;
+        if (dhcsr == 0xFFFFFFFF || (dhcsr & 0xF000FFF0) != 0)
+            continue;                         // filter errata/invalid reads
+        if (dhcsr & (1 << 17))                // S_HALT -> step complete
+            return true;
+        sleep_us(20);
+    }
+    return false;
+}
+
 bool swd_read_core_reg(uint8_t reg, uint32_t *value) {
     // Write register index to DCRSR (REGWnR=0 for read)
     if (!mem_write32(DCRSR, (uint32_t)reg))

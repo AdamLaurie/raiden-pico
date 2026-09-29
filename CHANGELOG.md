@@ -10,6 +10,9 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 ## [0.14] — 2026-09-29 — STM32 bootloader over I2C (bit-banged)
 
 ### Added
+- **`SWD STEP [n]`** — single-step the target core (ARMv7-M mask-interrupts-then-step
+  DHCSR sequence). **`SWD ROMREAD <addr> <len>`** — F401 boot-ROM gadget flash-dump
+  probe (single-steps the ROM's own `ldrb` read gadget past its software RDP check).
 - **`TARGET I2C <SCAN|SYNC|GET|GV|GID|READ|WRITE|GO|PROBE|ERASE|RP|RU>`** — talks to
   the STM32 system bootloader over a bit-banged I2C master (AN4221), to test the I2C
   boot interface the F401 boot ROM initialises but AN2606 doesn't document. Reuses
@@ -33,6 +36,13 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
   Corrects an earlier hypothesis — there is **no command-level Write+Go bypass** at
   RDP1; the only remaining flash-read route stays the VCAP glitch of the ROM's
   Read-Memory RDP check.
+- **Debugger-jump-to-ROM-gadget bypass tested and blocked.** At RDP1 the boot ROM
+  (0x1FFF0000) is walled off the SWD debug port exactly like flash: AHB-AP reads
+  fault (ACK=0x4) and the CPU won't execute ROM when PC is redirected there by the
+  debugger (single-step retires nothing; SRAM steps fine as control). The 30 KB
+  bootrom dump was only possible at RDP0, confirming ROM debug-access is RDP-gated.
+  So the ROM's trusted flash read is reachable only via genuine boot flow — the
+  glitch stays necessary.
 
 ## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
 

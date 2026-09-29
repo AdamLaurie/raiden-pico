@@ -503,6 +503,18 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD REGS`** - Read core registers
 - Displays r0-r15, xPSR, MSP, PSP while halted
 
+**`SWD STEP [n]`** - Single-step n instructions (default 1)
+- Core must be halted; masks interrupts during the step. Reports pc/xPSR after.
+
+**`SWD ROMREAD <flash_addr> <len>`** - F401 boot-ROM gadget flash-dump probe
+- Attempts to dump flash by single-stepping the F401 boot ROM's own read gadget
+  (`0x1FFF0550: ldrb r0,[r5],#1`), which sits *after* the ROM's software RDP check.
+- **Bench result: blocked at RDP1.** The boot ROM (0x1FFF0000) is walled off the
+  debug port exactly like flash — AHB-AP reads fault and the CPU won't execute ROM
+  when PC is redirected there by SWD. The command self-diagnoses this and reports
+  it. Only usable where the ROM is debug-accessible (RDP0). The ROM's trusted flash
+  read is reachable only via genuine (non-debug) boot flow, i.e. the VCAP glitch.
+
 **`SWD FILL <addr|region> <value> [n] [ERASE]`** - Fill memory with pattern
 - Fills n words (default: full region for aliases, 1 for raw address)
 - Flash addresses auto-detected — requires ERASE keyword to confirm page erase

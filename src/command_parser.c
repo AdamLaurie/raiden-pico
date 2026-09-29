@@ -300,8 +300,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT", "LEAKPROBE"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 19, "SWD sub-command")) {
+                                          "HALT", "RESUME", "STEP", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT", "LEAKPROBE", "ROMREAD"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 21, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -2535,6 +2535,87 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else {
                 api_error("ERROR: Resume failed\r\n");
             }
+
+        } else if (strcmp(parts->parts[1], "STEP") == 0) {
+            // Single-step N instructions (default 1). Core must be halted.
+            uint32_t n = 1;
+            if (parts->count >= 3) n = strtoul(parts->parts[2], NULL, 0);
+            if (n == 0 || n > 100000) { api_error("ERROR: count 1..100000\r\n"); goto api_response; }
+            swd_halt();
+            uint32_t i;
+            for (i = 0; i < n; i++) { if (!swd_step()) break; }
+            uint32_t pc = 0, xpsr = 0;
+            swd_read_core_reg(15, &pc);
+            swd_read_core_reg(16, &xpsr);
+            uart_cli_printf("OK: stepped %lu/%lu; pc=0x%08X xPSR=0x%08X\r\n",
+                            (unsigned long)i, (unsigned long)n, (unsigned)pc, (unsigned)xpsr);
+
+        } else if (strcmp(parts->parts[1], "ROMREAD") == 0) {
+            // SWD ROMREAD <flash_addr> <len> — dump flash by single-stepping the
+            // F401 boot ROM's own read gadget (0x1FFF0550: ldrb r0,[r5],#1), which
+            // sits AFTER the ROM's software RDP check. Tests whether a core data
+            // read executed from ROM-region PC is HW-permitted at RDP1 while debug
+            // is attached (the untested cell vs. AHB-AP reads, which fault).
+            #define F401_ROM_LDRB_GADGET 0x1FFF0550u
+            uint32_t faddr = 0, flen = 0;
+            if (parts->count < 4 ||
+                !parse_u32(parts->parts[2], 0, &faddr) ||
+                !parse_u32(parts->parts[3], 0, &flen)) {
+                api_error("ERROR: Usage: SWD ROMREAD <flash_addr> <len>\r\n");
+                goto api_response;
+            }
+            if (flen == 0 || flen > 4096) { api_error("ERROR: len 1..4096\r\n"); goto api_response; }
+            if (!swd_ensure_connected()) { api_error("ERROR: SWD not connected\r\n"); goto api_response; }
+            if (!swd_halt()) { api_error("ERROR: halt failed\r\n"); goto api_response; }
+            // Pre-check 1: is the boot ROM itself reachable over the debug port?
+            // At RDP1 the system-memory ROM faults to AHB-AP reads (walled like flash),
+            // so the gadget can never be reached this way. Report it plainly.
+            uint32_t rom_probe = 0;
+            if (swd_read_mem(F401_ROM_LDRB_GADGET, &rom_probe, 1) != 1) {
+                api_error("ERROR: boot ROM 0x1FFF0550 not readable via SWD (RDP1 walls the ROM "
+                          "off the debug port, same as flash) -- gadget unreachable, bypass blocked\r\n");
+                goto api_response;
+            }
+            // Pre-check 2: can the CPU execute a ROM instruction under debug? Step the
+            // gadget once and confirm r5 actually post-incremented. If not, the core
+            // won't run ROM code when the debugger redirects PC there.
+            if (!swd_write_core_reg(5, faddr)) { api_error("ERROR: set r5 failed\r\n"); goto api_response; }
+            swd_write_core_reg(15, F401_ROM_LDRB_GADGET);
+            swd_step();
+            uint32_t r5_chk = faddr;
+            swd_read_core_reg(5, &r5_chk);
+            if (r5_chk != faddr + 1) {
+                uart_cli_printf("ERROR: ROM not executable under debug (r5 stayed 0x%08X after stepping "
+                                "the gadget) -- CPU won't run ROM code when PC is set by SWD at RDP1\r\n",
+                                (unsigned)r5_chk);
+                goto api_response;
+            }
+            if (!swd_write_core_reg(5, faddr)) { api_error("ERROR: set r5 failed\r\n"); goto api_response; }
+            uart_cli_printf("ROMREAD gadget 0x%08X, r5=0x%08X, %lu bytes:\r\n",
+                            F401_ROM_LDRB_GADGET, (unsigned)faddr, (unsigned long)flen);
+            uint8_t line[16];
+            uint32_t got = 0, fails = 0;
+            for (got = 0; got < flen; got++) {
+                if (!swd_write_core_reg(15, F401_ROM_LDRB_GADGET)) { fails++; }
+                if (!swd_step()) { fails++; }
+                uint32_t v = 0;
+                if (!swd_read_core_reg(0, &v)) { fails++; }
+                line[got % 16] = (uint8_t)(v & 0xFF);
+                if (got % 16 == 15 || got == flen - 1) {
+                    uint32_t nl = (got % 16) + 1;
+                    uint32_t base = faddr + got - nl + 1;
+                    uart_cli_printf("0x%08X:", (unsigned)base);
+                    for (uint32_t j = 0; j < nl; j++) uart_cli_printf(" %02X", line[j]);
+                    uart_cli_send("\r\n");
+                }
+            }
+            // Report the gadget's own PC after the last step (should stay in ROM if
+            // the reads are permitted; a jump to a fault handler = HW block/lockup).
+            uint32_t pc = 0, r5 = 0;
+            swd_read_core_reg(15, &pc);
+            swd_read_core_reg(5, &r5);
+            uart_cli_printf("ROMREAD done: %lu bytes, %lu SWD errs; pc=0x%08X r5=0x%08X\r\n",
+                            (unsigned long)flen, (unsigned long)fails, (unsigned)pc, (unsigned)r5);
 
         } else if (strcmp(parts->parts[1], "REGS") == 0) {
             // Must halt to read registers
