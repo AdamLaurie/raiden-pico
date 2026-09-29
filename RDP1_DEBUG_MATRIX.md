@@ -1,0 +1,142 @@
+# RDP1 Debug Matrix — STM32F401 (DEV_ID 0x433)
+
+**Headline:** On STM32F4, RDP level 1 is a **narrow flash-domain read block**, not a
+debug lockout. Main flash, the system bootrom, and the option bytes are unreadable
+over the debug MEM-AP — but **SRAM, every peripheral register, and the entire
+core-debug suite (halt / step / registers / DWT / FPB / DEMCR) stay fully
+available.** Debug is *not* disabled at RDP1.
+
+Measured 2026-09-29 on the bench F401 at RDP1, using only existing `SWD`
+CLI commands (no special firmware). Companion to
+`stm32_payloads/f4/stm32f401_bootrom_analysis.md` and `SWD SCAN`.
+
+## Matrix
+
+| Capability | Addr / op | RDP1 | Observed |
+|---|---|---|---|
+| DP connect / IDCODE | DPIDR | ✓ | 0x2BA01477 |
+| AP enum + CoreSight ROM (`SWD SCAN`) | AP IDR / 0xE00FF000 | ✓ | full topology (SCS/DWT/FPB/ITM/TPIU/ETM) |
+| Main flash read | 0x08000000 | ✗ | ACK=0x4 (FAULT) |
+| System bootrom read | 0x1FFF0000 | ✗ | ACK=0x4 (FAULT) |
+| Option-byte read | 0x1FFFC000 | ✗ | ACK=0x4 (FAULT) |
+| SRAM read | 0x20000000 | ✓ | `DF F8 38 04` |
+| SRAM write | 0x20010000 | ✓ | wrote+verified 0xCAFEBABE |
+| Peripheral read | RCC_CR 0x40023800 | ✓ | 0x03007183 |
+| CPUID | 0xE000ED00 | ✓ | 0x410FC241 (Cortex-M4) |
+| DHCSR read | 0xE000EDF0 | ✓ | 0x03090000 run / 0x00030003 halted |
+| DEMCR read+write | 0xE000EDFC | ✓ | wrote VC_CORERESET, verified, cleared |
+| DWT registers | 0xE0001000 | ✓ | DWT_CTRL 0x40000000 |
+| FPB registers | 0xE0002000 | ✓ | FP_CTRL 0x00000260 |
+| DBGMCU | 0xE0042000 | ✓ | 0x10016433 |
+| Core HALT / RESUME | DHCSR | ✓ | S_HALT observed |
+| Core register read | DCRSR/DCRDR | ✓ | see below |
+
+Registers captured while halted at RDP1 (blank+locked target):
+```
+r0=0x40020000  r10=0xE000E010  r11=0x40003C00  sp=0x20002E00
+pc=0xFFFFFFFE  xPSR=0x81000003   ; exception 3 = HardFault
+```
+The part had hardfaulted at boot (blank flash after erase) — and that state is
+fully visible from the registers **even though flash itself is unreadable**.
+
+## What is / isn't blocked
+
+- **Blocked:** debug MEM-AP reads of the *flash domain* — main flash
+  (0x08000000), system memory / bootrom (0x1FFF0000), option bytes (0x1FFFC000).
+  (Consistent with the bootrom analysis: RDP is enforced by the flash controller
+  against non-flash-master reads, not by a software gate.)
+- **Open:** SRAM (R/W), all peripheral register banks, the System Control Space
+  (NVIC/SCB/SysTick + fault status), DWT, FPB, DEMCR/vector-catch, DBGMCU, and
+  full core control (halt, single-step, register read/write).
+
+## Implications for fault-injection research
+
+1. **Full core instrumentation at RDP1.** Halt / step / register access / DWT
+   cycle-count timing / FPB breakpoints all work locked — so the bootrom read
+   window can be characterised (CYCCNT, breakpoints) directly on a locked part,
+   not only on an unlocked one.
+2. **Observe a glitch while locked.** `VC_CORERESET` works at RDP1: arm
+   halt-on-reset, glitch the boot, then snapshot PC / registers / SRAM /
+   peripherals to see what the fault flipped — no flash read needed. This makes
+   the "fault-effect snapshot/diff per glitch" approach feasible on a locked
+   device for all non-flash state.
+3. **Flash content still needs the transient.** The flash block is on the debug
+   and non-flash-master paths, so reading actual flash still requires the timed
+   VCAP bootloader-read glitch — but the whole debug suite above is available at
+   RDP1 to trigger and measure it (debug-attach disturbs neither SRAM, peripheral,
+   nor core access — only flash).
+
+---
+
+# Proposed tooling: `SWD SNAPSHOT`
+
+A diffable capture of the target's non-flash observable state, for cataloguing
+what a glitch changes (works at RDP0 and RDP1). Pre/post snapshots diff cleanly
+with `diff`.
+
+## Syntax
+
+```
+SWD SNAPSHOT [sram_addr] [sram_len]
+```
+- `sram_addr` (default `0x20000000`), `sram_len` bytes (default `256`, max e.g. 4096).
+- Auto-connects (like other SWD commands). Halts the core for a coherent capture,
+  then restores the prior run/halt state on exit.
+
+## Captured state
+
+- **Core registers** (via the existing REGS path): r0–r12, sp (MSP/PSP), lr, pc,
+  xPSR, plus CONTROL/PRIMASK/FAULTMASK/BASEPRI.
+- **Fault status (SCB):** CFSR 0xE000ED28, HFSR 0xE000ED2C, DFSR 0xE000ED30,
+  MMFAR 0xE000ED34, BFAR 0xE000ED38 — the "why did it fault" set.
+- **Debug:** DHCSR 0xE000EDF0, DEMCR 0xE000EDFC.
+- **Clock / power / flash-iface:** RCC_CR 0x40023800, RCC_CFGR 0x40023808,
+  FLASH_ACR 0x40023C00, FLASH_OPTCR 0x40023C14, PWR_CR 0x40007000,
+  PWR_CSR 0x40007004.
+- **ID:** DBGMCU_IDCODE 0xE0042000.
+- **GPIO mode:** GPIOA/B/C MODER (0x40020000 / 0x40020400 / 0x40020800).
+- **SRAM window:** `sram_len` bytes from `sram_addr`.
+
+## Output format (line-oriented for `diff`)
+
+```
+# SWD SNAPSHOT rdp=1 halted=1
+REG.r0=0x40020000
+...
+REG.pc=0xFFFFFFFE
+REG.xpsr=0x81000003
+SCB.CFSR=0x00000000
+SCB.HFSR=0x40000000
+DBG.DHCSR=0x00030003
+RCC.CR=0x03007183
+FLASH.OPTCR=FAULT            # marked when the read NACKs (e.g. blocked at RDP1)
+GPIO.A.MODER=0xA8000000
+SRAM 0x20000000: DF F8 38 04 ...
+...
+```
+
+## Fault handling (key for RDP1)
+
+Every peripheral/memory read is wrapped: on ACK=0x4 print `<key>=FAULT`, call
+`swd_clear_errors()` to recover the DP, and continue. So a snapshot never aborts
+on a blocked flash-iface register — it records `FAULT` and moves on. This is what
+makes the same command usable at RDP0 and RDP1 (OPTCR etc. simply show `FAULT`
+when locked).
+
+## Workflow
+
+```
+SWD SNAPSHOT > pre.txt         # (host redirects the capture)
+<fire one glitch>
+SWD SNAPSHOT > post.txt
+diff pre.txt post.txt          # exactly what the fault flipped in non-flash state
+```
+
+## Implementation notes
+
+- Reuse `swd_halt` / `swd_resume`, the `SWD REGS` core-register reader, and
+  `swd_read_mem`; wrap reads with `swd_clear_errors()` recovery.
+- Register `SNAPSHOT` in `swd_subcmds` (cli-errors) and add a config_none test
+  (command recognised; graceful when no target).
+- ~100 lines in `swd.c` + a dispatch branch; no new hardware. Pairs with a future
+  `SWD WATCH` (DWT watchpoint) for triggered snapshots.
