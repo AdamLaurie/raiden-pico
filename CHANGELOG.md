@@ -7,6 +7,21 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.14] — 2026-09-29 — STM32 bootloader over I2C (bit-banged)
+
+### Added
+- **`TARGET I2C <SCAN|SYNC|GET|GID|READ>`** — talks to the STM32 system bootloader
+  over a bit-banged I2C master (AN4221), to test the I2C boot interface the F401
+  boot ROM initialises but AN2606 doesn't document. Reuses the target UART1 pins
+  (**GP4=SCL, GP5=SDA**) since the bootloader locks to one interface, so UART-boot
+  and I2C-boot can never co-exist. Default 7-bit slave address **0x39** (decoded
+  from the ROM: `OAR1=0x4072`), overridable per command. Handles clock-stretching
+  and the AN4221 command/ACK framing; `SCAN` probes 0x08..0x77, `SYNC` = enter +
+  scan + Get. First cut covers Get/Get-ID/Read-Memory; Write/Erase/Go/RU/RP and
+  the No-Stretch variants are follow-ups. New `src/i2c_bootloader.c`.
+  Config_none tests cover the argument-validation paths. **Bench-untested** — needs
+  GP4/GP5 rewired to the target's I2C pins.
+
 ## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
 
 ### Added

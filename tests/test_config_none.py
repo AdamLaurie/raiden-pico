@@ -352,6 +352,36 @@ class TestBypassPayloadFamily:
         assert "ERROR" in r and "voltage_mv" in r
 
 
+# ── TARGET I2C bootloader (parse/error paths only) ───────────
+#
+# Only the argument-validation paths are exercised here: they return BEFORE
+# i2c_bl_enter() (which resets the target and bit-bangs GP4/GP5), so they drive
+# no hardware and are safe under config_none. SCAN/SYNC/valid GET/READ need a
+# wired target and are bench-only.
+
+class TestI2CBootloaderParse:
+
+    def test_i2c_no_subcommand_errors(self, raiden):
+        r = raiden.cmd("TARGET I2C", wait=1)
+        assert "ERROR" in r and "SCAN" in r  # usage lists subcommands
+
+    def test_i2c_unknown_subcommand_errors(self, raiden):
+        r = raiden.cmd("TARGET I2C BOGUS", wait=1)
+        assert "ERROR" in r and "Unknown I2C subcommand" in r
+
+    def test_i2c_bad_addr7_errors(self, raiden):
+        r = raiden.cmd("TARGET I2C GET notanumber", wait=1)
+        assert "ERROR" in r and "addr7" in r
+
+    def test_i2c_read_usage_errors(self, raiden):
+        r = raiden.cmd("TARGET I2C READ 0x08000000", wait=1)   # missing len
+        assert "ERROR" in r and "READ" in r
+
+    def test_i2c_read_len_range_errors(self, raiden):
+        r = raiden.cmd("TARGET I2C READ 0x08000000 999", wait=1)  # len > 256
+        assert "ERROR" in r and "1..256" in r
+
+
 # ── External PSU command (error/parse paths only) ────────────
 #
 # These stay on the safe paths that return BEFORE the PSU UART claims GP10/11:

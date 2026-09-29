@@ -320,6 +320,21 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Defaults: 115200 baud, 12000 kHz crystal, 500ms reset delay, 5 retries
 - Example: `TARGET SYNC 115200 12000 500 5`
 
+**`TARGET I2C <SCAN|SYNC|GET|GID|READ <addr> <len>> [addr7]`** - STM32 bootloader over I2C (AN4221)
+- Bit-banged I2C master on **GP4 (SCL) / GP5 (SDA)** — the *same* pins as the
+  target UART, reused because the STM32 bootloader locks to a single interface
+  (UART-boot and I2C-boot can never co-exist). Wire GP4/GP5 to the target's I2C
+  boot pins (not its USART pins).
+- Default 7-bit slave address **0x39** (`OAR1=0x4072`, decoded from the F401 boot
+  ROM); override with the optional `addr7` argument.
+- Each command resets the target into the ROM bootloader and drives I2C — it never
+  sends a USART `0x7F` sync (that would select the UART interface instead).
+- `SCAN` probes 0x08–0x77; `SYNC` = enter + scan + Get; `GET`/`GID` = Get / Get-ID;
+  `READ <addr> <len>` = Read Memory (len 1–256).
+- Purpose: test whether the F401's I2C boot interface (present in the ROM but
+  undocumented in AN2606) is reachable, and compare its Read-Memory path to the
+  UART one. See `stm32_payloads/f4/stm32f401_bootrom_analysis.md`.
+
 **`TARGET SEND <hex|"text">`** - Send data to target
 - Send hex bytes or quoted text to target UART
 - Hex: `TARGET SEND 3F` (sends 0x3F)

@@ -2,6 +2,7 @@
 #include "uart_cli.h"
 #include "glitch.h"
 #include "target_uart.h"
+#include "i2c_bootloader.h"
 #include "lpc_target.h"
 #include "grbl.h"
 #include "swd.h"
@@ -293,8 +294,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 18, "TARGET sub-command")) {
+                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL", "I2C"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 19, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -517,7 +518,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.13\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.14\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1078,7 +1079,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER|I2C>\r\n");
             goto api_response;
         }
 
@@ -1649,6 +1650,60 @@ void command_parser_execute(cmd_parts_t *parts) {
                         api_error("ERROR: Unknown CRP subcommand. Use: STATUS, INFO, CHECK <hex>, SET <level> LOCK-CRP\r\n");
                     }
                 }
+            }
+        } else if (strcmp(parts->parts[1], "I2C") == 0) {
+            // STM32 bootloader over bit-banged I2C (GP4=SCL/GP5=SDA, reusing the
+            // target UART pins). Each command resets the target into the ROM
+            // bootloader and drives I2C — never mixes with a USART 0x7F sync.
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: TARGET I2C <SCAN|SYNC|GET|GID|READ> [args] [addr7]\r\n");
+                goto api_response;
+            }
+            if (strcmp(parts->parts[2], "SCAN") == 0) {
+                i2c_bl_enter();
+                uint8_t found = 0;
+                i2c_bl_scan(&found);
+            } else if (strcmp(parts->parts[2], "SYNC") == 0) {
+                i2c_bl_enter();
+                uint8_t found = I2C_BL_ADDR7_DEFAULT;
+                if (i2c_bl_scan(&found)) i2c_bl_get(found);
+            } else if (strcmp(parts->parts[2], "GET") == 0) {
+                uint32_t a = I2C_BL_ADDR7_DEFAULT;
+                if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &a)) {
+                    api_error("ERROR: Invalid addr7. Usage: TARGET I2C GET [addr7]\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_get((uint8_t)a);
+            } else if (strcmp(parts->parts[2], "GID") == 0) {
+                uint32_t a = I2C_BL_ADDR7_DEFAULT;
+                if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &a)) {
+                    api_error("ERROR: Invalid addr7. Usage: TARGET I2C GID [addr7]\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_get_id((uint8_t)a);
+            } else if (strcmp(parts->parts[2], "READ") == 0) {
+                uint32_t addr = 0, len = 0, a = I2C_BL_ADDR7_DEFAULT;
+                if (parts->count < 5 ||
+                    !parse_u32(parts->parts[3], 0, &addr) ||
+                    !parse_u32(parts->parts[4], 0, &len)) {
+                    api_error("ERROR: Usage: TARGET I2C READ <addr> <len> [addr7]\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 6 && !parse_u32(parts->parts[5], 0, &a)) {
+                    api_error("ERROR: Invalid addr7. Usage: TARGET I2C READ <addr> <len> [addr7]\r\n");
+                    goto api_response;
+                }
+                if (len < 1 || len > 256) {
+                    api_error("ERROR: len must be 1..256\r\n");
+                    goto api_response;
+                }
+                i2c_bl_enter();
+                i2c_bl_read((uint8_t)a, addr, len);
+            } else {
+                api_error("ERROR: Unknown I2C subcommand. Use: SCAN, SYNC, GET, GID, READ\r\n");
+                goto api_response;
             }
         } else if (strcmp(parts->parts[1], "GLITCH") == 0) {
             if (parts->count < 3) {
