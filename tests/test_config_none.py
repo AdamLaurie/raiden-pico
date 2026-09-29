@@ -243,6 +243,12 @@ class TestDebug:
         assert "Unknown SWD" not in r
         assert ("SNAPSHOT" in r or "REG." in r or "connection failed" in r or "DPIDR" in r)
 
+    def test_swd_leakprobe_usage_errors(self, raiden):
+        """SWD LEAKPROBE needs an address. (SWD auto-connect runs first, so a
+        target-less setup errors on connect instead — both are errors.)"""
+        r = raiden.cmd("SWD LEAKPROBE", wait=2)
+        assert "ERROR" in r and ("LEAKPROBE" in r or "onnection" in r)
+
 
 # ── Target type ──────────────────────────────────────────────
 

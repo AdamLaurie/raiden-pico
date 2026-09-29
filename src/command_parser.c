@@ -299,8 +299,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 18, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT", "LEAKPROBE"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 19, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -517,7 +517,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.12\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.13\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -2295,6 +2295,14 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
             swd_snapshot(sram_addr, sram_len);
+
+        } else if (strcmp(parts->parts[1], "LEAKPROBE") == 0) {
+            uint32_t addr = 0;
+            if (parts->count < 3 || !parse_u32(parts->parts[2], 0, &addr)) {
+                api_error("ERROR: Usage: SWD LEAKPROBE <addr>\r\n");
+                goto api_response;
+            }
+            swd_leakprobe(addr);
 
         } else if (strcmp(parts->parts[1], "SPEED") == 0) {
             if (parts->count >= 3) {

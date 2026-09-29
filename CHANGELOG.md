@@ -7,6 +7,22 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
+
+### Added
+- **`SWD LEAKPROBE <addr>`** — atomic flash-read-leak probe: does a MEM-AP read of
+  a (possibly RDP-blocked) address and captures the raw DRW data phase, RDBUFF, and
+  sticky-error state with **no intervening error-clear**, so the per-command
+  auto-clear can't wipe transient residue. Baselines with a known SRAM read to
+  distinguish stale pipeline data from a real leak.
+
+### Findings
+- **Flash-read-leak experiment: NO LEAK (clean block).** Programmed an
+  address-encoding pattern to flash at RDP0, re-locked to RDP1, and probed the CPU
+  `ldr` path (HardFault, no data) and the debug MEM-AP path (`LEAKPROBE`: stale
+  baseline + STICKYERR, no flash data). Flash data never leaves the flash-controller
+  boundary. Recorded in `RDP1_DEBUG_MATRIX.md`.
+
 ## [0.12] — 2026-09-29 — SWD SCAN (DAP / CoreSight enumeration)
 
 Feature branch (version tag distinguishes it from the parallel I2C branch; the

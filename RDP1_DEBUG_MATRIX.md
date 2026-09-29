@@ -182,3 +182,26 @@ leaves the flash-controller boundary) — still a useful negative.
 **Prereqs:** a wide-window `SWD SNAPSHOT` (done); a flash-fill-with-pattern helper
 (`SWD FILL` writes SRAM/flash — extend to an address-encoding fill); RDP0→program→
 RDP1 cycle. Complements the shadow/VCAP glitch work as a *non-glitch* avenue.
+
+## Result (2026-09-29): NO LEAK — block is clean
+
+Ran the experiment on the F401: programmed `0xCAFE0000..0xCAFE0007` (magic+index)
+to flash @0x08000000 at RDP0, re-locked to RDP1 (pattern retained, flash reads
+fault), then probed every accessible channel for the pattern.
+
+| Channel | Observed | Leak? |
+|---|---|---|
+| CPU `ldr r1,[0x08000000]` (SRAM stub → bkpt) | HardFault; r1 stayed sentinel `0xDEADDEAD`; BFAR=0x08000000 (address only); CFSR precise bus fault | ✗ |
+| Debug MEM-AP read (`SWD LEAKPROBE`, no clear) | DRW returned stale SRAM baseline; RDBUFF=0; STICKYERR=1 | ✗ |
+| DP RDBUFF / AP DRW residue after fault | baseline/idle/fault — never `0xCAFE00xx` | ✗ |
+
+**Conclusion:** the flash data value never leaves the flash-controller boundary.
+Both the CPU-from-SRAM path and the debug MEM-AP path bus-fault cleanly; no flash
+byte is latched into any register, RDBUFF, AP data reg, or fault register (BFAR
+holds only the *address*). No byte-at-a-time exfil via a data-latch leak on this
+part. `SWD LEAKPROBE <addr>` (added for this — atomic read + residue capture with
+no intervening error-clear) confirms the auto-clear was not masking residue.
+
+**Not yet closed:** behaviour *under a voltage glitch* during the read, and
+whether ETM/DWT trace sampling of the faulting bus cycle exposes the data — both
+are separate follow-ups.
