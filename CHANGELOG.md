@@ -7,6 +7,21 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.12] — 2026-09-29 — SWD SCAN (DAP / CoreSight enumeration)
+
+Feature branch (version tag distinguishes it from the parallel I2C branch; the
+final number is assigned at merge).
+
+### Added
+- **`SWD SCAN`** — enumerates the ADIv5 DAP over SWD: Access Ports (reads each
+  `AP_IDR`) and, for each MEM-AP, walks the CoreSight ROM table (`BASE` → entries
+  → per-component `PIDR`/`CIDR`), naming components by their ARMv7-M debug base
+  (SCS, DWT, FPB/BPU, ITM, TPIU, ETM). SWD-only — no JTAG needed. Powers up the
+  debug/system domains first so AP reads work before any mem access.
+  Bench-verified on STM32F401 at **both RDP0 and RDP1**: the debug topology
+  enumerates identically when locked (PPB/ROM-table stays readable) even though
+  application flash/SRAM MEM reads fault (ACK=0x4). Registered in the SWD matcher.
+
 ## [0.11] — 2026-09-28 — Explicit glitch-voltage arg + robust auto-detect
 
 ### Added
