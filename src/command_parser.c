@@ -299,8 +299,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 16, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 17, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -517,7 +517,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.11\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.12-swdscan\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -2277,6 +2277,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "DISCONNECT") == 0) {
             swd_deinit();
             uart_cli_send("OK: SWD disconnected (pins high-Z)\r\n");
+
+        } else if (strcmp(parts->parts[1], "SCAN") == 0) {
+            // Enumerate the DAP (APs + CoreSight ROM table). Auto-connect already
+            // ran above. SWD-only — no JTAG needed.
+            swd_scan();
 
         } else if (strcmp(parts->parts[1], "SPEED") == 0) {
             if (parts->count >= 3) {

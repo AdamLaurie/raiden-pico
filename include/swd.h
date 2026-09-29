@@ -72,6 +72,10 @@ bool swd_write_dp(uint8_t addr, uint32_t value);
 // addr: register address within AP
 bool swd_read_ap(uint8_t ap, uint8_t addr, uint32_t *value);
 
+// Enumerate the DAP: Access Ports + CoreSight ROM table (see swd.c). SWD-only;
+// no JTAG required. Auto-connect is handled by the SWD command dispatcher.
+void swd_scan(void);
+
 // Write Access Port register
 bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value);
 

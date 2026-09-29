@@ -449,6 +449,16 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 - Reads DPIDR, CPUID, and STM32 debug ID code
 - Decodes ARM part number and STM32 device variant
 
+**`SWD SCAN`** - Enumerate the DAP (Access Ports + CoreSight ROM table)
+- Reads each Access Port's IDR, then walks each MEM-AP's CoreSight ROM table and
+  names the debug components (SCS, DWT, FPB/BPU, ITM, TPIU, ETM) by their debug
+  base address (plus raw part number).
+- SWD-only — JTAG is not required; it would only add boundary-scan / multi-TAP.
+- Enumerates only **CoreSight debug** blocks; application peripherals (USART/I2C/
+  GPIO) have no ID registers and don't appear — those come from the family memory map.
+- Works on a **locked (RDP1)** target: the debug topology reads even when flash/SRAM
+  MEM access is blocked (verified on STM32F401 at RDP0 and RDP1).
+
 **`SWD HALT`** / **`SWD RESUME`** - Halt/resume target core
 - Uses DHCSR debug register to control execution
 - Required before register reads or SRAM writes

@@ -6,6 +6,7 @@
  */
 
 #include "swd.h"
+#include "uart_cli.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
@@ -1400,4 +1401,108 @@ uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
     }
 
     return written;
+}
+
+// ---------------------------------------------------------------------------
+// SWD SCAN — enumerate the ADIv5 DAP: Access Ports + CoreSight ROM table.
+// Everything here is reached through the DAP, so SWD alone is sufficient — JTAG
+// is not needed (it would only add boundary-scan / multi-TAP chains).
+// Application peripherals (USART/I2C/GPIO) are NOT CoreSight components and have
+// no ID registers, so they do not appear here; only debug/CoreSight blocks do.
+// ---------------------------------------------------------------------------
+#define AP_BASE_REG 0xF8
+
+static uint32_t scan_rd32(uint32_t addr) {
+    uint32_t v = 0xFFFFFFFF;
+    swd_read_mem(addr, &v, 1);   // AP0 (the STM32 AHB-AP)
+    return v;
+}
+
+// Name a CoreSight component by its ARMv7-M debug base address (primary hint),
+// falling back to the raw part number the caller prints.
+static const char *scan_component_name(uint32_t base) {
+    switch (base & 0xFFFFF000) {
+        case 0xE0000000: return "ITM";
+        case 0xE0001000: return "DWT";
+        case 0xE0002000: return "FPB/BPU";
+        case 0xE000E000: return "SCS (NVIC/SCB/SysTick)";
+        case 0xE0040000: return "TPIU";
+        case 0xE0041000: return "ETM";
+        case 0xE0042000: return "DBGMCU";
+        case 0xE00FF000: return "ROM table";
+        default:         return "?";
+    }
+}
+
+static const char *scan_ap_type(uint8_t cls, uint8_t type) {
+    if (cls == 8) {               // MEM-AP class
+        switch (type) {
+            case 1: return "MEM-AP (AHB)";
+            case 2: return "MEM-AP (APB)";
+            case 4: return "MEM-AP (AXI)";
+            default: return "MEM-AP";
+        }
+    }
+    if (cls == 0 && type == 0) return "JTAG-AP";
+    return "AP";
+}
+
+static void scan_walk_rom(uint32_t rom) {
+    uart_cli_printf("  ROM table @0x%08lX:\r\n", (unsigned long)rom);
+    for (int i = 0; i < 128; i++) {
+        uint32_t e = scan_rd32(rom + i * 4);
+        if (e == 0) break;                 // final entry
+        if (!(e & 1)) continue;            // entry not present
+        int32_t off = (int32_t)(e & 0xFFFFF000);
+        uint32_t comp = rom + off;
+        uint32_t pid0 = scan_rd32(comp + 0xFE0) & 0xFF;
+        uint32_t pid1 = scan_rd32(comp + 0xFE4) & 0xFF;
+        uint32_t cid1 = scan_rd32(comp + 0xFF4) & 0xFF;
+        uint16_t part = (uint16_t)(pid0 | ((pid1 & 0xF) << 8));
+        uint8_t  cclass = (cid1 >> 4) & 0xF;
+        uart_cli_printf("    @0x%08lX part=0x%03X class=0x%X %s\r\n",
+                        (unsigned long)comp, part, cclass, scan_component_name(comp));
+    }
+}
+
+void swd_scan(void) {
+    uint32_t dpidr = 0;
+    swd_read_dp(DP_DPIDR, &dpidr);
+    uart_cli_printf("DPIDR=0x%08lX\r\n", (unsigned long)dpidr);
+
+    // Power up the debug + system domains so AP register access works. (mem
+    // reads normally do this via swd_init_ahb_ap, but SCAN reads AP IDRs first.)
+    swd_write_dp(DP_CTRL_STAT, 0x50000000);  // CDBGPWRUPREQ | CSYSPWRUPREQ
+    uint32_t stat = 0;
+    for (int i = 0; i < 100; i++) {
+        if (swd_read_dp(DP_CTRL_STAT, &stat) && (stat & 0xA0000000) == 0xA0000000)
+            break;
+    }
+
+    uart_cli_send("Scanning Access Ports (0..7)...\r\n");
+
+    int found = 0;
+    for (uint8_t ap = 0; ap < 8; ap++) {
+        uint32_t idr = 0;
+        if (!swd_read_ap(ap, AP_IDR, &idr) || idr == 0)
+            continue;
+        found++;
+        uint8_t cls  = (idr >> 13) & 0xF;
+        uint8_t type = idr & 0xF;
+        uart_cli_printf("AP%u IDR=0x%08lX (%s)\r\n", ap, (unsigned long)idr, scan_ap_type(cls, type));
+        if (cls == 8) {                              // MEM-AP -> has a BASE/ROM
+            uint32_t base = 0;
+            swd_read_ap(ap, AP_BASE_REG, &base);
+            uart_cli_printf("  BASE=0x%08lX\r\n", (unsigned long)base);
+            if (base == 0xFFFFFFFF || base == 0) {
+                uart_cli_send("  (no debug ROM entry)\r\n");
+            } else if (ap == 0) {
+                scan_walk_rom(base & 0xFFFFF000);    // ROM walk uses AP0 mem reads
+            } else {
+                uart_cli_send("  (ROM walk supported on AP0 only)\r\n");
+            }
+        }
+    }
+    if (!found) uart_cli_send("No Access Ports responded\r\n");
+    uart_cli_send("SWD SCAN complete\r\n");
 }

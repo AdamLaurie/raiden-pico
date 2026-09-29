@@ -222,6 +222,15 @@ class TestDebug:
         r = raiden.cmd("DEBUG")
         assert "OFF" in r
 
+    def test_swd_scan_recognized(self, raiden):
+        """SWD SCAN must be a recognised sub-command (registered in the matcher).
+        With a target wired it enumerates the DAP; with none it errors on connect
+        — either way it must not be rejected as an unknown sub-command."""
+        r = raiden.cmd("SWD SCAN", wait=3)
+        assert "Unknown SWD" not in r
+        assert ("SCAN complete" in r or "Access Ports" in r or
+                "connection failed" in r or "DPIDR" in r)
+
 
 # ── Target type ──────────────────────────────────────────────
 
