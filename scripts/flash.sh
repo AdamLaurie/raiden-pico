@@ -8,7 +8,10 @@ PROJECT_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 # Build dir can be passed as $1 (cmake passes ${CMAKE_CURRENT_BINARY_DIR}), defaults to build/
 BUILD_DIR="${1:-$PROJECT_DIR/build}"
 UF2_FILE="$BUILD_DIR/raiden_pico.uf2"
-MOUNT_POINT="/media/${USER}/RP2350"
+
+# udisks2 mounts removable media under /run/media/$USER on some systems and
+# /media/$USER on others — check both rather than hardcoding one.
+CANDIDATE_MOUNTS=("/run/media/${USER}/RP2350" "/media/${USER}/RP2350")
 
 # Check if UF2 exists
 if [ ! -f "$UF2_FILE" ]; then
@@ -28,9 +31,16 @@ fi
 
 # Wait for mount
 echo "Waiting for RP2350 bootloader mount..."
+MOUNT_POINT=""
 for i in {1..10}; do
-    if [ -d "$MOUNT_POINT" ]; then
-        echo "✓ Device ready"
+    for candidate in "${CANDIDATE_MOUNTS[@]}"; do
+        if [ -d "$candidate" ]; then
+            MOUNT_POINT="$candidate"
+            break
+        fi
+    done
+    if [ -n "$MOUNT_POINT" ]; then
+        echo "✓ Device ready ($MOUNT_POINT)"
         break
     fi
     sleep 1
