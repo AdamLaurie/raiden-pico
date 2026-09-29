@@ -72,6 +72,14 @@ target_link_libraries(raiden_pico
 pico_enable_stdio_usb(raiden_pico 1)
 pico_enable_stdio_uart(raiden_pico 0)
 
+# Block on USB-CDC stdout instead of dropping bytes when the host is briefly not
+# reading. The SDK default (500ms) discards the tail of large outputs (HELP, and
+# SWD SNAPSHOT's ~55 lines) if a reader pauses. The write loop still bails
+# immediately on host disconnect, so this never hangs a headless board.
+target_compile_definitions(raiden_pico PRIVATE
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=10000000
+)
+
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(raiden_pico)
 

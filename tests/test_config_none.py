@@ -231,6 +231,18 @@ class TestDebug:
         assert ("SCAN complete" in r or "Access Ports" in r or
                 "connection failed" in r or "DPIDR" in r)
 
+    def test_swd_snapshot_bad_arg_errors(self, raiden):
+        """SWD SNAPSHOT rejects a bad sram_addr. (SWD auto-connect runs first, so a
+        target-less setup sees a connect error instead — both are errors.)"""
+        r = raiden.cmd("SWD SNAPSHOT notanumber", wait=2)
+        assert "ERROR" in r and ("sram_addr" in r or "onnection" in r)
+
+    def test_swd_snapshot_recognized(self, raiden):
+        """SWD SNAPSHOT must be a recognised sub-command."""
+        r = raiden.cmd("SWD SNAPSHOT", wait=3)
+        assert "Unknown SWD" not in r
+        assert ("SNAPSHOT" in r or "REG." in r or "connection failed" in r or "DPIDR" in r)
+
 
 # ── Target type ──────────────────────────────────────────────
 

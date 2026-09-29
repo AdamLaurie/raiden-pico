@@ -76,6 +76,10 @@ bool swd_read_ap(uint8_t ap, uint8_t addr, uint32_t *value);
 // no JTAG required. Auto-connect is handled by the SWD command dispatcher.
 void swd_scan(void);
 
+// Diffable capture of non-flash observable state (core regs + SCB fault status +
+// key peripherals + SRAM window). Fault-tolerant per read (works at RDP0/RDP1).
+void swd_snapshot(uint32_t sram_addr, uint32_t sram_len);
+
 // Write Access Port register
 bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value);
 

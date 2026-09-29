@@ -140,3 +140,45 @@ diff pre.txt post.txt          # exactly what the fault flipped in non-flash sta
   (command recognised; graceful when no target).
 - ~100 lines in `swd.c` + a dispatch branch; no new hardware. Pairs with a future
   `SWD WATCH` (DWT watchpoint) for triggered snapshots.
+
+---
+
+# TODO — flash-read leak probe (byte-at-a-time exfil hypothesis)
+
+**Idea:** RDP1 blocks the *result* of a flash read (returns FAULT), but the flash
+controller may still latch the real data somewhere observable before refusing it.
+If any of it leaks into a register, SRAM, or a peripheral latch, we could pull
+flash a byte at a time from a locked part — no glitch required.
+
+**Why the unique pattern matters:** program flash so every location's value
+encodes its own address (e.g. `word[A] = A`, or `byte[A] = f(A)` for byte
+granularity). Then any leaked value immediately identifies *which* flash address
+it came from — distinguishing a real leak from coincidence, and telling us the
+leak's source/offset.
+
+**Procedure:**
+1. **RDP0:** program a unique address-encoding pattern across all of flash
+   (`word[A]=A` is simplest; a byte-mixing function if we need byte-level ID).
+   Verify with a normal read.
+2. **Re-lock to RDP1** (pattern is retained; only a later unlock erases it).
+3. **Baseline:** `SWD SNAPSHOT` with a wide SRAM window → `base.txt`.
+4. **Provoke a locked flash read** of a chosen address A, via each path:
+   - debug MEM-AP read of A (faults — but check what lands in the DP/AP data
+     registers, RDBUFF, or a re-read afterwards);
+   - bootloader Read-Memory of A (NACKs — snapshot after);
+   - a CPU-side read from an SRAM stub at A (blocked — snapshot the stub's regs);
+   - the same under a POR/voltage glitch on the read.
+5. **Snapshot again** → `probe.txt`; `diff base.txt probe.txt`. Look for the
+   address-encoded value of A (or its bytes) appearing in any REG.*, SRAM, or
+   peripheral latch.
+6. **If a leak channel is found:** sweep A across flash, reading the leaked
+   byte(s) each time → reconstruct flash byte-by-byte.
+
+**What would make it work / fail:** a hit means the controller exposes latched
+read data (bus register, RDBUFF residue, DWT/ETM sample, or a peripheral) before
+the block. A null result across all paths means the block is clean (data never
+leaves the flash-controller boundary) — still a useful negative.
+
+**Prereqs:** a wide-window `SWD SNAPSHOT` (done); a flash-fill-with-pattern helper
+(`SWD FILL` writes SRAM/flash — extend to an address-encoding fill); RDP0→program→
+RDP1 cycle. Complements the shadow/VCAP glitch work as a *non-glitch* avenue.

@@ -299,8 +299,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 17, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 18, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -2282,6 +2282,19 @@ void command_parser_execute(cmd_parts_t *parts) {
             // Enumerate the DAP (APs + CoreSight ROM table). Auto-connect already
             // ran above. SWD-only — no JTAG needed.
             swd_scan();
+
+        } else if (strcmp(parts->parts[1], "SNAPSHOT") == 0) {
+            // Diffable capture of non-flash state (regs + peripherals + SRAM).
+            uint32_t sram_addr = 0x20000000, sram_len = 256;
+            if (parts->count >= 3 && !parse_u32(parts->parts[2], 0, &sram_addr)) {
+                api_error("ERROR: Invalid sram_addr. Usage: SWD SNAPSHOT [sram_addr] [sram_len]\r\n");
+                goto api_response;
+            }
+            if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &sram_len)) {
+                api_error("ERROR: Invalid sram_len. Usage: SWD SNAPSHOT [sram_addr] [sram_len]\r\n");
+                goto api_response;
+            }
+            swd_snapshot(sram_addr, sram_len);
 
         } else if (strcmp(parts->parts[1], "SPEED") == 0) {
             if (parts->count >= 3) {

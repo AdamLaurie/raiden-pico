@@ -1506,3 +1506,84 @@ void swd_scan(void) {
     if (!found) uart_cli_send("No Access Ports responded\r\n");
     uart_cli_send("SWD SCAN complete\r\n");
 }
+
+// ---------------------------------------------------------------------------
+// SWD SNAPSHOT — diffable capture of the target's non-flash observable state
+// (core regs + SCB fault status + key peripherals + SRAM window). Every read is
+// fault-tolerant: a blocked address prints "=FAULT" and the DP is recovered, so
+// the same command works at RDP0 and RDP1. See RDP1_DEBUG_MATRIX.md.
+// ---------------------------------------------------------------------------
+static void snap_reg(const char *key, uint32_t addr) {
+    uint32_t v = 0;
+    if (swd_read_mem(addr, &v, 1) == 1) {
+        uart_cli_printf("%s=0x%08lX\r\n", key, (unsigned long)v);
+    } else {
+        uart_cli_printf("%s=FAULT\r\n", key);
+        swd_clear_errors();
+    }
+}
+
+void swd_snapshot(uint32_t sram_addr, uint32_t sram_len) {
+    // Remember prior run state so we can restore it.
+    uint32_t dhcsr = 0;
+    bool was_halted = false;
+    if (swd_read_mem(0xE000EDF0, &dhcsr, 1) == 1)
+        was_halted = (dhcsr & (1u << 17)) != 0;   // S_HALT
+
+    swd_halt();
+    sleep_ms(5);
+
+    // RDP hint: is the flash domain readable right now?
+    uint32_t probe = 0;
+    bool flash_locked = (swd_read_mem(0x08000000, &probe, 1) != 1);
+    if (flash_locked) swd_clear_errors();
+    dhcsr = 0; swd_read_mem(0xE000EDF0, &dhcsr, 1);
+    uart_cli_printf("# SWD SNAPSHOT rdp=%d halted=%d\r\n",
+                    flash_locked ? 1 : 0, (dhcsr & (1u << 17)) ? 1 : 0);
+
+    // Core registers (0..18 = r0-r12, sp, lr, pc, xPSR, MSP, PSP; 20 = CONTROL).
+    static const char *rn[] = {"r0","r1","r2","r3","r4","r5","r6","r7","r8","r9",
+                               "r10","r11","r12","sp","lr","pc","xpsr","msp","psp"};
+    for (int i = 0; i <= 18; i++) {
+        uint32_t v = 0;
+        if (swd_read_core_reg(i, &v)) uart_cli_printf("REG.%s=0x%08lX\r\n", rn[i], (unsigned long)v);
+        else { uart_cli_printf("REG.%s=FAULT\r\n", rn[i]); swd_clear_errors(); }
+    }
+    { uint32_t v = 0;
+      if (swd_read_core_reg(20, &v)) uart_cli_printf("REG.ctrl=0x%08lX\r\n", (unsigned long)v);
+      else { uart_cli_send("REG.ctrl=FAULT\r\n"); swd_clear_errors(); } }
+
+    // Memory-mapped debug + fault + peripheral state.
+    snap_reg("SCB.CFSR",      0xE000ED28);
+    snap_reg("SCB.HFSR",      0xE000ED2C);
+    snap_reg("SCB.DFSR",      0xE000ED30);
+    snap_reg("SCB.MMFAR",     0xE000ED34);
+    snap_reg("SCB.BFAR",      0xE000ED38);
+    snap_reg("DBG.DHCSR",     0xE000EDF0);
+    snap_reg("DBG.DEMCR",     0xE000EDFC);
+    snap_reg("RCC.CR",        0x40023800);
+    snap_reg("RCC.CFGR",      0x40023808);
+    snap_reg("FLASH.ACR",     0x40023C00);
+    snap_reg("FLASH.OPTCR",   0x40023C14);
+    snap_reg("PWR.CR",        0x40007000);
+    snap_reg("PWR.CSR",       0x40007004);
+    snap_reg("DBGMCU.IDCODE", 0xE0042000);
+    snap_reg("GPIOA.MODER",   0x40020000);
+    snap_reg("GPIOB.MODER",   0x40020400);
+    snap_reg("GPIOC.MODER",   0x40020800);
+
+    // SRAM window (per-word, fault-tolerant).
+    if (sram_len == 0) sram_len = 256;
+    if (sram_len > 4096) sram_len = 4096;
+    uint32_t words = (sram_len + 3) / 4;
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t a = sram_addr + i * 4, v = 0;
+        if ((i % 4) == 0) uart_cli_printf("SRAM 0x%08lX:", (unsigned long)a);
+        if (swd_read_mem(a, &v, 1) == 1) uart_cli_printf(" %08lX", (unsigned long)v);
+        else { uart_cli_send(" FAULT"); swd_clear_errors(); }
+        if ((i % 4) == 3 || i == words - 1) uart_cli_send("\r\n");
+    }
+    uart_cli_send("# SNAPSHOT end\r\n");
+
+    if (!was_halted) swd_resume();
+}
