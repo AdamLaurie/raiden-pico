@@ -7,7 +7,7 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
-## [0.12-swdscan] — 2026-09-29 — SWD SCAN (DAP / CoreSight enumeration)
+## [0.12] — 2026-09-29 — SWD SCAN (DAP / CoreSight enumeration)
 
 Feature branch (version tag distinguishes it from the parallel I2C branch; the
 final number is assigned at merge).
