@@ -1651,23 +1651,27 @@ static float adc_read_voltage(void) {
 
 // Auto-detect target via SWD if not already set. Returns target info or NULL.
 static const stm32_target_info_t *ensure_target_type(void) {
-    extern bool swd_connect(void);
+    extern bool swd_ensure_connected(void);
+    extern bool swd_clear_errors(void);
     extern bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out);
-    extern void swd_init(void);
     extern void swd_deinit(void);
 
     const stm32_target_info_t *info = stm32_get_target_info(current_target_type);
     if (info)
         return info;
 
-    // Try SWD IDCODE auto-detection
+    // Not set — auto-detect the same robust way `SWD IDCODE` does: energise the
+    // target (power-off is the boot default), ensure the SWD link is up, and
+    // clear any sticky errors a prior glitch left behind, THEN read the DEV_ID.
+    // The old bare swd_connect() path skipped the power-on + error-clear and
+    // faulted (ACK=0x7) whenever a preceding glitch left the target mid-boot.
     uart_cli_send("No target set, attempting SWD auto-detect...\r\n");
-    swd_init();
-    if (!swd_connect()) {
-        swd_deinit();
+    target_power_ensure_on();
+    if (!swd_ensure_connected()) {
         uart_cli_send("ERROR: SWD connect failed. Set target with TARGET or SWD IDCODE\r\n");
         return NULL;
     }
+    swd_clear_errors();
 
     uint32_t cpuid, dbg_id;
     if (!swd_detect(&cpuid, &dbg_id)) {
@@ -2544,7 +2548,7 @@ static const rdp_bypass_payload_t *get_rdp_bypass_payload(target_type_t type) {
     }
 }
 
-void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
@@ -2567,7 +2571,15 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes) {
         return;
     }
 
-    if (!sweep_calibrated) {
+    if (glitch_mv > 0) {
+        // Explicit voltage supplied — use it directly and skip the sweep, so a
+        // known-good depth (from a prior TARGET GLITCH SWEEP) can be re-applied
+        // without re-sweeping every run.
+        sweep_optimal_thresh = (float)glitch_mv / 1000.0f;
+        sweep_calibrated = true;
+        uart_cli_printf("Using supplied glitch voltage: %.2fV (%lu mV) — skipping sweep\r\n",
+                        sweep_optimal_thresh, (unsigned long)glitch_mv);
+    } else if (!sweep_calibrated) {
         uart_cli_send("No sweep calibration — running SWEEP first...\r\n\r\n");
         target_power_sweep();
         if (!sweep_calibrated) {
@@ -2881,7 +2893,7 @@ bypass_cleanup:
 // (the FPB/UART path) because at RDP1 an SWD flash read is blocked while debug is
 // attached. NOTE: GP10/11/12 is a slow GPIO-sourced rail; this is a best-effort
 // software glitch — a fast crowbar on VCAP is the "proper" tool.
-void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes) {
+void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
@@ -2908,8 +2920,19 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes) {
     const uint32_t WIDTHS[] = {5, 10, 20, 40};
     const int NW = (int)(sizeof(WIDTHS) / sizeof(WIDTHS[0]));
 
+    // Optional calibrated dip depth. glitch_mv>0 => the recovery dip is ADC-gated
+    // to that voltage (drop rail, poll ADC0/GP26 until <= thresh, then dwell WIDTH)
+    // instead of the legacy uncontrolled fixed-time low pull. Establish the value
+    // with TARGET GLITCH SWEEP (its optimal threshold), then pass it here.
+    uint16_t glitch_thresh = glitch_mv ? (uint16_t)((uint32_t)glitch_mv * 4095u / 3300u) : 0;
+
     uart_cli_printf("RDP1 SHADOW-glitch bypass: %s, offset %lu..%luus/step%lu, widths 5/10/20/40us, up to %lu attempts\r\n",
                     info->name, OFF_MIN, OFF_MAX, OFF_STEP, max_attempts);
+    if (glitch_thresh)
+        uart_cli_printf("Dip depth: ADC-gated to %.2fV (%lu mV, thresh=%u)\r\n",
+                        (float)glitch_mv / 1000.0f, (unsigned long)glitch_mv, glitch_thresh);
+    else
+        uart_cli_send("Dip depth: uncontrolled fixed-time low pull (no voltage given)\r\n");
     uart_cli_send("Success = stage2 'RDP1' header + non-0xFF flash. (slow GPIO rail; best-effort)\r\n");
 
     // Upload payload once (SRAM is writable over SWD even at RDP1).
@@ -2976,10 +2999,21 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes) {
         gpio_set_mask(POWER_MASK);
         uint64_t t0 = time_us_64();
         while ((uint32_t)(time_us_64() - t0) < off) tight_loop_contents();
-        // Glitch dip: pull the whole group low for `width` us, then restore.
+        // Glitch dip: ADC-gated to the calibrated depth if a voltage was given
+        // (drop, poll until <= thresh, then dwell WIDTH us past it), else the
+        // legacy fixed-time low pull for `width` us.
         gpio_clr_mask(POWER_MASK);
         uint64_t td = time_us_64();
-        while ((uint32_t)(time_us_64() - td) < width) tight_loop_contents();
+        if (glitch_thresh) {
+            adc_select_input(ADC_POWER_CHAN);
+            while (adc_read() > glitch_thresh) {
+                if ((uint32_t)(time_us_64() - td) > 2000) break;  // 2ms safety cap
+            }
+            uint64_t tw = time_us_64();
+            while ((uint32_t)(time_us_64() - tw) < width) tight_loop_contents();
+        } else {
+            while ((uint32_t)(time_us_64() - td) < width) tight_loop_contents();
+        }
         gpio_set_mask(POWER_MASK);
 
         // Let stage1 boot from SRAM and configure the FPB.

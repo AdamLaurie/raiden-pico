@@ -86,7 +86,7 @@ void target_power_glitch(float voltage, uint32_t count);
 // per attempt so a host sweep can parse per-shot results.
 void target_power_lpc_glitch(uint32_t count);
 void target_power_payload(float voltage, uint32_t max_attempts);
-void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes);
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv);
 void target_power_halt(uint32_t dump_bytes);
 void target_power_cleanwake(void);
 void target_power_shadowchar(uint32_t iterations);

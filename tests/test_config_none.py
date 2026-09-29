@@ -309,6 +309,21 @@ class TestBypassPayloadFamily:
         assert "No BYPASS payload" in r
         assert "STM32F1" in r and "STM32F4" in r  # names the supported families
 
+    def test_bypass_bad_voltage_errors(self, raiden):
+        """The optional [voltage_mv] arg must reject non-numeric / out-of-range
+        input at parse time, before any hardware access."""
+        r = raiden.cmd("TARGET GLITCH BYPASS 5 0 notanumber", wait=1)
+        assert "ERROR" in r and "voltage_mv" in r
+        r = raiden.cmd("TARGET GLITCH BYPASS 5 0 9999", wait=1)  # > 3300 mV
+        assert "ERROR" in r and "voltage_mv" in r
+
+    def test_shadowbypass_bad_voltage_errors(self, raiden):
+        """SHADOWBYPASS shares the same [voltage_mv] parse/range guard."""
+        r = raiden.cmd("TARGET GLITCH SHADOWBYPASS 1 64 notanumber", wait=1)
+        assert "ERROR" in r and "voltage_mv" in r
+        r = raiden.cmd("TARGET GLITCH SHADOWBYPASS 1 64 9999", wait=1)  # > 3300 mV
+        assert "ERROR" in r and "voltage_mv" in r
+
 
 # ── External PSU command (error/parse paths only) ────────────
 #

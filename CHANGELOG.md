@@ -7,6 +7,23 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.11] — 2026-09-28 — Explicit glitch-voltage arg + robust auto-detect
+
+### Added
+- **`[voltage_mv]` argument on `TARGET GLITCH BYPASS` and `SHADOWBYPASS`.** Establish
+  the glitch depth once with `TARGET GLITCH SWEEP`, then pass it (millivolts, 0–3300)
+  to skip re-sweeping every run. On BYPASS it sets the calibrated threshold directly
+  and skips the sweep; on SHADOWBYPASS it ADC-gates the recovery dip to that depth
+  instead of the legacy uncontrolled fixed-time low pull. Invalid/out-of-range values
+  error at parse time (config_none regression tests added).
+
+### Changed
+- **`ensure_target_type()` now auto-detects the robust way `SWD IDCODE` does** —
+  `target_power_ensure_on()` + `swd_ensure_connected()` + `swd_clear_errors()` before
+  reading DEV_ID. The old bare `swd_connect()` path faulted (ACK=0x7) when a preceding
+  glitch left the target mid-boot, so `SWEEP`/`BYPASS`/`SHADOWBYPASS` could no longer
+  self-set the target. Now they recover and detect on their own.
+
 ## [0.10] — 2026-09-28 — STM32F4 RDP1 BYPASS + F4 flash-controller support
 
 ### Added
