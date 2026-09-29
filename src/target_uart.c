@@ -2548,6 +2548,13 @@ static const rdp_bypass_payload_t *get_rdp_bypass_payload(target_type_t type) {
     }
 }
 
+// debug/fpb-probe: which FP_COMP0 probe is active. The probes are MUTUALLY
+// EXCLUSIVE because each does an swd_connect() that re-powers the debug domain
+// (CDBGPWRUPREQ / C_DEBUGEN) — running probe 1 before the nRST would contaminate
+// probe 2's post-reset reading AND change how stage2 flash-boots (debug attached
+// at RDP1 blocks flash). 1 = pre-nRST only, 2 = post-nRST only, 0 = off.
+#define FPB_PROBE 2
+
 void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
@@ -2728,6 +2735,37 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t gl
     uart_cli_send("    Waiting for stage 1 to complete...\r\n");
     sleep_ms(500);
 
+#if FPB_PROBE == 1
+    // === DEBUG PROBE (debug/fpb-probe): did stage 1 actually run? ===
+    // Stage 1 only runs if the chip SRAM-booted (BOOT0/1=1 + POR). Under RDP1
+    // SRAM boot is disabled unless the POR glitch corrupted the RDP latch, so
+    // FP_COMP0 (0xE0002008, stage1 writes 0x05) tells us "glitch landed / SRAM
+    // booted" vs "stage1 never ran". Non-intrusive mem read; no halt.
+    {
+        extern void swd_init(void);
+        extern bool swd_connect(void);
+        extern void swd_deinit(void);
+        uint32_t fp_comp0 = 0xFFFFFFFF, fp_ctrl = 0xFFFFFFFF;
+        bool link = false;
+        swd_init();
+        if (swd_connect()) {
+            link = true;
+            swd_read_mem(0xE0002008, &fp_comp0, 1);   // FP_COMP0
+            swd_read_mem(0xE0002000, &fp_ctrl, 1);    // FP_CTRL
+        }
+        swd_deinit();
+        if (!link) {
+            uart_cli_send("[dbg] FP probe: SWD connect failed (target hung?)\r\n");
+        } else {
+            uart_cli_printf("[dbg] FP_CTRL=0x%08lX FP_COMP0=0x%08lX -> stage1 %s\r\n",
+                            (unsigned long)fp_ctrl, (unsigned long)fp_comp0,
+                            (fp_comp0 & 0x1) ? "RAN (SRAM boot OK / glitch landed)"
+                                             : "did NOT run (SRAM boot blocked / glitch missed)");
+        }
+    }
+
+#endif  /* FPB_PROBE == 1 */
+
     // === Step 4: Init target UART for receiving dump ===
     uart_cli_send("[4] Initializing UART RX (GP5, 115200, 8N1)...\r\n");
 
@@ -2790,6 +2828,35 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t gl
 
     if (!hdr_found) {
         uart_cli_send("ERROR: \"RDP1\" header not received — stage 2 may not be executing\r\n");
+#if FPB_PROBE == 2
+        // === DEBUG PROBE 2 (debug/fpb-probe): did the step-5 nRST survive FPB? ===
+        // Stage1 armed FP_COMP0=0x05 pre-nRST. If it now reads 0 the pin reset
+        // wiped the remap (CPU booted flash -> 0xDEADBEEF -> hardfault, stage2
+        // never entered). If it still reads 0x05 the remap survived, so stage2
+        // WAS entered and faulted on its flash access (the F4 RDP1 read-block).
+        {
+            extern void swd_init(void);
+            extern bool swd_connect(void);
+            extern void swd_deinit(void);
+            uint32_t fp_comp0 = 0xFFFFFFFF, fp_ctrl = 0xFFFFFFFF;
+            bool link = false;
+            swd_init();
+            if (swd_connect()) {
+                link = true;
+                swd_read_mem(0xE0002008, &fp_comp0, 1);
+                swd_read_mem(0xE0002000, &fp_ctrl, 1);
+            }
+            swd_deinit();
+            if (!link)
+                uart_cli_send("[dbg] post-nRST FP probe: SWD connect failed\r\n");
+            else
+                uart_cli_printf("[dbg] post-nRST FP_CTRL=0x%08lX FP_COMP0=0x%08lX -> %s\r\n",
+                                (unsigned long)fp_ctrl, (unsigned long)fp_comp0,
+                                (fp_comp0 & 0x1)
+                                  ? "FPB SURVIVED reset -> stage2 entered but faulted on flash read"
+                                  : "FPB CLEARED by reset -> stage2 never entered");
+        }
+#endif  /* FPB_PROBE == 2 */
         goto bypass_cleanup;
     }
     uart_cli_send("    Header: RDP1\r\n");

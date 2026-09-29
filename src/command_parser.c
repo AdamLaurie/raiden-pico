@@ -517,7 +517,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.11\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.11-fpbprobe2only\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
