@@ -1,0 +1,3 @@
+# Treat datasheets as binary (no EOL normalization / no text diffs)
+*.pdf binary
+*.PDF binary
