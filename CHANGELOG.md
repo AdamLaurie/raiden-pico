@@ -1,3 +1,21 @@
+## [0.15] — 2026-09-30 — ROMGADGET: SRAM-boot ROM-gadget experiment (gate-2 mechanism)
+
+### Added
+- `TARGET GLITCH ROMGADGET [variant | 0xADDR]` — SRAM-boot stage2 -> boot-ROM gadget -> SWD recovery [F401]. Variants: 0=control (ROM read loop, SRAM source), 1=flash-plain, 2=flash+KEYR-unlock, 3=FPB reader-trick (stage2 programs FPB itself), 4=fetch-probe (blx a host-supplied ROM/flash address; `0xADDR` form), 5=data-read (stage2 loads from flash+ROM directly). Fault forensics in recovery: stacked-exception PC/LR, CFSR/HFSR/BFAR decode.
+- `TARGET GLITCH ROMFPB` / `ROMFPBCTL` — FPB-remap of the boot-ROM RDP checker + gated I2C command exercise, and its no-patch control (concluded: FPB regs wiped by BOR; halt kills bootloader I2C).
+
+### Changed
+- ROMGADGET argument validation: non-numeric/garbage args and unknown variants emit explicit `ERROR:` lines (cli-errors rule).
+- **`TARGET GLITCH I2CGATE [attempts] [mv]`** — brownout-dip the boot-ROM RDP check during the I2C command stretch, three rotating windows (cmd-byte / pre-STOP / post-STOP), verdict poll + full 16-byte read on ACK. Calibration mode at RDP0: NACK-on-dip = corrupted check, ACK + FF read = clean data path.
+- **`TARGET GLITCH I2CPROBE [samples] [delay_us]`** — SWD-halt mid-stretch timing recon; dumps PC/xPSR + stacked fault frame + CFSR/BFAR. `delay_us 999999` = control (no 0x11 sent). Recon-only: a halt inside the read path gates the read.
+- **`TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]`** — PIO one-shot rail pulse (new `i2c_pulse_oneshot` program on the crowbar SM slot, INTERNAL mode): GP10 idles HIGH, dips LOW for `width` 6.67ns ticks after `pause` ticks from the 0x11 frame's STOP edge; ns-resolution sweep across the stretch.
+
+### Findings (bench)
+- I2CGATE calibration at RDP0 (200-shot run, 2.10V dips): post-STOP window corrupts the check ~47% (28 NACK / 31 ACK+clean-read); ≤2.3V never corrupts, ≤2.0V BORs (re-entry recovers). Data path proven: every ACK shot completed a clean read.
+- I2CGATE at RDP1: 450 shots across 1.95–2.25V, zero false-ACKs — a µs rail dip flips pass→fail easily but cannot forge the precise `cmp == 0xAA00` false-pass. Rail-dip primitive ruled out for RDP1 bypass.
+- I2CPROBE recon (RDP1 mule): the ROM core is ALREADY in HardFault (BFSR.IBUSERR at 0x1FFF03E2, the I2C wait-poll loop; timeout seed 0xAAAA via the 0x1FFF0C1C accept-helper) at every sampled delay 0µs–5ms — and even with no command sent — while the I2C slave hardware serves GET/GID/PROBE/verdicts autonomously. The gated-command verdict is NOT CPU-generated during the stretch; the "glitch the running rdp_locked() check" model was wrong for the I2C boot path.
+- I2CPROBE operational notes: C_DEBUGEN survives nRST, so each probe sample must POR (power-cycle) before re-entering the bootloader; the first command frame after entry+GET always NACKs (warm-up frame fixes it); `delay_us` is capped at 1e6 (a huge delay busy-waits the whole main loop).
+
 # Changelog
 
 All notable changes to the Raiden Pico firmware. The version is the string the

@@ -90,6 +90,18 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t gl
 void target_power_halt(uint32_t dump_bytes);
 void target_power_cleanwake(void);
 void target_power_shadowchar(uint32_t iterations);
+// RDP1 ROM-FPB probe (no glitching): FPB-remap the boot ROM's software RDP check
+// (0x1FFF0B94 -> bx lr) while the genuine bootloader runs, then exercise gated
+// I2C bootloader commands. Answers whether FPB can patch system-memory fetches.
+void target_power_romfpb(void);
+void target_power_romfpb_control(void);  // control: same flow, no FPB patch
+void target_power_romgadget(void);  // SRAM stage2 -> ROM read-loop gadget -> SWD recovery
+void target_power_romgadget_variant(uint32_t variant);  // run specific variant (0-4)
+void target_power_romgadget_addr(uint32_t addr);        // fetch-probe at specific ROM addr
+void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv);   // glitch the boot-ROM RDP check during I2C command stretch
+void target_power_i2cprobe(uint32_t samples, uint32_t delay_us);  // SWD-halt mid-stretch, read PC (window mapping)
+void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_hi,
+                           uint32_t pause_step, uint32_t width_cycles);  // PIO ns-resolution pulse sweep
 void target_power_literal(void);
 void target_power_regdump(void);
 void target_power_glitch_regdump(uint32_t max_attempts);

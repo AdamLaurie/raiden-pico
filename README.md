@@ -417,6 +417,27 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   ADC0/GP26 until ≤ threshold, then dwell) instead of the legacy uncontrolled
   fixed-time low pull. Get the value from `TARGET GLITCH SWEEP`.
 
+**`TARGET GLITCH ROMFPB`** / **`ROMFPBCTL`** - FPB-patch boot ROM RDP check, then exercise gated I2C bootloader commands [STM32F401]
+- Research commands (concluded): bench result = FPB regs are wiped by BOR, so the patch cannot survive debugger detach; control proves halting the bootloader kills its I2C.
+
+**`TARGET GLITCH ROMGADGET [variant | 0xADDR]`** - SRAM-boot stage2 -> boot-ROM gadget -> SWD recovery [STM32F401]
+- Research command: uploads stage2 over SWD, brownout-dips (debug domain dies, SRAM survives), stage2 runs debugger-free and tries to read flash via boot-ROM code paths; SWD re-attach recovers markers/registers.
+- `variant`: 0=control (ROM loop, SRAM source) 1=flash-plain 2=flash+KEYR-unlock 3=FPB reader-trick 4=fetch-probe 5=data-read. `0xADDR` = run the fetch-probe at that ROM address.
+- Unknown variant/address prints `ERROR`. Bench result (RDP1 mule): all ROM/flash fetches and data reads bus-fault from SRAM boot — gadget premise dead; not yet RDP0-controlled.
+
+**`TARGET GLITCH I2CGATE [attempts] [mv]`** - Brownout-dip the boot-ROM RDP check during the I2C command stretch [STM32F401]
+- Sends the 0x11 Read command frame with an ADC-gated rail dip fired in one of three rotating windows (after cmd byte / before ~cmd / post-STOP), then polls the verdict and completes a full 16-byte read on ACK.
+- Calibration mode (mule at RDP0): NACK-on-dip = corrupted check, ACK + all-FF read = clean data path. RDP0 bench result: post-STOP window corrupts ~47% at 2.10V dips; ≤2.3V never corrupts, ≤2.0V BORs the target (auto re-entry recovers it).
+- RDP1 result: 450 shots, zero false-ACKs — a coarse µs rail dip flips pass→fail easily but cannot forge the precise cmp==0xAA00 false-pass.
+
+**`TARGET GLITCH I2CPROBE [samples] [delay_us]`** - SWD-halt mid-stretch timing recon [STM32F401]
+- Halts the core `delay_us` after a raw 0x11 command frame (or `delay_us 999999` = control, no command) and dumps PC/xPSR plus the stacked fault frame and CFSR/BFAR.
+- Recon-only by design: never call this inside a read path — the halt itself gates the flash read.
+- Bench finding (RDP1 mule): the ROM core is ALREADY in HardFault (BFSR.IBUSERR at 0x1FFF03E2, the I2C wait-poll loop) at every sampled delay, even with no command sent — while the I2C slave hardware keeps serving commands autonomously. The gated-command verdict is not CPU-generated during the stretch.
+
+**`TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]`** - PIO ns-resolution rail-pulse sweep [STM32F401]
+- A dedicated PIO SM drives GP10: idles HIGH (rail up), dips LOW for `width` 6.67ns ticks after `pause` ticks from the 0x11 frame's STOP edge. Pauses are swept lo..hi in `step` increments across the attempts. Internal mode only; requires no SWD and never halts the core.
+
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms
 

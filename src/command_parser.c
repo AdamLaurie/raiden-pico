@@ -518,7 +518,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.14\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.15\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1786,10 +1786,21 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  RESETTEST                  - Reset/low-power disruption test\r\n");
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
+                uart_cli_send("  ROMFPB                     - FPB-patch boot ROM RDP check, read flash over I2C (no glitch)\r\n");
+                uart_cli_send("  ROMFPBCTL                  - control: same early-attach flow, no FPB patch\r\n");
+                uart_cli_send("  ROMGADGET [N | 0xADDR]     - SRAM stage2 -> boot-ROM gadget -> SWD recovery\r\n");
+                uart_cli_send("                               (N: 0=control 1=flash 2=flash+unlock 3=reader\r\n");
+                uart_cli_send("                               4=fetch-probe 5=data-read; 0xADDR = probe target)\r\n");
+                uart_cli_send("  I2CGATE [attempts] [mv]    - glitch boot-ROM RDP check during I2C cmd stretch\r\n");
+                uart_cli_send("  I2CPROBE [samples] [us]    - SWD-halt mid-stretch, read PC (map RDP check timing)\r\n");
+                uart_cli_send("  I2CPULSE [n] [lo] [hi] [step] [w] - PIO ns-resolution rail pulse sweep (ticks)\r\n");
+                uart_cli_send("                               (mv = dip depth in mV, 0/omit = auto-sweep 1.30->0.70V)\r\n");
             } else {
                 const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "SHADOWBYPASS", "SHADOWSCAN", "LPCBYPASS",
-                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
-                if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
+                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING",
+                                             "ROMFPB", "ROMFPBCTL", "ROMGADGET", "I2CGATE",
+                                             "I2CPROBE", "I2CPULSE"};
+                if (!match_and_replace(&parts->parts[2], glitch_cmds, sizeof(glitch_cmds) / sizeof(glitch_cmds[0]), "GLITCH command")) {
                     goto api_response;
                 }
 
@@ -1943,6 +1954,136 @@ void command_parser_execute(cmd_parts_t *parts) {
                     target_power_glitch_regdump(attempts);
                 } else if (strcmp(parts->parts[2], "RESETTEST") == 0) {
                     target_power_resettest();
+                } else if (strcmp(parts->parts[2], "ROMFPB") == 0) {
+                    // No-glitch RDP1 probe: FPB-remap the boot ROM's software RDP
+                    // check while the genuine bootloader runs, then READ flash over
+                    // I2C. Requires: F401 target, BOOT0=1 wiring, GP26 rail monitor
+                    // unused (no glitching), SWD + I2C (GP4/5) wired.
+                    target_power_romfpb();
+                } else if (strcmp(parts->parts[2], "ROMFPBCTL") == 0) {
+                    // Control experiment: identical early-attach flow but NO FPB
+                    // patch — isolates whether the halt/patch or the halt alone is
+                    // what breaks the bootloader's I2C.
+                    target_power_romfpb_control();
+                } else if (strcmp(parts->parts[2], "ROMGADGET") == 0) {
+                    // Premise test: SRAM-boot stage2 via brownout (debug domain
+                    // dies), stage2 jumps into the boot-ROM read loop with a fake
+                    // SRAM register block; SWD recovers the parked flash byte.
+                    // Optional arg: variant index (0-4) or "0xADDR" (fetch-probe).
+                    if (parts->count >= 4) {
+                        const char *a = parts->parts[3];
+                        char *end = NULL;
+                        if (a[0] == '0' && (a[1] == 'x' || a[1] == 'X')) {
+                            uint32_t addr = (uint32_t)strtoul(a, &end, 16);
+                            if (end == a || *end != '\0') {
+                                uart_cli_printf("ERROR: Bad ROMGADGET address '%s' (expect 0x1FFF0000..0x1FFF77FF)\r\n", a);
+                            } else {
+                                target_power_romgadget_addr(addr);
+                            }
+                        } else {
+                            uint32_t var = (uint32_t)strtoul(a, &end, 10);
+                            if (end == a || *end != '\0') {
+                                uart_cli_printf("ERROR: Bad ROMGADGET variant '%s' (0-5 or 0xADDR)\r\n", a);
+                            } else {
+                                target_power_romgadget_variant(var);
+                            }
+                        }
+                    } else {
+                        target_power_romgadget();
+                    }
+                } else if (strcmp(parts->parts[2], "I2CGATE") == 0) {
+                    // Glitch the boot-ROM per-command RDP check (0x1FFF0B94)
+                    // during the I2C clock-stretch after the command byte ACK.
+                    // Optional arg: attempt count (default 20).
+                    uint32_t n = 20;
+                    uint32_t mv = 0;   // 0 = auto depth sweep
+                    if (parts->count >= 4) {
+                        char *end = NULL;
+                        n = (uint32_t)strtoul(parts->parts[3], &end, 10);
+                        if (end == parts->parts[3] || *end != '\0') {
+                            uart_cli_printf("ERROR: Bad I2CGATE attempt count '%s'\r\n", parts->parts[3]);
+                            n = 0;
+                        }
+                    }
+                    if (n && parts->count >= 5) {
+                        char *end = NULL;
+                        mv = (uint32_t)strtoul(parts->parts[4], &end, 10);
+                        if (end == parts->parts[4] || *end != '\0') {
+                            uart_cli_printf("ERROR: Bad I2CGATE depth '%s' (mV, 0 = auto-sweep)\r\n", parts->parts[4]);
+                            n = 0;
+                        }
+                    }
+                    if (n) target_power_i2cgate(n, mv);
+                } else if (strcmp(parts->parts[2], "I2CPROBE") == 0) {
+                    // SWD-halt mid-stretch at delay_us after the 0x11 frame,
+                    // read PC: maps where rdp_locked() runs relative to STOP.
+                    // Usage: TARGET GLITCH I2CPROBE [samples] [delay_us]
+                    uint32_t n = 10;
+                    uint32_t us = 100;
+                    if (parts->count >= 4) {
+                        char *end = NULL;
+                        n = (uint32_t)strtoul(parts->parts[3], &end, 10);
+                        if (end == parts->parts[3] || *end != '\0' || n == 0 || n > 500) {
+                            uart_cli_printf("ERROR: Bad I2CPROBE sample count '%s' (1..500)\r\n", parts->parts[3]);
+                            n = 0;
+                        }
+                    }
+                    if (n && parts->count >= 5) {
+                        char *end = NULL;
+                        us = (uint32_t)strtoul(parts->parts[4], &end, 10);
+                        if (end == parts->parts[4] || *end != '\0' || us > 1000000) {
+                            uart_cli_printf("ERROR: Bad I2CPROBE delay '%s' (us, max 1000000)\r\n", parts->parts[4]);
+                            n = 0;
+                        }
+                    }
+                    if (n) target_power_i2cprobe(n, us);
+                } else if (strcmp(parts->parts[2], "I2CPULSE") == 0) {
+                    // PIO ns-resolution rail pulse swept across the stretch.
+                    // Usage: TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]
+                    //   pauses in 6.67ns ticks; width in ticks (0 = default 300 = 2us)
+                    uint32_t n = 100, lo = 0, hi = 2000, step = 40, w = 300;
+                    bool ok = true;
+                    if (parts->count >= 4) {
+                        char *end = NULL;
+                        n = (uint32_t)strtoul(parts->parts[3], &end, 10);
+                        if (end == parts->parts[3] || *end != '\0' || n == 0 || n > 2000) {
+                            uart_cli_printf("ERROR: Bad I2CPULSE attempt count '%s' (1..2000)\r\n", parts->parts[3]);
+                            ok = false;
+                        }
+                    }
+                    if (ok && parts->count >= 5) {
+                        char *end = NULL;
+                        lo = (uint32_t)strtoul(parts->parts[4], &end, 10);
+                        if (end == parts->parts[4] || *end != '\0') {
+                            uart_cli_printf("ERROR: Bad I2CPULSE pause_lo '%s'\r\n", parts->parts[4]);
+                            ok = false;
+                        }
+                    }
+                    if (ok && parts->count >= 6) {
+                        char *end = NULL;
+                        hi = (uint32_t)strtoul(parts->parts[5], &end, 10);
+                        if (end == parts->parts[5] || *end != '\0' || hi < lo) {
+                            uart_cli_printf("ERROR: Bad I2CPULSE pause_hi '%s' (>= pause_lo)\r\n", parts->parts[5]);
+                            ok = false;
+                        }
+                    }
+                    if (ok && parts->count >= 7) {
+                        char *end = NULL;
+                        step = (uint32_t)strtoul(parts->parts[6], &end, 10);
+                        if (end == parts->parts[6] || *end != '\0' || step == 0) {
+                            uart_cli_printf("ERROR: Bad I2CPULSE pause_step '%s' (>0)\r\n", parts->parts[6]);
+                            ok = false;
+                        }
+                    }
+                    if (ok && parts->count >= 8) {
+                        char *end = NULL;
+                        w = (uint32_t)strtoul(parts->parts[7], &end, 10);
+                        if (end == parts->parts[7] || *end != '\0') {
+                            uart_cli_printf("ERROR: Bad I2CPULSE width '%s'\r\n", parts->parts[7]);
+                            ok = false;
+                        }
+                    }
+                    if (ok) target_power_i2cpulse(n, lo, hi, step, w);
                 } else if (strcmp(parts->parts[2], "TIMING") == 0) {
                     if (parts->count < 4) {
                         // No args: list breakpoints

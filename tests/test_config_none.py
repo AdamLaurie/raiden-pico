@@ -642,3 +642,22 @@ class TestPrefixMatching:
     def test_pin_matches_pins(self, raiden):
         r = raiden.cmd("PIN")
         assert "Pin Configuration" in r or "GP" in r
+
+
+# ── TARGET GLITCH ROMGADGET (cli-errors rule: explicit errors) ──
+
+class TestRomgadgetErrors:
+    """ROMGADGET's run path drives SWD + power glitches (never run here);
+    these cover only the argument-validation error paths, which are USB-only."""
+
+    def test_romgadget_unknown_variant(self, raiden):
+        r = raiden.cmd("TARGET GLITCH ROMGADGET 9")
+        assert "ERROR" in r
+        assert "variant" in r.lower()
+
+    def test_romgadget_garbage_arg(self, raiden):
+        # non-numeric args must NOT silently parse as variant 0 via strtoul
+        # and launch the hardware sequence
+        r = raiden.cmd("TARGET GLITCH ROMGADGET WIBBLE")
+        assert "ERROR" in r
+        assert "Bad ROMGADGET variant" in r
