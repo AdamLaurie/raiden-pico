@@ -149,6 +149,9 @@ bool swd_halt(void);
 // Resume target core
 bool swd_resume(void);
 
+// Single-step one instruction (core must be halted). Waits for re-halt.
+bool swd_step(void);
+
 // Read a CPU register (r0-r15, xPSR etc) while halted
 // reg: 0-15 = r0-r15, 16 = xPSR, 17 = MSP, 18 = PSP
 bool swd_read_core_reg(uint8_t reg, uint32_t *value);

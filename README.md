@@ -320,6 +320,53 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Defaults: 115200 baud, 12000 kHz crystal, 500ms reset delay, 5 retries
 - Example: `TARGET SYNC 115200 12000 500 5`
 
+**`TARGET I2C <subcommand> [args] [addr7]`** - STM32 bootloader over I2C (AN4221)
+- Bit-banged I2C master on **GP4 (SCL) / GP5 (SDA)** — the *same* pins as the
+  target UART, reused because the STM32 bootloader locks to a single interface
+  (UART-boot and I2C-boot can never co-exist). On the target side these are the
+  bootloader's **I2C1 = PB6 (SCL) / PB7 (SDA)** pins (found by reading the ROM's
+  GPIO AFR setup over SWD; *not* PB8/PB9). Needs pull-ups to 3V3 on both lines
+  (the Pico's internal pull-ups are enabled but weak — external ~2.2k–4.7k is
+  better for reliability).
+- Default 7-bit slave address **0x39** (`OAR1=0x4072`, decoded from the F401 boot
+  ROM); override with the optional trailing `addr7` argument.
+- Each command resets the target into the ROM bootloader (BOOT0=1, power-cycle if
+  SWD was attached so the debug halt clears) and drives I2C — it never sends a
+  USART `0x7F` sync (that would select the UART interface instead).
+
+  | Subcommand | Action |
+  |---|---|
+  | `SCAN` | probe addresses 0x08–0x77, list responders |
+  | `SYNC` | enter bootloader + scan + Get |
+  | `GET` | 0x00 Get (version + supported command list) |
+  | `GV` | 0x01 Get Version & Read-Protection status |
+  | `GID` | 0x02 Get ID (chip PID) |
+  | `READ <addr> <len>` | 0x11 Read Memory (len 1–256), hexdump |
+  | `WRITE <addr> <hex>` | 0x31 Write Memory (≤256 bytes, e.g. `WRITE 0x20001000 DEADBEEF`) |
+  | `GO <addr>` | 0x21 Go (jump to address) |
+  | `PROBE <cmd_hex>` | send a command byte only, report ACK/NACK (RDP gate mapping) |
+  | `ERASE ALL WIPE` | 0x45 Extended Erase, mass (**destructive**, confirm token) |
+  | `RP CONFIRM` | 0x83 Readout Protect → re-lock to RDP1 (**destructive**, confirm token) |
+  | `RU WIPE` | 0x93 Readout Unprotect → mass-erase + drop to RDP0 (**destructive**, confirm token) |
+
+- **Deterministic timing (no UART jitter).** Unlike the USART bootloader path —
+  where sync (`0x7F`), command and verdict traffic jitter by milliseconds
+  (host/baud/ROM polling dependent) and every glitch delay must absorb that
+  spread — the I2C slave ACKs each byte in hardware and only stretches SCL for
+  the actual ROM processing, so the frame boundaries are tight and repeatable.
+  Measured command stretch: 17–34 ms (worst case, write-commit); the I2CGATE/
+  I2CPULSE campaigns rely on exactly this determinism, using the STOP edge as
+  the t=0 reference. Use the I2C bootloader in preference to the UART
+  bootloader for any timed glitch against bootloader command processing.
+
+- Purpose: test whether the F401's I2C boot interface (present in the ROM but
+  undocumented in AN2606) is reachable, and map which bootloader commands the RDP
+  level gates. **Bench result (F401):** the interface *is* reachable at 0x39; at
+  **RDP1 only Get/GV/GID and the RDP-management pair (RP/RU) are accepted — Read,
+  Write, Go, Erase and Write-Protect are all NACK'd**, so there is no command-level
+  Write+Go bypass. At RDP0 every command works. See
+  `stm32_payloads/f4/stm32f401_bootrom_analysis.md`.
+
 **`TARGET SEND <hex|"text">`** - Send data to target
 - Send hex bytes or quoted text to target UART
 - Hex: `TARGET SEND 3F` (sends 0x3F)
@@ -379,6 +426,27 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - `voltage_mv` (0–3300): ADC-gates the recovery dip to that depth (drop rail, poll
   ADC0/GP26 until ≤ threshold, then dwell) instead of the legacy uncontrolled
   fixed-time low pull. Get the value from `TARGET GLITCH SWEEP`.
+
+**`TARGET GLITCH ROMFPB`** / **`ROMFPBCTL`** - FPB-patch boot ROM RDP check, then exercise gated I2C bootloader commands [STM32F401]
+- Research commands (concluded): bench result = FPB regs are wiped by BOR, so the patch cannot survive debugger detach; control proves halting the bootloader kills its I2C.
+
+**`TARGET GLITCH ROMGADGET [variant | 0xADDR]`** - SRAM-boot stage2 -> boot-ROM gadget -> SWD recovery [STM32F401]
+- Research command: uploads stage2 over SWD, brownout-dips (debug domain dies, SRAM survives), stage2 runs debugger-free and tries to read flash via boot-ROM code paths; SWD re-attach recovers markers/registers.
+- `variant`: 0=control (ROM loop, SRAM source) 1=flash-plain 2=flash+KEYR-unlock 3=FPB reader-trick 4=fetch-probe 5=data-read. `0xADDR` = run the fetch-probe at that ROM address.
+- Unknown variant/address prints `ERROR`. Bench result (RDP1 mule): all ROM/flash fetches and data reads bus-fault from SRAM boot — gadget premise dead; not yet RDP0-controlled.
+
+**`TARGET GLITCH I2CGATE [attempts] [mv]`** - Brownout-dip the boot-ROM RDP check during the I2C command stretch [STM32F401]
+- Sends the 0x11 Read command frame with an ADC-gated rail dip fired in one of three rotating windows (after cmd byte / before ~cmd / post-STOP), then polls the verdict and completes a full 16-byte read on ACK.
+- Calibration mode (mule at RDP0): NACK-on-dip = corrupted check, ACK + all-FF read = clean data path. RDP0 bench result: post-STOP window corrupts ~47% at 2.10V dips; ≤2.3V never corrupts, ≤2.0V BORs the target (auto re-entry recovers it).
+- RDP1 result: 450 shots, zero false-ACKs — a coarse µs rail dip flips pass→fail easily but cannot forge the precise cmp==0xAA00 false-pass.
+
+**`TARGET GLITCH I2CPROBE [samples] [delay_us]`** - SWD-halt mid-stretch timing recon [STM32F401]
+- Halts the core `delay_us` after a raw 0x11 command frame (or `delay_us 999999` = control, no command) and dumps PC/xPSR plus the stacked fault frame and CFSR/BFAR.
+- Recon-only by design: never call this inside a read path — the halt itself gates the flash read.
+- Bench finding (RDP1 mule): the ROM core is ALREADY in HardFault (BFSR.IBUSERR at 0x1FFF03E2, the I2C wait-poll loop) at every sampled delay, even with no command sent — while the I2C slave hardware keeps serving commands autonomously. The gated-command verdict is not CPU-generated during the stretch.
+
+**`TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]`** - PIO ns-resolution rail-pulse sweep [STM32F401]
+- A dedicated PIO SM drives GP10: idles HIGH (rail up), dips LOW for `width` 6.67ns ticks after `pause` ticks from the 0x11 frame's STOP edge. Pauses are swept lo..hi in `step` increments across the attempts. Internal mode only; requires no SWD and never halts the core.
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms
@@ -448,6 +516,13 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD IDCODE`** - Identify connected target
 - Reads DPIDR, CPUID, and STM32 debug ID code
 - Decodes ARM part number and STM32 device variant
+- A failed CPUID/DBG_IDCODE read (e.g. the AP racing the target's bus right
+  after a plain connect) now reports `ERROR: Could not read CPUID/debug
+  registers` instead of printing blank `0x00000000` values as success
+
+**`SWD DISCONNECT`** - Detach cleanly from target
+- Powers down the debug domain and releases SWD pins; preferred cleanup between
+  campaigns (leaving debug attached can hold the target's debug domain up)
 
 **`SWD SCAN`** - Enumerate the DAP (Access Ports + CoreSight ROM table)
 - Reads each Access Port's IDR, then walks each MEM-AP's CoreSight ROM table and
@@ -465,6 +540,18 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 
 **`SWD REGS`** - Read core registers
 - Displays r0-r15, xPSR, MSP, PSP while halted
+
+**`SWD STEP [n]`** - Single-step n instructions (default 1)
+- Core must be halted; masks interrupts during the step. Reports pc/xPSR after.
+
+**`SWD ROMREAD <flash_addr> <len>`** - F401 boot-ROM gadget flash-dump probe
+- Attempts to dump flash by single-stepping the F401 boot ROM's own read gadget
+  (`0x1FFF0550: ldrb r0,[r5],#1`), which sits *after* the ROM's software RDP check.
+- **Bench result: blocked at RDP1.** The boot ROM (0x1FFF0000) is walled off the
+  debug port exactly like flash — AHB-AP reads fault and the CPU won't execute ROM
+  when PC is redirected there by SWD. The command self-diagnoses this and reports
+  it. Only usable where the ROM is debug-accessible (RDP0). The ROM's trusted flash
+  read is reachable only via genuine (non-debug) boot flow, i.e. the VCAP glitch.
 
 **`SWD FILL <addr|region> <value> [n] [ERASE]`** - Fill memory with pattern
 - Fills n words (default: full region for aliases, 1 for raw address)

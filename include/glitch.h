@@ -39,6 +39,15 @@ bool glitch_arm_trace(void);
 // Execute a glitch
 bool glitch_execute(void);
 
+// I2CPULSE one-shot rail pulse (CPU-synchronous glitching, INTERNAL mode):
+// a dedicated PIO SM drives POWER_PIN1 (GP10) — idle HIGH, dips the rail LOW
+// for `width_cycles` (6.67ns ticks @ 150MHz) after `pause_cycles` pushed per
+// shot and fired with i2cpulse_fire() (~6.7ns latency, no blocking).
+bool i2cpulse_start(uint32_t width_cycles);       // arm the SM (once per campaign)
+void i2cpulse_push_pause(uint32_t pause_cycles);  // queue this shot's PAUSE
+void i2cpulse_fire(void);                         // fire NOW (call at t=0 reference)
+void i2cpulse_stop(void);                         // release SM + GP10 back to SIO
+
 // Reset system state
 void glitch_reset(void);
 
