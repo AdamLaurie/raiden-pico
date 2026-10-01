@@ -7,6 +7,26 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+## [0.14] — 2026-10-01 — Fix SWD IDCODE zero-masking + unreachable SWD DISCONNECT
+
+### Fixed
+- **`swd_detect()` no longer masks failed CPUID/DBG_IDCODE reads as success.** It
+  discarded the return value of `mem_read32()` for both reads, so a transient
+  AHB-AP read failure right after a plain (un-halted) `SWD CONNECT` — the AP can
+  race the target's own bus activity immediately after debug-power-domain
+  power-up — still returned `true` with the caller's zero-initialized values.
+  `SWD IDCODE` then printed `CPUID: 0x00000000` / `Chip: Unknown` as if that were
+  real (but blank) silicon, which reads as "target not enumerating" even though
+  the DP/AP link is fine. Now propagates the read failure so the CLI reports
+  `ERROR: Could not read CPUID/debug registers` instead. `SWD CONNECTRST` was
+  never affected (it halts the core first, avoiding the race).
+- **`SWD DISCONNECT` was unreachable.** Its handler existed
+  (`command_parser.c`), but the `swd_subcmds[]` allow-list used for
+  sub-command matching didn't include `"DISCONNECT"`, so every call was
+  rejected as `ERROR: Unknown SWD sub-command 'DISCONNECT'` before reaching
+  the handler — including the cleanup calls used throughout the SWD test
+  suite, which never asserted on the response and so never caught it.
+
 ## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
 
 ### Added

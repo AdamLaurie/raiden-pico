@@ -298,9 +298,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
-            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
+            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE", "FILL", "IDCODE",
                                           "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT", "LEAKPROBE"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 19, "SWD sub-command")) {
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 20, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -517,7 +517,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.13\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.14\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();

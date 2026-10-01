@@ -566,6 +566,19 @@ class TestSWDSpeed:
         raiden.cmd("SWD SPEED 1")
 
 
+# ── SWD disconnect (no target needed — just releases pins) ────
+
+class TestSWDDisconnect:
+
+    def test_disconnect_accepted(self, raiden):
+        """Regression: DISCONNECT was missing from swd_subcmds[], so every
+        call was rejected as an unknown sub-command before reaching its
+        (otherwise correct) handler."""
+        r = raiden.cmd("SWD DISCONNECT")
+        assert "Unknown" not in r
+        assert "OK" in r
+
+
 # ── ChipSHOUTER command guardrails (error paths) ─────────────
 # These reject bad input in the firmware BEFORE anything is sent to the
 # ChipSHOUTER, so they're safe with no CS connected (no arm/fire). Happy paths

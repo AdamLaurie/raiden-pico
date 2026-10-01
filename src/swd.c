@@ -868,11 +868,11 @@ bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out) {
         ahb_initialized = true;
     }
 
-    if (cpuid_out)
-        mem_read32(CPUID, cpuid_out);
+    if (cpuid_out && !mem_read32(CPUID, cpuid_out))
+        return false;
 
-    if (dbg_idcode_out)
-        mem_read32(DBG_IDCODE, dbg_idcode_out);
+    if (dbg_idcode_out && !mem_read32(DBG_IDCODE, dbg_idcode_out))
+        return false;
 
     return true;
 }
