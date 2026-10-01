@@ -299,9 +299,9 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
-            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
+            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE", "FILL", "IDCODE",
                                           "HALT", "RESUME", "STEP", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "SCAN", "SNAPSHOT", "LEAKPROBE", "ROMREAD"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 21, "SWD sub-command")) {
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 22, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {

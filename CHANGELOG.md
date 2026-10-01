@@ -5,6 +5,8 @@
 - `TARGET GLITCH ROMFPB` / `ROMFPBCTL` — FPB-remap of the boot-ROM RDP checker + gated I2C command exercise, and its no-patch control (concluded: FPB regs wiped by BOR; halt kills bootloader I2C).
 
 ### Changed
+- `TARGET I2C GET` now enumerates each supported command with its AN4221 name (`00 GET | 01 GETVER | ... | 93 RU`) instead of a bare hex list; unknown codes print `?`.
+- I2C bootloader timing property documented and bench-confirmed: the hardware-slave byte ACKs remove the USART path's milliseconds of sync/command/verdict jitter — frame boundaries are deterministic, which is what the I2CGATE/I2CPULSE campaigns use (STOP edge = t=0).
 - ROMGADGET argument validation: non-numeric/garbage args and unknown variants emit explicit `ERROR:` lines (cli-errors rule).
 - **`TARGET GLITCH I2CGATE [attempts] [mv]`** — brownout-dip the boot-ROM RDP check during the I2C command stretch, three rotating windows (cmd-byte / pre-STOP / post-STOP), verdict poll + full 16-byte read on ACK. Calibration mode at RDP0: NACK-on-dip = corrupted check, ACK + FF read = clean data path.
 - **`TARGET GLITCH I2CPROBE [samples] [delay_us]`** — SWD-halt mid-stretch timing recon; dumps PC/xPSR + stacked fault frame + CFSR/BFAR. `delay_us 999999` = control (no 0x11 sent). Recon-only: a halt inside the read path gates the read.
@@ -24,6 +26,26 @@ same change (see the `version-bump` skill) and add an entry here.
 
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
+
+## [0.14.1] — 2026-10-01 — Fix SWD IDCODE zero-masking + unreachable SWD DISCONNECT
+
+### Fixed
+- **`swd_detect()` no longer masks failed CPUID/DBG_IDCODE reads as success.** It
+  discarded the return value of `mem_read32()` for both reads, so a transient
+  AHB-AP read failure right after a plain (un-halted) `SWD CONNECT` — the AP can
+  race the target's own bus activity immediately after debug-power-domain
+  power-up — still returned `true` with the caller's zero-initialized values.
+  `SWD IDCODE` then printed `CPUID: 0x00000000` / `Chip: Unknown` as if that were
+  real (but blank) silicon, which reads as "target not enumerating" even though
+  the DP/AP link is fine. Now propagates the read failure so the CLI reports
+  `ERROR: Could not read CPUID/debug registers` instead. `SWD CONNECTRST` was
+  never affected (it halts the core first, avoiding the race).
+- **`SWD DISCONNECT` was unreachable.** Its handler existed
+  (`command_parser.c`), but the `swd_subcmds[]` allow-list used for
+  sub-command matching didn't include `"DISCONNECT"`, so every call was
+  rejected as `ERROR: Unknown SWD sub-command 'DISCONNECT'` before reaching
+  the handler — including the cleanup calls used throughout the SWD test
+  suite, which never asserted on the response and so never caught it.
 
 ## [0.14] — 2026-09-29 — STM32 bootloader over I2C (bit-banged)
 

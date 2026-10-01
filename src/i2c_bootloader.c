@@ -252,14 +252,27 @@ bool i2c_bl_get(uint8_t a) {
     uint8_t ver = i2c_rd(true);        // bootloader version
     uart_cli_printf("I2C bootloader: version %u.%u, %u commands:\r\n",
                     (ver >> 4) & 0xF, ver & 0xF, n);
+    // Enumerate each command with its AN4221 name instead of a bare hex list.
+    static const struct { uint8_t code; const char *name; } cmd_names[] = {
+        {0x00, "GET"},        {0x01, "GETVER"},     {0x02, "GETID"},
+        {0x11, "READ"},       {0x21, "GO"},         {0x31, "WRITE"},
+        {0x32, "WRITE-NS"},   {0x44, "ERASE"},      {0x45, "ERASE-EXT"},
+        {0x63, "WP"},         {0x64, "WP-NS"},      {0x73, "RP"},
+        {0x74, "RP-NS"},      {0x82, "GP"},         {0x83, "RP-EXT"},
+        {0x92, "WU"},         {0x93, "RU"},
+    };
     uart_cli_send("  ");
     for (int i = 0; i < n; i++) {
         uint8_t c = i2c_rd(true);
-        uart_cli_printf("%02X ", c);
+        const char *name = NULL;
+        for (unsigned k = 0; k < sizeof(cmd_names) / sizeof(cmd_names[0]); k++)
+            if (cmd_names[k].code == c) { name = cmd_names[k].name; break; }
+        if (name) uart_cli_printf("%02X %s", c, name);
+        else      uart_cli_printf("%02X ?", c);
+        uart_cli_send(i < n - 1 ? " | " : "\r\n");
     }
     i2c_rd(false);                     // trailing status (NACK last)
     i2c_stop();
-    uart_cli_send("\r\n");
     return true;
 }
 

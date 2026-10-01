@@ -349,6 +349,16 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   | `RP CONFIRM` | 0x83 Readout Protect → re-lock to RDP1 (**destructive**, confirm token) |
   | `RU WIPE` | 0x93 Readout Unprotect → mass-erase + drop to RDP0 (**destructive**, confirm token) |
 
+- **Deterministic timing (no UART jitter).** Unlike the USART bootloader path —
+  where sync (`0x7F`), command and verdict traffic jitter by milliseconds
+  (host/baud/ROM polling dependent) and every glitch delay must absorb that
+  spread — the I2C slave ACKs each byte in hardware and only stretches SCL for
+  the actual ROM processing, so the frame boundaries are tight and repeatable.
+  Measured command stretch: 17–34 ms (worst case, write-commit); the I2CGATE/
+  I2CPULSE campaigns rely on exactly this determinism, using the STOP edge as
+  the t=0 reference. Use the I2C bootloader in preference to the UART
+  bootloader for any timed glitch against bootloader command processing.
+
 - Purpose: test whether the F401's I2C boot interface (present in the ROM but
   undocumented in AN2606) is reachable, and map which bootloader commands the RDP
   level gates. **Bench result (F401):** the interface *is* reachable at 0x39; at
@@ -506,6 +516,13 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD IDCODE`** - Identify connected target
 - Reads DPIDR, CPUID, and STM32 debug ID code
 - Decodes ARM part number and STM32 device variant
+- A failed CPUID/DBG_IDCODE read (e.g. the AP racing the target's bus right
+  after a plain connect) now reports `ERROR: Could not read CPUID/debug
+  registers` instead of printing blank `0x00000000` values as success
+
+**`SWD DISCONNECT`** - Detach cleanly from target
+- Powers down the debug domain and releases SWD pins; preferred cleanup between
+  campaigns (leaving debug attached can hold the target's debug domain up)
 
 **`SWD SCAN`** - Enumerate the DAP (Access Ports + CoreSight ROM table)
 - Reads each Access Port's IDR, then walks each MEM-AP's CoreSight ROM table and

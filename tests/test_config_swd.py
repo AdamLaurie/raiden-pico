@@ -41,7 +41,8 @@ class TestSWDConnect:
         assert "Connected" in r
 
     def test_disconnect_reconnect(self, swd_target):
-        swd_target.cmd("SWD DISCONNECT")
+        r = swd_target.cmd("SWD DISCONNECT")
+        assert "OK" in r
         r = swd_target.cmd("SWD CONNECT")
         assert "Connected" in r
 
@@ -50,6 +51,20 @@ class TestSWDConnect:
         assert "DPIDR" in r
         assert "CPUID" in r
         assert "Cortex" in r
+
+    def test_idcode_never_fabricates_zero_cpuid(self, swd_target):
+        """Regression: swd_detect() used to discard mem_read32() failures and
+        still return success, so a transient AHB-AP read glitch right after a
+        plain (un-halted) CONNECT printed CPUID/DBG_ID as 0x00000000 instead
+        of surfacing an error. A real connected target must always report
+        either real register data or an explicit error — never silent zeros."""
+        for _ in range(10):
+            swd_target.cmd("SWD CONNECT")
+            r = swd_target.cmd("SWD IDCODE")
+            if "ERROR" in r:
+                continue
+            assert "CPUID:    0x00000000" not in r
+            assert "DBG_ID:   0x00000000" not in r
 
     def test_help_text(self, swd_target):
         r = swd_target.cmd("SWD")
