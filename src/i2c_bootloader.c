@@ -294,18 +294,13 @@ bool i2c_bl_get(uint8_t a) {
     if (!i2c_wr(ADDR_R(a))) { i2c_stop(); uart_cli_send("ERROR: I2C Get: read-addr NACK\r\n"); return false; }
     uint8_t n = i2c_rd(true);          // number of commands (N)
     uint8_t ver = i2c_rd(true);        // bootloader version
-    uint8_t cmds[32];
-    uint32_t got = (n > sizeof(cmds)) ? sizeof(cmds) : n;
-    for (uint32_t i = 0; i < got; i++) cmds[i] = i2c_rd(true);
-    i2c_rd(false);                     // trailing status (NACK last)
-    i2c_stop();
     // Same format as the UART bootloader's TARGET BL GET (stm32_bl_get).
     uart_cli_printf("Bootloader version: %u.%u\r\n", (ver >> 4) & 0xF, ver & 0xF);
     uart_cli_printf("Supported commands: %lu\r\n", (unsigned long)n);
-    for (uint32_t i = 0; i < got; i++) {
-        uint8_t c = cmds[i];
+    for (uint32_t i = 0; i < n; i++) {  // stream: never truncate (other
+        uint8_t c = i2c_rd(true);       // families may report >32 commands)
         // AN4221 names; -NS/-EXT variants are I2C-only (undocumented in AN3155)
-        const char *name = "???";
+        const char *name = "???";       // unknown opcode -> hex + ???
         switch (c) {
             case 0x00: name = "GET"; break;
             case 0x01: name = "Get Version"; break;
@@ -327,6 +322,8 @@ bool i2c_bl_get(uint8_t a) {
         }
         uart_cli_printf("  0x%02X  %s\r\n", c, name);
     }
+    i2c_rd(false);                     // trailing status (NACK last)
+    i2c_stop();
     return true;
 }
 
