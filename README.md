@@ -355,8 +355,8 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   spread — the I2C slave ACKs each byte in hardware and only stretches SCL for
   the actual ROM processing, so the frame boundaries are tight and repeatable.
   Measured command stretch: 17–34 ms (worst case, write-commit); the I2CGATE/
-  I2CPULSE campaigns rely on exactly this determinism, using the STOP edge as
-  the t=0 reference. Use the I2C bootloader in preference to the UART
+  I2CPULSE campaigns rely on exactly this determinism, using the cmd-byte ACK
+  edge as the t=0 reference. Use the I2C bootloader in preference to the UART
   bootloader for any timed glitch against bootloader command processing.
 
 - Purpose: test whether the F401's I2C boot interface (present in the ROM but
@@ -446,7 +446,12 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Bench finding (RDP1 mule): the ROM core is ALREADY in HardFault (BFSR.IBUSERR at 0x1FFF03E2, the I2C wait-poll loop) at every sampled delay, even with no command sent — while the I2C slave hardware keeps serving commands autonomously. The gated-command verdict is not CPU-generated during the stretch.
 
 **`TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]`** - PIO ns-resolution rail-pulse sweep [STM32F401]
-- A dedicated PIO SM drives GP10: idles HIGH (rail up), dips LOW for `width` 6.67ns ticks after `pause` ticks from the 0x11 frame's STOP edge. Pauses are swept lo..hi in `step` increments across the attempts. Internal mode only; requires no SWD and never halts the core.
+- A dedicated PIO SM drives GP10: idles HIGH (rail up), dips LOW for `width` 6.67ns ticks after `pause` ticks. Pauses are swept lo..hi in `step` increments across the attempts. Internal mode only; requires no SWD and never halts the core.
+- Anchor: the pulse fires from INSIDE the cmd byte's ACK slot (before the ACK SCL rise) via `i2c_bl_send_cmd_ackhook` — t=0 of the ROM's ~0.6us dispatch+`rdp_locked()`+verdict sequence. Post-frame hooks run ~400us too late (trailing dly()s).
+- Bench findings (RDP1 mule, ~4500 shots total):
+  - The gang power pins (GP10/11/12) ARE the rail source. Geometry determines the reachable dip depth: 1 sink vs 1 source (divider) floors at ~2.71V (50us ADC min-probe, width-independent); any zero-source pulse collapses the rail below BOR at ANY width (33ns -> BOR; no bulk capacitance on this board). Neither reaches the 2.1-2.28V corrupting band.
+  - Zero ACKs across the full 0-100us post-ACK band at every geometry — consistent with the ROM analysis: the verdict latches ~0.6us after the cmd byte ACK, and at RDP1 a false-pass needs compare/control-flow corruption, which the open-loop PIO sink cannot deliver without ADC feedback (I2CGATE's hook has it, the PIO pulse doesn't).
+  - I2CPULSE remains useful as a timing recon primitive; the ADC-feedback CPU hook (I2CGATE) is the depth-accurate primitive.
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms

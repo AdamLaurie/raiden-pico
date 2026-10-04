@@ -150,6 +150,50 @@ bool i2c_bl_cmd_with_hook(uint8_t a, uint8_t cmd, void (*hook)(void), void (*hoo
     return addr_ok;
 }
 
+// Fire a hook at the *ACK-slot edge* of a byte — the moment SCL rises for the
+// ACK clock. This is the earliest trustworthy anchor: at the cmd byte it is
+// t=0 of the ROM's ~0.6us dispatch+rdp_locked()+verdict sequence (the whole
+// verdict latches ~600ns after this edge), whereas the post-ACK hooks in
+// i2c_bl_cmd_with_hook run ~400us later (after the trailing dly()s) — far too
+// late to touch the verdict. The ACK slot itself is dly()-paced (~100us), so
+// the hook lands INSIDE the slave's stretch — the CPU is still running.
+// NOTE: this is a low-level primitive; callers wanting hooks per byte use
+// i2c_bl_cmd_with_hook (post-byte hooks) or a custom frame builder.
+static bool i2c_wr_ack_hook(uint8_t b, void (*ack_hook)(void)) {
+    for (int i = 7; i >= 0; i--) {
+        if (b & (1u << i)) sda_hi(); else sda_lo();
+        dly();
+        scl_hi(); dly();
+        scl_lo(); dly();
+    }
+    sda_hi();                 // release for ACK
+    dly();
+    if (ack_hook) ack_hook(); // fire BEFORE the ACK rise: at RDP1 the slave
+                              // clock-stretches through the verdict, so firing
+                              // after scl_hi() returns would be after the verdict
+    scl_hi();                 // ACK clock rises (honouring any stretch)
+    dly();
+    int ack = sda_get();      // 0 = ACK
+    scl_lo(); dly();
+    return ack == 0;
+}
+
+// Send the cmd frame with a hook fired at the cmd byte's ACK-slot SCL rise —
+// t=0 of the ROM's dispatch+rdp_locked()+verdict sequence (~540ns @ 48MHz).
+// The hook fires while SCL is high in the ACK slot; the rest of the frame
+// (~cmd + STOP) is clocked out normally afterwards (a rail dip doesn't stop
+// the master from driving the bus).
+bool i2c_bl_send_cmd_ackhook(uint8_t a, uint8_t cmd, void (*ack_hook)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr_ack_hook(cmd, ack_hook);
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    return addr_ok;
+}
+
 // Send the command frame and return immediately (no verdict wait) — leaves the
 // ROM inside its post-command processing, the window I2CGATE glitches into.
 bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd) {

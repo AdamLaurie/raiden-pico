@@ -215,7 +215,10 @@ low_boost:
 ; Not shared with the IRQ-trigger pulse generator: this SM idles at 'wait 1 irq 1'
 ; (IRQ1 is never raised by the glitch machinery).
 .program i2c_pulse_oneshot
-.side_set 1
+.side_set 1                       ; GP10 is the PIO sink; GP11/12 released to
+                                  ; inputs by i2cpulse_reattach (zero-source
+                                  ; geometry = the only one bench-proven to
+                                  ; reach the 2.1-2.28V corrupting band)
 .wrap_target
 start:
     wait 1 irq 1        side 1   ; idle: GP10 HIGH (rail up)

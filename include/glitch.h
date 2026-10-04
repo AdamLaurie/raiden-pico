@@ -43,6 +43,7 @@ bool glitch_execute(void);
 // a dedicated PIO SM drives POWER_PIN1 (GP10) — idle HIGH, dips the rail LOW
 // for `width_cycles` (6.67ns ticks @ 150MHz) after `pause_cycles` pushed per
 // shot and fired with i2cpulse_fire() (~6.7ns latency, no blocking).
+void i2cpulse_reattach(void);
 bool i2cpulse_start(uint32_t width_cycles);       // arm the SM (once per campaign)
 void i2cpulse_push_pause(uint32_t pause_cycles);  // queue this shot's PAUSE
 void i2cpulse_fire(void);                         // fire NOW (call at t=0 reference)
