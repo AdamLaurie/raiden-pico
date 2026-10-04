@@ -294,29 +294,39 @@ bool i2c_bl_get(uint8_t a) {
     if (!i2c_wr(ADDR_R(a))) { i2c_stop(); uart_cli_send("ERROR: I2C Get: read-addr NACK\r\n"); return false; }
     uint8_t n = i2c_rd(true);          // number of commands (N)
     uint8_t ver = i2c_rd(true);        // bootloader version
-    uart_cli_printf("I2C bootloader: version %u.%u, %u commands:\r\n",
-                    (ver >> 4) & 0xF, ver & 0xF, n);
-    // Enumerate each command with its AN4221 name instead of a bare hex list.
-    static const struct { uint8_t code; const char *name; } cmd_names[] = {
-        {0x00, "GET"},        {0x01, "GETVER"},     {0x02, "GETID"},
-        {0x11, "READ"},       {0x21, "GO"},         {0x31, "WRITE"},
-        {0x32, "WRITE-NS"},   {0x44, "ERASE"},      {0x45, "ERASE-EXT"},
-        {0x63, "WP"},         {0x64, "WP-NS"},      {0x73, "RP"},
-        {0x74, "RP-NS"},      {0x82, "GP"},         {0x83, "RP-EXT"},
-        {0x92, "WU"},         {0x93, "RU"},
-    };
-    uart_cli_send("  ");
-    for (int i = 0; i < n; i++) {
-        uint8_t c = i2c_rd(true);
-        const char *name = NULL;
-        for (unsigned k = 0; k < sizeof(cmd_names) / sizeof(cmd_names[0]); k++)
-            if (cmd_names[k].code == c) { name = cmd_names[k].name; break; }
-        if (name) uart_cli_printf("%02X %s", c, name);
-        else      uart_cli_printf("%02X ?", c);
-        uart_cli_send(i < n - 1 ? " | " : "\r\n");
-    }
+    uint8_t cmds[32];
+    uint32_t got = (n > sizeof(cmds)) ? sizeof(cmds) : n;
+    for (uint32_t i = 0; i < got; i++) cmds[i] = i2c_rd(true);
     i2c_rd(false);                     // trailing status (NACK last)
     i2c_stop();
+    // Same format as the UART bootloader's TARGET BL GET (stm32_bl_get).
+    uart_cli_printf("Bootloader version: %u.%u\r\n", (ver >> 4) & 0xF, ver & 0xF);
+    uart_cli_printf("Supported commands: %lu\r\n", (unsigned long)n);
+    for (uint32_t i = 0; i < got; i++) {
+        uint8_t c = cmds[i];
+        // AN4221 names; -NS/-EXT variants are I2C-only (undocumented in AN3155)
+        const char *name = "???";
+        switch (c) {
+            case 0x00: name = "GET"; break;
+            case 0x01: name = "Get Version"; break;
+            case 0x02: name = "Get ID"; break;
+            case 0x11: name = "Read Memory"; break;
+            case 0x21: name = "Go"; break;
+            case 0x31: name = "Write Memory"; break;
+            case 0x32: name = "Write Memory (no stretch)"; break;
+            case 0x44: name = "Erase"; break;
+            case 0x45: name = "Extended Erase"; break;
+            case 0x63: name = "Write Protect"; break;
+            case 0x64: name = "Write Protect (no stretch)"; break;
+            case 0x73: name = "Write Unprotect"; break;
+            case 0x74: name = "Write Unprotect (no stretch)"; break;
+            case 0x82: name = "Readout Protect"; break;
+            case 0x83: name = "Readout Protect (extended)"; break;
+            case 0x92: name = "Write Unprotect (alias)"; break;
+            case 0x93: name = "Readout Unprotect"; break;
+        }
+        uart_cli_printf("  0x%02X  %s\r\n", c, name);
+    }
     return true;
 }
 

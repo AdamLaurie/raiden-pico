@@ -1400,6 +1400,9 @@ void target_power_cycle(uint32_t time_ms) {
     uart_cli_printf("OK: Target power cycling (OFF for %u ms)...\r\n", time_ms);
     sleep_ms(time_ms);
     power_drive(power_active_mask(), true);
+    sleep_ms(POWER_ON_SETTLE_MS);   // self-settling: an immediately-following
+    // entry (TARGET I2C GET right after a cycle) used to reset a target whose
+    // POR hadn't finished — bootloader never armed, "no ACK"
     uart_cli_send("OK: Target power ON\r\n");
 }
 
