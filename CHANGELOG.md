@@ -1,3 +1,25 @@
+## [0.15] — 2026-09-30 — ROMGADGET: SRAM-boot ROM-gadget experiment (gate-2 mechanism)
+
+### Added
+- `TARGET GLITCH ROMGADGET [variant | 0xADDR]` — SRAM-boot stage2 -> boot-ROM gadget -> SWD recovery [F401]. Variants: 0=control (ROM read loop, SRAM source), 1=flash-plain, 2=flash+KEYR-unlock, 3=FPB reader-trick (stage2 programs FPB itself), 4=fetch-probe (blx a host-supplied ROM/flash address; `0xADDR` form), 5=data-read (stage2 loads from flash+ROM directly). Fault forensics in recovery: stacked-exception PC/LR, CFSR/HFSR/BFAR decode.
+- `TARGET GLITCH ROMFPB` / `ROMFPBCTL` — FPB-remap of the boot-ROM RDP checker + gated I2C command exercise, and its no-patch control (concluded: FPB regs wiped by BOR; halt kills bootloader I2C).
+
+### Changed
+- `TARGET I2C GET` now enumerates each supported command with its AN4221 name (`00 GET | 01 GETVER | ... | 93 RU`) instead of a bare hex list; unknown codes print `?`.
+- I2C bootloader timing property documented and bench-confirmed: the hardware-slave byte ACKs remove the USART path's milliseconds of sync/command/verdict jitter — frame boundaries are deterministic, which is what the I2CGATE/I2CPULSE campaigns use (STOP edge = t=0).
+- ROMGADGET argument validation: non-numeric/garbage args and unknown variants emit explicit `ERROR:` lines (cli-errors rule).
+- **`TARGET GLITCH I2CGATE [attempts] [mv]`** — brownout-dip the boot-ROM RDP check during the I2C command stretch, three rotating windows (cmd-byte / pre-STOP / post-STOP), verdict poll + full 16-byte read on ACK. Calibration mode at RDP0: NACK-on-dip = corrupted check, ACK + FF read = clean data path.
+- **`TARGET GLITCH I2CPROBE [samples] [delay_us]`** — SWD-halt mid-stretch timing recon; dumps PC/xPSR + stacked fault frame + CFSR/BFAR. `delay_us 999999` = control (no 0x11 sent). Recon-only: a halt inside the read path gates the read.
+- **`TARGET GLITCH I2CPULSE [attempts] [pause_lo] [pause_hi] [pause_step] [width]`** — PIO one-shot rail pulse (new `i2c_pulse_oneshot` program on the crowbar SM slot, INTERNAL mode): GP10 idles HIGH, dips LOW for `width` 6.67ns ticks after `pause` ticks; ns-resolution sweep. Re-anchored mid-campaign from the STOP edge to the cmd byte's ACK-slot SCL rise (new `i2c_bl_send_cmd_ackhook` primitive) — the verdict latches ~0.6us after that edge; post-frame hooks are ~400us too late.
+
+### Findings (bench)
+- I2CGATE calibration at RDP0 (200-shot run, 2.10V dips): post-STOP window corrupts the check ~47% (28 NACK / 31 ACK+clean-read); ≤2.3V never corrupts, ≤2.0V BORs (re-entry recovers). Data path proven: every ACK shot completed a clean read.
+- I2CGATE at RDP1: 450 shots across 1.95–2.25V, zero false-ACKs — a µs rail dip flips pass→fail easily but cannot forge the precise `cmp == 0xAA00` false-pass. Rail-dip primitive ruled out for RDP1 bypass.
+- I2CPROBE recon (RDP1 mule): the ROM core is ALREADY in HardFault (BFSR.IBUSERR at 0x1FFF03E2, the I2C wait-poll loop; timeout seed 0xAAAA via the 0x1FFF0C1C accept-helper) at every sampled delay 0µs–5ms — and even with no command sent — while the I2C slave hardware serves GET/GID/PROBE/verdicts autonomously. The gated-command verdict is NOT CPU-generated during the stretch; the "glitch the running rdp_locked() check" model was wrong for the I2C boot path.
+- I2CPROBE operational notes: C_DEBUGEN survives nRST, so each probe sample must POR (power-cycle) before re-entering the bootloader; the first command frame after entry+GET always NACKs (warm-up frame fixes it); `delay_us` is capped at 1e6 (a huge delay busy-waits the whole main loop).
+- I2CPULSE at RDP1 (~4500 shots, ACK-slot anchor, all geometries): zero ACKs, near-zero disturbance. Rail-depth map (50us ADC min-probe): divider geometry (1 sink vs 1 source) floors at ~2.71V width-independent — above the 2.1-2.28V corrupting band; zero-source geometry collapses the rail below BOR at ANY width (33ns suffices — no bulk holdup on this board). The open-loop PIO sink cannot reach the corrupting band; ADC feedback (the I2CGATE hook) is what makes a dip depth-controllable. A raw 0x02 liveness probe between shots wedges the slave's write path (alternating bus-dead) unless the full GETID response is drained — removed in favor of per-shot bus-dead logging.
+- I2CPULSE operational notes: the gang pins must be re-released AFTER the entry sequence (power_drive() re-drives all three as SIO outputs), and re-ganged BEFORE i2c_bl_enter (its power-up uses gpio_set_mask, a no-op on input-released pins — released pins during re-entry left the target unpowered, a 100/100 bus-dead cascade).
+
 # Changelog
 
 All notable changes to the Raiden Pico firmware. The version is the string the
@@ -7,7 +29,7 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
-## [0.14] — 2026-10-01 — Fix SWD IDCODE zero-masking + unreachable SWD DISCONNECT
+## [0.14.1] — 2026-10-01 — Fix SWD IDCODE zero-masking + unreachable SWD DISCONNECT
 
 ### Fixed
 - **`swd_detect()` no longer masks failed CPUID/DBG_IDCODE reads as success.** It
@@ -26,6 +48,43 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
   rejected as `ERROR: Unknown SWD sub-command 'DISCONNECT'` before reaching
   the handler — including the cleanup calls used throughout the SWD test
   suite, which never asserted on the response and so never caught it.
+
+## [0.14] — 2026-09-29 — STM32 bootloader over I2C (bit-banged)
+
+### Added
+- **`SWD STEP [n]`** — single-step the target core (ARMv7-M mask-interrupts-then-step
+  DHCSR sequence). **`SWD ROMREAD <addr> <len>`** — F401 boot-ROM gadget flash-dump
+  probe (single-steps the ROM's own `ldrb` read gadget past its software RDP check).
+- **`TARGET I2C <SCAN|SYNC|GET|GV|GID|READ|WRITE|GO|PROBE|ERASE|RP|RU>`** — talks to
+  the STM32 system bootloader over a bit-banged I2C master (AN4221), to test the I2C
+  boot interface the F401 boot ROM initialises but AN2606 doesn't document. Reuses
+  the target UART1 pins (**GP4=SCL, GP5=SDA**) since the bootloader locks to one
+  interface, so UART-boot and I2C-boot can never co-exist; on the target these are
+  the ROM's **I2C1 = PB6/PB7** (not PB8/PB9). Default 7-bit slave address **0x39**
+  (decoded from the ROM: `OAR1=0x4072`), overridable per command. Handles clock-
+  stretching (80 ms budget; measured worst case ~34 ms on write-commit) and the
+  AN4221 command/ACK framing. Full command set: `SCAN` (probe 0x08..0x77), `SYNC`
+  (enter+scan+Get), `GET`/`GV`/`GID`, `READ <addr> <len>`, `WRITE <addr> <hex>`,
+  `GO <addr>`, `PROBE <cmd_hex>` (gate mapping), and destructive `ERASE ALL WIPE` /
+  `RP CONFIRM` / `RU WIPE` (confirm tokens). New `src/i2c_bootloader.c`.
+- Config_none tests cover the argument-validation paths.
+
+### Verified (bench, F401 DEV_ID 0x433)
+- I2C boot interface **is reachable** on the F401 at slave 0x39 (undocumented in
+  AN2606). At RDP0 the full command set works (Write DEADBEEF → READ-back verified).
+- **RDP1 command gating mapped** (via `PROBE`): only **Get (0x00), GV (0x01),
+  GID (0x02)** and the RDP-management pair **RP/RU** are accepted; **Read (0x11),
+  Go (0x21), Write (0x31), Erase (0x44), Write-Protect (0x63) are all NACK'd**.
+  Corrects an earlier hypothesis — there is **no command-level Write+Go bypass** at
+  RDP1; the only remaining flash-read route stays the VCAP glitch of the ROM's
+  Read-Memory RDP check.
+- **Debugger-jump-to-ROM-gadget bypass tested and blocked.** At RDP1 the boot ROM
+  (0x1FFF0000) is walled off the SWD debug port exactly like flash: AHB-AP reads
+  fault (ACK=0x4) and the CPU won't execute ROM when PC is redirected there by the
+  debugger (single-step retires nothing; SRAM steps fine as control). The 30 KB
+  bootrom dump was only possible at RDP0, confirming ROM debug-access is RDP-gated.
+  So the ROM's trusted flash read is reachable only via genuine boot flow — the
+  glitch stays necessary.
 
 ## [0.13] — 2026-09-29 — SWD LEAKPROBE + flash-leak experiment (negative)
 

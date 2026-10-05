@@ -199,3 +199,35 @@ low_boost:
     nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
     set pins, 0         ; Return GP22 (GLITCH_FIRED) LOW
 .wrap
+
+; One-shot pulse for CPU-synchronous glitching (I2CPULSE):
+; CPU pushes [pause_cycles, width_cycles] then fires pio_sm_exec(jmp offset+5)
+; (wrap_target = the 'wait' instruction) to start the pulse with ~13ns latency.
+; SET pin = target-rail sink pin (GP10, active-LOW via outover invert: pulse
+; drives the pin LOW for WIDTH cycles after PAUSE cycles of HIGH).
+; Not shared with the IRQ-trigger pulse generator — this SM idles at 'wait 1 irq'
+; on IRQ1, never triggered by the glitch machinery.
+; One-shot pulse for CPU-synchronous glitching (I2CPULSE):
+; CPU pushes [pause_cycles, width_cycles] then fires pio_sm_exec(jmp to 'out x,32')
+; to start the pulse with ~13ns latency (no FIFO/blocking wait in the fire path).
+; SET pin = GP10 (POWER_PIN1). Idle = HIGH (rail powered); pulse = LOW for WIDTH
+; cycles after PAUSE cycles (sinks the target rail, exactly like the ADC-dip hook).
+; Not shared with the IRQ-trigger pulse generator: this SM idles at 'wait 1 irq 1'
+; (IRQ1 is never raised by the glitch machinery).
+.program i2c_pulse_oneshot
+.side_set 1                       ; GP10 is the PIO sink; GP11/12 released to
+                                  ; inputs by i2cpulse_reattach (zero-source
+                                  ; geometry = the only one bench-proven to
+                                  ; reach the 2.1-2.28V corrupting band)
+.wrap_target
+start:
+    wait 1 irq 1        side 1   ; idle: GP10 HIGH (rail up)
+    out x, 32           side 1   ; pause_cycles (width pre-pulled into OSR)
+pause_loop:
+    jmp x-- pause_loop  side 1   ; wait PAUSE cycles (pin stays HIGH)
+    set pins, 0         side 1   ; FIRE: GP10 LOW -> sink rail
+    mov x, osr          side 0   ; width_cycles
+width_loop:
+    jmp x-- width_loop  side 0   ; hold LOW for WIDTH cycles
+    jmp start           side 1   ; back to idle (GP10 restored HIGH)
+.wrap

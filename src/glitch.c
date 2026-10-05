@@ -1,5 +1,6 @@
 #include "glitch.h"
 #include "hardware/pio.h"
+#include "hardware/pio_instructions.h"
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/sync.h"
@@ -52,6 +53,112 @@ static uint offset_irq_trigger;
 
 // Crowbar gate pulse state (EXTERNAL power mode only)
 static bool crowbar_pulse_active = false;
+
+// ---- I2CPULSE one-shot rail pulse (CPU-synchronous, INTERNAL mode) ----
+// A dedicated i2c_pulse_oneshot SM in the crowbar SM slot (SM3 — unused in
+// INTERNAL mode). Idle: GP10 HIGH (rail up). CPU pre-loads WIDTH into Y once,
+// pushes one PAUSE value into the TX FIFO, then fires with pio_sm_exec(jmp):
+// the dip lands PAUSE ticks (6.67ns each at 150MHz) after the fire, with no
+// FIFO wait or blocking in the fire path. This is what lets the I2CGATE
+// campaign place a rail dip at ns-scale offsets inside the boot ROM's
+// clock-stretch — the CPU-side ADC dip was µs-coarse.
+#define I2C_PULSE_PIN 10   // = POWER_PIN1 (target_uart.c): target rail, sink-LOW
+static uint offset_i2c_pulse;
+static bool i2c_pulse_active = false;
+
+// (Re)claim GP10/11/12 for the PIO sink. Called from i2cpulse_start and from
+// the I2CPULSE re-entry path in target_uart.c — i2c_bl_enter's power-cycle
+// re-gangs the pins to SIO (gpio_init resets the mux), so they must be handed
+// back to the PIO or the pulse only drives GP10 against two live sources.
+void i2cpulse_reattach(void) {
+    // GP10 -> PIO sink; GP12 stays SIO HIGH (the lone source — divider
+    // geometry); GP11 floating. Zero-source collapses this mule's rail below
+    // BOR at ANY width (bench: 33ns pulse -> BOR), so the divider is the only
+    // firmware-controllable depth knob left; its transient dip depth is
+    // measured by the in-hook 50us ADC min probe.
+    gpio_init(I2C_PULSE_PIN);
+    gpio_disable_pulls(I2C_PULSE_PIN);
+    pio_gpio_init(glitch_pio, I2C_PULSE_PIN);
+    gpio_set_drive_strength(I2C_PULSE_PIN, GPIO_DRIVE_STRENGTH_12MA);
+    hw_clear_bits(&padsbank0_hw->io[I2C_PULSE_PIN], PADS_BANK0_GPIO0_ISO_BITS);
+    gpio_set_dir(11, GPIO_IN);  gpio_disable_pulls(11);
+    gpio_set_dir(12, GPIO_OUT); gpio_put(12, 1);
+    pio_sm_set_consecutive_pindirs(glitch_pio, sm_crowbar, I2C_PULSE_PIN, 1, true);
+}
+
+bool i2cpulse_start(uint32_t width_cycles) {
+    extern power_mode_t target_get_power_mode(void);
+    if (i2c_pulse_active) return true;
+    if (target_get_power_mode() != POWER_MODE_INTERNAL) return false;
+    if (flags.armed) return false;   // don't fight the trigger machinery
+
+    // The target rail is GANGED across GP10/11/12 and the pins ARE the power
+    // source. Bench-proven geometry map:
+    //   - 1 sink vs 1 source (divider): net 12mA, sag floor ~2.7V — too shallow.
+    //   - 2 sinks vs 1 source: net 12mA again — same depth (~2.87V), pointless.
+    //   - Zero source (GP11/12 released, GP10 sinks) = the I2CGATE hook
+    //     geometry, the only one reaching the 2.1-2.28V corrupting band.
+    // The earlier "collapses at ANY width" result was an artifact of the
+    // re-entry power bug (released pins + gpio_set_mask power-up), since fixed.
+    // With re-entry fixed, depth should scale with width against rail
+    // capacitance — re-measured by the width staircase.
+    // Restored by i2cpulse_stop().
+
+    offset_i2c_pulse = pio_add_program(glitch_pio, &i2c_pulse_oneshot_program);
+
+    pio_sm_config c = i2c_pulse_oneshot_program_get_default_config(offset_i2c_pulse);
+    sm_config_set_set_pins(&c, I2C_PULSE_PIN, 3);    // SET GP10/11/12 (sink gang)
+    sm_config_set_sideset_pins(&c, I2C_PULSE_PIN);   // SIDE same gang (3-wide is
+                                                     // baked into the .pio program)
+    sm_config_set_clkdiv(&c, 1.0);                   // full 150MHz: 1 tick = 6.67ns
+
+    i2cpulse_reattach();   // claim all three gang pins for the PIO
+
+    pio_sm_clear_fifos(glitch_pio, sm_crowbar);
+    pio_sm_restart(glitch_pio, sm_crowbar);
+    pio_sm_init(glitch_pio, sm_crowbar, offset_i2c_pulse, &c);
+    pio_sm_set_enabled(glitch_pio, sm_crowbar, true);
+
+    // Pre-load WIDTH into Y: push width, exec `pull block` (FIFO -> OSR), then
+    // exec `mov y, osr`. pio_sm_exec executes without advancing PC, so the SM
+    // stays parked at 'wait 1 irq 1' (never fired — IRQ1 is unused by the
+    // glitch machinery). Y then survives every shot (mov x, y copies it).
+    pio_sm_put_blocking(glitch_pio, sm_crowbar, width_cycles);
+    pio_sm_exec(glitch_pio, sm_crowbar, pio_encode_pull(true, true));
+    pio_sm_exec(glitch_pio, sm_crowbar, pio_encode_mov(pio_y, pio_osr));
+
+    i2c_pulse_active = true;
+    return true;
+}
+
+void i2cpulse_push_pause(uint32_t pause_cycles) {
+    if (!i2c_pulse_active) return;
+    // Drop any stale unconsumed pause, then push this shot's value. The shot's
+    // `out x, 32` (first instruction after fire) consumes exactly one entry.
+    pio_sm_clear_fifos(glitch_pio, sm_crowbar);
+    pio_sm_put(glitch_pio, sm_crowbar, pause_cycles);
+}
+
+void i2cpulse_fire(void) {
+    if (!i2c_pulse_active) return;
+    // Jump the PC straight to the `out x, 32` (start + 1): executes next cycle,
+    // ~6.7ns fire latency. The SM then runs pause -> LOW -> width -> back to wait.
+    pio_sm_exec(glitch_pio, sm_crowbar, pio_encode_jmp(offset_i2c_pulse + 1));
+}
+
+void i2cpulse_stop(void) {
+    if (!i2c_pulse_active) return;
+    pio_sm_set_enabled(glitch_pio, sm_crowbar, false);
+    pio_remove_program(glitch_pio, &i2c_pulse_oneshot_program, offset_i2c_pulse);
+    // Hand GP10/GP11 back to SIO at HIGH and re-gang GP12 so normal power
+    // control works again (GP11 was PIO-driven in i2cpulse_start)
+    gpio_init(I2C_PULSE_PIN);
+    gpio_set_dir(I2C_PULSE_PIN, GPIO_OUT);
+    gpio_put(I2C_PULSE_PIN, 1);
+    gpio_init(11);               gpio_set_dir(11, GPIO_OUT);  gpio_put(11, 1);
+    gpio_set_dir(12, GPIO_OUT);  gpio_put(12, 1);
+    i2c_pulse_active = false;
+}
 
 // Track which trigger programs are loaded (avoid removing unloaded programs)
 static bool trigger_programs_loaded = false;
