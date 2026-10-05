@@ -859,6 +859,84 @@ Dump complete: 131072 bytes received
 [7] Power cycling target...
 ```
 
+### 5. Finding a Glitch Window by Halting (halt-as-probe recon)
+
+The workflow above injects a fault and searches for a window by trial and error. This campaign inverts that: instead of firing energy and hoping to land near a target instruction, **fire a debug halt and simply look**. A halt is a zero-width "glitch" — it injects nothing, so it can't corrupt the target — but frozen at a chosen offset from a deterministic trigger edge, it answers the one question every glitch campaign has to guess otherwise: *where is the CPU, relative to the instruction I want to corrupt, at each point in the window?*
+
+The example: locating the RDP check that guards the STM32 bootloader's **Read Memory command (0x11)**, delivered over the undocumented **I2C boot interface** (see `TARGET GLITCH I2CGATE`/`I2CPROBE` above). On the wire, the sequence is fully deterministic — slave address, command byte, checksum, and the bus clock-stretch while the bootloader evaluates the command — so the edge at the end of the command frame is a trustworthy t=0. The same technique works for any target whose interesting instruction sits at a fixed offset from a repeatable trigger edge (a UART command byte, a GPIO pulse, a clock edge).
+
+#### Phase 1 — Establish the deterministic anchor
+
+The probe and the eventual glitch must share the same t=0, or the window map is meaningless. For the I2C bootloader, t=0 is the ACK of the command byte — the moment the target commits to processing the command:
+
+```bash
+# Reset target into the I2C bootloader and confirm the slave answers
+TARGET I2C GET          # bootloader version + command list (proves entry + ACK path)
+```
+
+If you're mapping a UART target instead, the equivalent anchor is the TX edge of the command byte (see `TRIGGER UART`); the rest of this campaign is identical.
+
+#### Phase 2 — Sweep the halt offset and record PC
+
+Each probe cycle boots the target fresh (a halt wedges the bootloader's I2C slave — one boot per sample is the cost of clean data), sends the raw 0x11 command frame, waits exactly `delay_us`, then SWD-halts and dumps PC / xPSR plus the stacked exception frame:
+
+```bash
+# Control first: no command sent — baseline for what the core does idle
+TARGET GLITCH I2CPROBE 1 999999
+
+# Sweep the window: where is the PC at t+0us, t+50us, t+200us... after the frame
+TARGET GLITCH I2CPROBE 5 0
+TARGET GLITCH I2CPROBE 5 50
+TARGET GLITCH I2CPROBE 5 200
+TARGET GLITCH I2CPROBE 5 1000
+TARGET GLITCH I2CPROBE 5 5000
+```
+
+Each sample prints `PC` / `xPSR`, or — if the core is in an exception — `EXC_RETURN`, the exception number, and the **stacked fault frame**: the faulted-at PC (the instruction the CPU was executing when the fault hit), LR, CFSR, and BFAR. That distinction is the payoff of halting instead of injecting: a faulted core tells you *both* where execution stopped and why.
+
+Example output from the bench campaign (RDP1 mule):
+
+```
+I2CPROBE: halt mid-stretch, sweep PC at 50us after 0x11 cmd frame (5 samples)
+  [1] EXC_RETURN=0xFFFFFFFE exc#=3 faulted-at PC=0x1FFF03E2 LR=0x1FFF0487 CFSR=0x00000101 BFAR=0x00000000
+  ...
+I2CPROBE: 5 samples — halt-fail 0, cmd-fail 0
+  PC histogram:
+    0xFFFFFFFE x5
+```
+
+#### Phase 3 — Read the map (and what it can rule out)
+
+Interpret each bucket against the target's disassembly (the faulted-at PC from the stacked frame, not the live PC, is what you match against instructions):
+
+- **PC = your target instruction or its compare branch** → you have a live window; the glitch (rail dip, EM pulse, clock glitch) must land at exactly that offset. Proceed to Phase 4.
+- **PC = exception (`EXC_RETURN`)** everywhere, including the no-command control → the code you wanted to corrupt isn't running at all at any sampled point. On the bench F401 the core was **already HardFaulted at every delay (0µs–5ms), even with no command sent** — faulted on its own instruction fetch (`BFSR.IBUSERR`) inside the ROM's I2C wait loop — while the I2C slave hardware kept serving commands autonomously. The verdict being glitched is produced by slave hardware + pre-fault state, not by a CPU instruction during the window.
+- **PC cycles between a small set of addresses** → a polling loop; the instruction of interest executes once per loop iteration, so the real window is (loop period / iterations), not the whole stretch.
+
+This is the campaign's verdict function, and it's why halt-first is cheap: on the bench mule, Phase 3 *ended* the campaign. A rail-dip/EMFI sweep there would have burned thousands of shots corrupting a window with no check running in it. Note the asymmetry the probe exposed that pure glitching would never have surfaced: I2CGATE/I2CPULSE dips *did* change verdicts (47% corruption at RDP0) — but only by disturbing the hardware state machine, never by corrupting an executing instruction, because there wasn't one.
+
+#### Phase 4 — Convert the window map into glitch parameters
+
+If Phase 3 found a live window, the offsets where PC sits on the target instruction become the glitch sweep's pause range. The map is in microseconds from the same anchor the glitch engine fires from, so it transfers 1:1:
+
+```bash
+# Example: probe showed PC on the RDP compare at t+1.2us..t+2.1us after the ACK
+# (150MHz ticks: 1.2us = 180 ticks, 2.1us = 315 ticks). Sweep that band with
+# the ns-resolution I2C pulse engine (pauses in 6.67ns ticks, swept lo..hi):
+TARGET GLITCH I2CPULSE 300 180 315 1 20
+# ...or, for engines driven by SET PAUSE/WIDTH + ARM/GLITCH, step PAUSE across
+# the window manually: SET PAUSE 180 -> GLITCH, SET PAUSE 181 -> GLITCH, ...
+```
+
+For the I2C path specifically, the ACK-slot-anchored pulse engine (`I2CPULSE`) and the ADC-feedback depth control (`I2CGATE`) already fire from this exact anchor; a positive Phase-3 result is precisely what would justify re-running those campaigns on a part whose check *is* CPU-executed (e.g. the F205/F427 targets in the Joe Grand/Wouters EMFI work — see TODO.md).
+
+#### Method notes
+
+- **Cost per sample is one boot.** Halting while the slave is clock-stretching wedges the bootloader, so every probe pays a fresh `target_power_cycle` + `i2c_bl_enter` + GET + warm-up. With POR (not nRST!) between samples — `C_DEBUGEN` survives nRST and would leave the core boot-held.
+- **The halt itself perturbs nothing you're measuring** — PC, xPSR, and the stacked frame are frozen state — but *attaching* SWD can perturb peripherals; the control sample (no command) exists precisely to separate that from command-driven behavior.
+- **Sampling bias is real**: SWD attach takes ~ms, so delays below ~50µs are approximations of "immediately after the frame." The bench sweep still resolved the question because the answer was constant (HardFault) across four orders of magnitude — a narrow live window would need the ns-resolution variant (halt via PIO/DMACC loop or EMFI-based single-shot freeze) instead.
+- **Negative results are results.** An all-exception histogram is evidence about *where the verdict is actually computed* (CPU vs dedicated hardware state machine), which redirects the whole attack — on this bench it redirected from CPU-glitching toward slave-hardware state as the only remaining bypass surface.
+
 ## Heatmap Visualization Tools
 
 The project includes Python scripts for automated XY scanning with real-time heatmap visualization.
