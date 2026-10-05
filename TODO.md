@@ -74,10 +74,46 @@ re-porting the STOP kill to F4 (see the F4 bench-test debug-kill note above).
 If it fails on F1 too, STOP is genuinely a dead end and BYPASS (POR) stays the
 only method.
 
+## Try EMFI on the I2C-boot RDP gate (Joe Grand two-fault mapping)
+
+**Context:** the I2CGATE / I2CPULSE rail-dip campaigns are closed negative
+(~5500 RDP1 shots, zero false-ACKs) — see memory `project_f401_rdp1_fpb_trilemma`
+and the Joe Grand reference (`reference_joe_grand_stm32_fault_injection`).
+Grand/Wouters (REcon 2026, repo `joegrand/stm32-fault-injection`) bypass the same
+class of gate — the RDP check inside the Read Memory (0x11) bootloader command —
+with **EMFI, not voltage glitching**: ChipSHOUTER + per-device tuned probe
+POSITION over the die (CNC-swept), re-glitched on every 256-byte read call,
+triggered from the READ_MEMORY command byte's TX edge then refined with
+power-analysis (SAD) triggering to kill UART jitter. Our I2C ACK-slot anchor
+already solves their jitter problem with ns determinism; what we lack is the
+**spatial axis** (a global rail dip hits every transistor → corruption-or-BOR,
+never a surgical compare flip) and their shaped-dip mechanism.
+
+**Attack to try:** EMFI probe over the F401 mule's die, fired at our I2C
+cmd-byte ACK-slot anchor (reuse `i2c_bl_send_cmd_ackhook` / the I2CGATE
+classification harness: ACK-read vs NACK vs BOR vs corruption), sweep probe XY
+via the GRBL stage + ChipSHOUTER 300–350 V + width/offset like notebook 3a.
+Calibration on an RDP0 mule first (flags A0..AF, per the 2026-10-04 redo), then
+RDP1. Success = false-ACK on a gated 0x11 at RDP1.
+
+**Open caveat:** our I2CPROBE halt-recon shows the F401 ROM core HardFaults while
+the I2C slave serves commands autonomously — unknown whether the verdict path on
+this part is CPU-executed (their F205/F427 per-command glitch working suggests
+theirs is) and hence whether a spatial fault can flip it. That question is itself
+worth answering: a zero-result across a swept spatial grid would be evidence the
+F401's slave-hardware verdict isn't faultable this way.
+
+**Also from the repo, unexplored here:** their glitch #1 (RDP2→RDP1 downgrade)
+corrupts option-byte loading DURING POWER-UP (nRST-triggered, verified via JTAG
+OPTCR 0x40023C14 SPRMOD bit) — a different attack point than anything we've tried
+on this mule, and the relevant one if we ever meet an RDP2 part.
+
 ## Follow-ups
 
 - **F2 / F3 BYPASS payloads.** Same pattern. F3 is Cortex-M4 (like F4, needs the
   reader trick). F2 is Cortex-M3 (like F1) but has **no target type** in
   `stm32_target.c` yet — add `TARGET_STM32F2` + its info + `SET TARGET STM32F2`.
 - **RDP2 → RDP1 downgrade** (separate, harder): needs a power-signature trigger
-  and a fast crowbar we don't have yet.
+  and a fast crowbar we don't have yet. (Note: the Joe Grand repo's glitch #1
+  above is a proven recipe for exactly this on F2/F4 — power-up option-byte
+  corruption, OPTCR SPRMOD as the success oracle.)
