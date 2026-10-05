@@ -1,3 +1,29 @@
+## [0.16] — 2026-10-05 — SWD auto-attach-under-reset for sleeping targets
+
+### Fixed
+- **SWD now attaches to a running target that sleeps, without a manual `CONNECTRST`.**
+  On a target whose firmware enters a low-power loop (`WFI`/`WFE`/STOP), the AHB
+  bus clock is gated, so every AHB-AP *memory* access WAITs forever (ACK=0x2)
+  even though the DP link and AP *register* access (IDR/CSW/TAR) stay alive. A
+  plain `SWD CONNECT` therefore reported success while `IDCODE`/`READ`/`FLASH`/
+  `HALT` all failed with "Could not read CPUID/debug registers". `swd_ensure_connected()`
+  (the auto-connect used by every memory-touching SWD command) now probes real
+  memory access with a DHCSR read after connecting; if it WAITs out, it escalates
+  to connect-under-reset — vector-catching the core at the reset vector before
+  firmware can re-enter the sleep loop — and re-checks. Verified on an
+  STM32F103RB (Nucleo MB1136) whose firmware sleeps: plain `SWD IDCODE` now
+  returns CPUID `0x411FC231` / STM32F1 Medium-density where it previously needed
+  a hand-typed `SWD CONNECTRST`. The escalation is generic (any sleeping Cortex-M),
+  only triggers when memory is otherwise unreachable, and prints a one-line notice
+  when it halts the core under reset.
+- **`SWD HALT` no longer resumes an already-halted core.** Its first step cleared
+  C_HALT (enable-debug-without-halt) before requesting the halt; on a target that
+  is only reachable while halted (sleeping/blank core caught under reset), that
+  resume made it inaccessible and the re-halt timed out. `swd_halt()` now returns
+  success immediately when the core is already halted (S_HALT + C_DEBUGEN set),
+  which is also the correct answer for halt-when-already-halted. No change for a
+  normally running target (it still falls through to the robust halt loop).
+
 ## [0.15] — 2026-09-30 — ROMGADGET: SRAM-boot ROM-gadget experiment (gate-2 mechanism)
 
 ### Added

@@ -327,14 +327,42 @@ bool swd_is_connected(void) {
     return connected;
 }
 
-bool swd_ensure_connected(void) {
-    if (connected)
+// Probe whether the AHB-AP can actually reach target memory. The DP link and AP
+// *register* access (IDR/CSW/TAR) stay alive even when the core is asleep, so a
+// plain connect looks fine while every AHB *memory* access WAITs forever. One
+// DHCSR read tells them apart; clear the sticky WAIT it leaves on failure.
+static bool swd_mem_access_works(void) {
+    uint32_t tmp;
+    swd_clear_errors();
+    if (swd_read_mem(DHCSR, &tmp, 1) == 1)
         return true;
+    swd_clear_errors();
+    return false;
+}
+
+bool swd_ensure_connected(void) {
     // Energise the target before connecting — covers the power-off boot default,
     // so SWD READ/WRITE/HALT (and breakpoint helpers) work without a host POWER ON.
-    extern void target_power_ensure_on(void);
-    target_power_ensure_on();
-    return swd_connect();
+    if (!connected) {
+        extern void target_power_ensure_on(void);
+        target_power_ensure_on();
+        if (!swd_connect())
+            return false;
+    }
+
+    // A plain connect only proves the DP is up. If the core is in a low-power
+    // state (WFI/WFE/STOP) its AHB clock is gated and every memory access WAITs,
+    // so IDCODE/READ/FLASH/HALT all fail even though CONNECT reported success.
+    // Vector-catch the core under reset — this halts it at the reset vector
+    // before firmware can re-enter the sleep loop — and re-check. This makes the
+    // common "running target that sleeps" case work without a manual CONNECTRST.
+    if (swd_mem_access_works())
+        return true;
+
+    printf("[SWD] Core not answering memory access (asleep?) — attaching under reset\r\n");
+    if (!swd_connect_under_reset())
+        return false;
+    return swd_mem_access_works();
 }
 
 // (Forward declarations moved above swd_deinit)
@@ -778,6 +806,17 @@ static bool mem_write16(uint32_t addr, uint16_t val) {
 }
 
 bool swd_halt(void) {
+    // If the core is already halted (e.g. we attached under reset to a sleeping
+    // target, leaving it caught at the reset vector), don't resume it first:
+    // Step 1 below clears C_HALT, and a blank/sleeping target becomes
+    // inaccessible the instant it runs, so the re-halt would never land. A halt
+    // request on an already-halted core is a success — confirm and return.
+    uint32_t dhcsr0;
+    if (mem_read32(DHCSR, &dhcsr0) && dhcsr0 != 0xFFFFFFFF &&
+        (dhcsr0 & 0xF000FFF0) == 0 &&
+        (dhcsr0 & ((1 << 17) | (1 << 0))) == ((1 << 17) | (1 << 0)))  // S_HALT | C_DEBUGEN
+        return true;
+
     // BMP-style robust halt: loop until S_HALT is confirmed.
     // Step 1: Enable debug first (C_DEBUGEN without C_HALT)
     if (!mem_write32(DHCSR, DBGKEY | 0x1))
