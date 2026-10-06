@@ -261,6 +261,57 @@ static bool resolve_mem_alias(const char *name, uint32_t *addr, uint32_t *size_o
     return true;
 }
 
+// Shared bootloader sync sequence used by BOTH the explicit `TARGET SYNC` command
+// and the auto-sync inside `TARGET BL *`, so the two can never diverge again.
+// (Previously the auto-sync was a near-duplicate that OMITTED target_power_ensure_on(),
+// so `TARGET BL GV` would NACK where an explicit `TARGET SYNC` succeeded.)
+// Caller must have already validated target type != TARGET_NONE. Returns true on sync.
+static bool target_bl_sync_sequence(uint32_t baud, uint32_t crystal_khz,
+                                    uint32_t reset_delay_ms, uint32_t retries) {
+    // Release the SWD debug port so the target can reset into the bootloader.
+    extern void swd_deinit(void);
+    extern bool swd_is_connected(void);
+    extern void target_power_cycle(uint32_t time_ms);
+    bool was_swd = swd_is_connected();
+    swd_deinit();
+    // If SWD was active, power-cycle to fully clear Cortex-M debug state
+    // (nRST alone doesn't clear a debug halt on Cortex-M3).
+    if (was_swd) {
+        target_power_cycle(100);
+        sleep_ms(100);
+    }
+
+    // Ensure the target is powered before reset/bootloader entry (covers the
+    // power-off boot default). THIS is the step the old auto-sync was missing.
+    target_power_ensure_on();
+
+    // STM32: BOOT0 HIGH before reset (bootloader mode).
+    if (target_is_stm32(target_get_type())) {
+        gpio_init(PIN_BOOT0);
+        gpio_set_dir(PIN_BOOT0, GPIO_OUT);
+        gpio_put(PIN_BOOT0, 1);
+        uart_cli_send("OK: BOOT0 = HIGH\r\n");
+    }
+
+    if (retries < 1) retries = 1;
+    for (uint32_t retry = 0; retry < retries; retry++) {
+        if (retry > 0)
+            uart_cli_printf("Retry %u/%u...\r\n", retry, retries);
+        uart_cli_send("Resetting target...\r\n");
+        target_reset_execute();
+        uart_cli_printf("Waiting %u ms for target to boot...\r\n", reset_delay_ms);
+        sleep_ms(reset_delay_ms);
+        uart_cli_send("Entering bootloader mode...\r\n");
+        if (target_enter_bootloader(baud, crystal_khz))
+            return true;
+        if (retry < retries - 1) {
+            uart_cli_send("Sync failed, retrying...\r\n");
+            sleep_ms(100);
+        }
+    }
+    return false;
+}
+
 void command_parser_execute(cmd_parts_t *parts) {
     if (!parts || parts->count == 0) {
         return;
@@ -418,6 +469,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
         uart_cli_send("TARGET GLITCH CLEANWAKE          - Control: SRAM-boot + STOP/wake, no debug, try flash read\r\n");
         uart_cli_send("TARGET GLITCH SHADOWCHAR [n]     - Characterize POR power-up window (t_vdd..t_nrst) for shadow-load glitch\r\n");
+        uart_cli_send("TARGET GLITCH SHADOWTRACE [samples] [reps] [hold_nrst] - ADC1/GP27 shunt current trace of POR window (hold_nrst=1 holds core in reset to ID features)\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
         uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
@@ -518,7 +570,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.16\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.19\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1124,81 +1176,22 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[1], "BOOTLOADER") == 0 ||
                    strcmp(parts->parts[1], "SYNC") == 0) {
-            // Release SWD debug port so target can reset into bootloader
-            extern void swd_deinit(void);
-            extern bool swd_is_connected(void);
-            bool was_swd = swd_is_connected();
-            swd_deinit();
+            uint32_t baud = 115200;        // Default baud
+            uint32_t crystal_khz = 12000;  // Default 12MHz crystal
+            uint32_t reset_delay_ms = 500; // Default 500ms boot delay
+            uint32_t retries = 5;          // Default 5 retries
+            if (parts->count >= 3) baud = atoi(parts->parts[2]);
+            if (parts->count >= 4) crystal_khz = atoi(parts->parts[3]);
+            if (parts->count >= 5) reset_delay_ms = atoi(parts->parts[4]);
+            if (parts->count >= 6) { retries = atoi(parts->parts[5]); if (retries < 1) retries = 1; }
 
-            // If SWD was active, power-cycle to fully clear Cortex-M debug state
-            // (nRST alone doesn't clear debug halt on Cortex-M3)
-            if (was_swd) {
-                extern void target_power_cycle(uint32_t time_ms);
-                target_power_cycle(100);
-                sleep_ms(100);
-            }
-
-            uint32_t baud = 115200;       // Default baud
-            uint32_t crystal_khz = 12000; // Default 12MHz crystal
-            uint32_t reset_delay_ms = 500; // Default 500ms delay for bootloader to initialize
-            uint32_t retries = 5;         // Default 5 retries
-            if (parts->count >= 3) {
-                baud = atoi(parts->parts[2]);
-            }
-            if (parts->count >= 4) {
-                crystal_khz = atoi(parts->parts[3]);
-            }
-            if (parts->count >= 5) {
-                reset_delay_ms = atoi(parts->parts[4]);
-            }
-            if (parts->count >= 6) {
-                retries = atoi(parts->parts[5]);
-                // Ensure at least 1 retry
-                if (retries < 1) {
-                    retries = 1;
-                }
-            }
-
-            // Check target type before doing anything
             if (target_get_type() == TARGET_NONE) {
                 api_error("ERROR: No target type set. Use TARGET <LPC|STM32F1|STM32F3|...> first\r\n");
                 goto api_response;
             }
 
-            // Ensure the target is powered before reset/bootloader entry (covers
-            // the power-off boot default — no host POWER ON needed).
-            target_power_ensure_on();
-
-            // For STM32, set BOOT0 HIGH before reset (bootloader mode)
-            bool is_stm32 = target_is_stm32(target_get_type());
-            if (is_stm32) {
-                gpio_init(PIN_BOOT0);
-                gpio_set_dir(PIN_BOOT0, GPIO_OUT);
-                gpio_put(PIN_BOOT0, 1);
-                uart_cli_send("OK: BOOT0 = HIGH\r\n");
-            }
-
-            // Try up to specified times to sync with target
-            bool sync_success = false;
-            for (uint32_t retry = 0; retry < retries; retry++) {
-                if (retry > 0) {
-                    uart_cli_printf("Retry %u/%u...\r\n", retry, retries);
-                }
-                uart_cli_send("Resetting target...\r\n");
-                target_reset_execute();
-                uart_cli_printf("Waiting %u ms for target to boot...\r\n", reset_delay_ms);
-                sleep_ms(reset_delay_ms);
-                uart_cli_send("Entering bootloader mode...\r\n");
-                if (target_enter_bootloader(baud, crystal_khz)) {
-                    sync_success = true;
-                    break;
-                }
-                if (retry < retries - 1) {  // Don't print on last retry
-                    uart_cli_send("Sync failed, retrying...\r\n");
-                    sleep_ms(100);  // Small delay between retries
-                }
-            }
-            if (!sync_success) {
+            // Shared sequence — identical to the TARGET BL auto-sync path.
+            if (!target_bl_sync_sequence(baud, crystal_khz, reset_delay_ms, retries)) {
                 uart_cli_printf("ERROR: Failed to sync with target after %u attempts\r\n", retries);
             }
         } else if (strcmp(parts->parts[1], "SEND") == 0) {
@@ -1441,42 +1434,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                     }
                 }
 
-                // Auto-sync: if bootloader not synced, run TARGET SYNC automatically
+                // Auto-sync: if the bootloader isn't synced, run the EXACT SAME
+                // sequence as the explicit `TARGET SYNC` (shared helper) so the two
+                // can't diverge. (The old inline copy omitted target_power_ensure_on(),
+                // which is why `TARGET BL GV` NACKed where `TARGET SYNC` worked.)
                 if (!target_is_bl_synced()) {
                     if (target_get_type() == TARGET_NONE) {
                         api_error("ERROR: No target type set. Use TARGET <LPC|STM32F1|STM32F3|...> first\r\n");
                         goto api_response;
                     }
                     uart_cli_send("Bootloader not synced — running TARGET SYNC...\r\n");
-
-                    extern void swd_deinit(void);
-                    extern bool swd_is_connected(void);
-                    if (swd_is_connected()) {
-                        swd_deinit();
-                        target_power_cycle(100);
-                        sleep_ms(100);
-                    }
-
-                    bool is_stm32 = target_is_stm32(target_get_type());
-                    if (is_stm32) {
-                        gpio_init(PIN_BOOT0);
-                        gpio_set_dir(PIN_BOOT0, GPIO_OUT);
-                        gpio_put(PIN_BOOT0, 1);
-                    }
-
-                    bool synced = false;
-                    for (uint32_t retry = 0; retry < 5; retry++) {
-                        if (retry > 0)
-                            uart_cli_printf("Retry %u/5...\r\n", retry);
-                        target_reset_execute();
-                        sleep_ms(500);
-                        if (target_enter_bootloader(115200, 12000)) {
-                            synced = true;
-                            break;
-                        }
-                        sleep_ms(100);
-                    }
-                    if (!synced) {
+                    if (!target_bl_sync_sequence(115200, 12000, 500, 5)) {
                         api_error("ERROR: Auto-sync failed — check wiring and target power\r\n");
                         goto api_response;
                     }
@@ -1659,6 +1627,17 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error("ERROR: Usage: TARGET I2C <SCAN|SYNC|GET|GV|GID|READ <addr> <len>|WRITE <addr> <hex>|GO <addr>|PROBE <cmd_hex>|ERASE ALL WIPE|RP CONFIRM|RU WIPE> [addr7]\r\n");
                 goto api_response;
             }
+            // The I2C ROM bootloader is STM32-only (LPC has no I2C ISP). Lock the
+            // whole TARGET I2C path to a set STM32 target type, mirroring the UART
+            // TARGET BL discipline, so destructive commands (ERASE/RP/RU/WRITE)
+            // can't run on an unknown or non-STM32 part.
+            if (!target_is_stm32(target_get_type())) {
+                if (target_get_type() == TARGET_NONE)
+                    api_error("ERROR: No target type set. Use TARGET STM32F1|STM32F3|STM32F4|STM32L4 (or SWD ID to auto-detect) first\r\n");
+                else
+                    api_error("ERROR: TARGET I2C is STM32-only (I2C ROM bootloader); current target is not STM32\r\n");
+                goto api_response;
+            }
             if (strcmp(parts->parts[2], "SCAN") == 0) {
                 i2c_bl_enter();
                 uint8_t found = 0;
@@ -1666,7 +1645,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[2], "SYNC") == 0) {
                 i2c_bl_enter();
                 uint8_t found = I2C_BL_ADDR7_DEFAULT;
-                if (i2c_bl_scan(&found)) i2c_bl_get(found);
+                if (i2c_bl_scan(&found)) {
+                    // The scan's bare address-probe (addr+STOP, no command frame)
+                    // desyncs the fresh STM32 I2C bootloader, so a Get immediately
+                    // after NACKs. Re-enter (reset to a clean state) before the
+                    // confirming Get now that we know the address.
+                    i2c_bl_enter();
+                    i2c_bl_get(found);
+                }
             } else if (strcmp(parts->parts[2], "GET") == 0) {
                 uint32_t a = I2C_BL_ADDR7_DEFAULT;
                 if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &a)) {
@@ -1794,12 +1780,13 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  I2CGATE [attempts] [mv]    - glitch boot-ROM RDP check during I2C cmd stretch\r\n");
                 uart_cli_send("  I2CPROBE [samples] [us]    - SWD-halt mid-stretch, read PC (map RDP check timing)\r\n");
                 uart_cli_send("  I2CPULSE [n] [lo] [hi] [step] [w] - PIO ns-resolution rail pulse sweep (ticks)\r\n");
+                uart_cli_send("  ETSRECON [phases] [reps]   - ADC1 equivalent-time power recon: locate RDP check in time\r\n");
                 uart_cli_send("                               (mv = dip depth in mV, 0/omit = auto-sweep 1.30->0.70V)\r\n");
             } else {
                 const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "SHADOWBYPASS", "SHADOWSCAN", "LPCBYPASS",
-                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING",
+                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "SHADOWTRACE", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING",
                                              "ROMFPB", "ROMFPBCTL", "ROMGADGET", "I2CGATE",
-                                             "I2CPROBE", "I2CPULSE"};
+                                             "I2CPROBE", "I2CPULSE", "ETSRECON"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, sizeof(glitch_cmds) / sizeof(glitch_cmds[0]), "GLITCH command")) {
                     goto api_response;
                 }
@@ -1865,31 +1852,37 @@ void command_parser_execute(cmd_parts_t *parts) {
                     // RDP1 shadow-load glitch bypass: sweep a timed voltage dip
                     // during POR recovery to corrupt the RDP option-byte shadow,
                     // then read via the FPB chain. Usage: [attempts] [dump_bytes]
-                    extern void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv);
+                    extern void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv, uint32_t off_lo, uint32_t off_hi);
                     uint32_t attempts = 2000;
                     uint32_t dump_bytes = 64;
                     uint32_t glitch_mv = 0;
+                    uint32_t off_lo = 0, off_hi = 0;   // 0/0 = default full 5..1500us sweep
+                    const char *sbusage = "ERROR: Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv] [off_lo_us] [off_hi_us]\r\n";
                     if (parts->count >= 4) {
                         if (!parse_u32(parts->parts[3], 0, &attempts)) {
-                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
-                            goto api_response;
+                            api_error(sbusage); goto api_response;
                         }
                     }
                     if (parts->count >= 5) {
                         if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
-                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
-                            goto api_response;
+                            api_error(sbusage); goto api_response;
                         }
                     }
                     if (parts->count >= 6) {
                         if (!parse_u32(parts->parts[5], 0, &glitch_mv) || glitch_mv > 3300) {
-                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv] [off_lo_us] [off_hi_us]\r\n");
                             goto api_response;
                         }
                     }
+                    if (parts->count >= 7) {
+                        if (!parse_u32(parts->parts[6], 0, &off_lo)) { api_error(sbusage); goto api_response; }
+                    }
+                    if (parts->count >= 8) {
+                        if (!parse_u32(parts->parts[7], 0, &off_hi)) { api_error(sbusage); goto api_response; }
+                    }
                     if (attempts < 1) attempts = 1;
                     if (attempts > 200000) attempts = 200000;
-                    target_power_shadowbypass(attempts, dump_bytes, glitch_mv);
+                    target_power_shadowbypass(attempts, dump_bytes, glitch_mv, off_lo, off_hi);
                 } else if (strcmp(parts->parts[2], "SHADOWSCAN") == 0) {
                     // FAST timing pre-screen: glitch POR + dip, then SWD-read
                     // FLASH_OPTCR and log any change from baseline. Usage: [attempts]
@@ -1937,6 +1930,26 @@ void command_parser_execute(cmd_parts_t *parts) {
                         goto api_response;
                     }
                     target_power_shadowchar(iters);
+                } else if (strcmp(parts->parts[2], "SHADOWTRACE") == 0) {
+                    // ADC1/GP27 shunt current trace of the POR window (localize shadow load)
+                    // [hold_nrst] 1 = drive nRST LOW throughout (core held in reset) to
+                    // identify whether a trace feature is chip reset-exit activity vs a
+                    // rig/rail/analog artifact.
+                    extern void target_power_shadowtrace(uint32_t samples, uint32_t reps, uint32_t hold_nrst);
+                    uint32_t samples = 0, reps = 0, hold_nrst = 0;
+                    if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &samples)) {
+                        api_error("ERROR: Invalid samples. Usage: TARGET GLITCH SHADOWTRACE [samples] [reps] [hold_nrst]\r\n");
+                        goto api_response;
+                    }
+                    if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &reps)) {
+                        api_error("ERROR: Invalid reps. Usage: TARGET GLITCH SHADOWTRACE [samples] [reps] [hold_nrst]\r\n");
+                        goto api_response;
+                    }
+                    if (parts->count >= 6 && !parse_u32(parts->parts[5], 0, &hold_nrst)) {
+                        api_error("ERROR: Invalid hold_nrst. Usage: TARGET GLITCH SHADOWTRACE [samples] [reps] [hold_nrst]\r\n");
+                        goto api_response;
+                    }
+                    target_power_shadowtrace(samples, reps, hold_nrst);
                 } else if (strcmp(parts->parts[2], "LITERAL") == 0) {
                     target_power_literal();
                 } else if (strcmp(parts->parts[2], "REGDUMP") == 0) {
@@ -2084,6 +2097,33 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     if (ok) target_power_i2cpulse(n, lo, hi, step, w);
+                } else if (strcmp(parts->parts[2], "ETSRECON") == 0) {
+                    // Equivalent-time-sampling power recon (ADC1/GP27 shunt):
+                    // reconstruct a sub-ADC-sample power trace of the RDP-check
+                    // window from many deterministic repeats, to LOCATE the check
+                    // in time (the halt-probe can't — SWD-attach latency >> the
+                    // ~0.6us window). Needs no glitch, so the target never BORs.
+                    // Usage: TARGET GLITCH ETSRECON [phases] [reps]
+                    extern void target_power_etsrecon(uint32_t phases, uint32_t reps);
+                    uint32_t phases = 80, reps = 300;
+                    bool ok = true;
+                    if (parts->count >= 4) {
+                        char *end = NULL;
+                        phases = (uint32_t)strtoul(parts->parts[3], &end, 10);
+                        if (end == parts->parts[3] || *end != '\0' || phases == 0 || phases > 400) {
+                            uart_cli_printf("ERROR: Bad ETSRECON phases '%s' (1..400)\r\n", parts->parts[3]);
+                            ok = false;
+                        }
+                    }
+                    if (ok && parts->count >= 5) {
+                        char *end = NULL;
+                        reps = (uint32_t)strtoul(parts->parts[4], &end, 10);
+                        if (end == parts->parts[4] || *end != '\0' || reps == 0 || reps > 5000) {
+                            uart_cli_printf("ERROR: Bad ETSRECON reps '%s' (1..5000)\r\n", parts->parts[4]);
+                            ok = false;
+                        }
+                    }
+                    if (ok) target_power_etsrecon(phases, reps);
                 } else if (strcmp(parts->parts[2], "TIMING") == 0) {
                     if (parts->count < 4) {
                         // No args: list breakpoints

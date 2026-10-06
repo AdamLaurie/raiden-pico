@@ -45,6 +45,8 @@ bool i2c_bl_cmd_with_hook(uint8_t addr7, uint8_t cmd, void (*hook)(void), void (
 // lands INSIDE the slave's ACK-slot clock-stretch; the rest of the frame is
 // clocked out normally afterwards.
 bool i2c_bl_send_cmd_ackhook(uint8_t addr7, uint8_t cmd, void (*ack_hook)(void));
+// Hook fires AFTER the ACK rise (t0), SCL held high — basis for ETS power recon.
+bool i2c_bl_send_cmd_postackhook(uint8_t addr7, uint8_t cmd, void (*post_hook)(void));
 bool i2c_bl_gv(uint8_t addr7);                                   // 0x01 Get Version & Read Protection Status
 bool i2c_bl_wait_status(uint8_t addr7, int retries, bool *status_ack);  // poll post-command ACK/NACK verdict (I2CGATE)
 bool i2c_bl_read_frames(uint8_t addr7, uint32_t address, uint8_t *out, uint32_t len);  // finish an accepted 0x11

@@ -1,6 +1,6 @@
 ---
 name: version-bump
-description: Firmware-change discipline for Raiden Pico — ANY change to the firmware (src/*.c, src/*.pio, include/*.h that alters the built raiden_pico.uf2's behavior or output) MUST bump the firmware version string in the SAME change. The version is what the VERSION command prints, in src/command_parser.c. Also: if any source file is touched between testing and committing/pushing, a full flash + retest is required before the push. Invoke whenever you edit firmware source, are about to build + flash a firmware change, or are about to commit/push firmware.
+description: Firmware-change discipline for Raiden Pico — any firmware change (src/*.c, src/*.pio, include/*.h that alters the built raiden_pico.uf2's behavior or output) that will be committed/pushed MUST carry a version bump relative to the version LIVE on main. The bump is per released batch, NOT per edit: once the current uncommitted working tree is already ahead of main's version, further edits in the same uncommitted batch need NO additional bump. The version is what the VERSION command prints, in src/command_parser.c. Also: if any source file is touched between testing and committing/pushing, a full flash + retest is required before the push. Invoke whenever you edit firmware source, are about to build + flash a firmware change, or are about to commit/push firmware.
 ---
 
 # Every firmware change bumps the version
@@ -12,8 +12,23 @@ can't tell whether a fix or feature is really on the part. This bites hardest on
 this project because flashing is a manual drag-drop dance; the `VERSION` readout
 is the only confirmation the right firmware landed.
 
-**Rule: any change that alters the firmware's behavior or output MUST bump the
-version in the SAME change (same commit as the code).**
+**Rule: a firmware behavior/output change that you commit/push MUST be accompanied
+by a version that is higher than the one LIVE on `main`, in the same commit as the
+code.**
+
+The bump is measured **against `main` (the last committed/pushed version), not your
+working tree**, and it is **per released batch, not per edit**:
+
+- If `main` is at `vX.Y` and your uncommitted work is still at `vX.Y`, bump once
+  (to `vX.(Y+1)`) — that single bump covers the whole uncommitted batch.
+- If your uncommitted tree is **already** ahead of `main` (you bumped earlier in
+  this batch), **do NOT bump again** for subsequent edits/flash cycles before the
+  commit. Re-incrementing per edit just churns the version.
+- You only need a *new* bump once the current batch has been committed/pushed and
+  you start the next change on top of it.
+
+So the question is never "did I edit firmware?" — it's "**is my working-tree version
+already ahead of `main`?**" If yes, you're done; if no, bump once.
 
 ## Where the version lives
 
@@ -70,7 +85,8 @@ change the binary, so they need a test re-run but not a re-flash.
 ## Checklist
 
 - [ ] Did this change alter firmware behavior or output (`src/*.c`, `src/*.pio`,
-      `include/*.h`)? → bump the version.
+      `include/*.h`)? → ensure the working-tree version is ahead of `main`. If it
+      already is (you bumped earlier in this uncommitted batch), do NOT bump again.
 - [ ] **No firmware source edited since the last flash+test?** If any was, re-flash
       the freshly-built firmware and re-run the tests green BEFORE committing/pushing.
 - [ ] Version string in `src/command_parser.c` (VERSION handler) updated, bumped

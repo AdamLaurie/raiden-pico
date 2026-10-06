@@ -194,6 +194,38 @@ bool i2c_bl_send_cmd_ackhook(uint8_t a, uint8_t cmd, void (*ack_hook)(void)) {
     return addr_ok;
 }
 
+// Like send_cmd_ackhook, but the hook fires immediately AFTER the ACK-clock
+// rise (scl_hi) — i.e. at t0 of the ROM's dispatch+rdp_locked()+verdict
+// sequence — while the master HOLDS SCL high (does not clock further). The ROM
+// runs the check ~0.6us after t0 regardless of further clocking (it has the cmd
+// byte + ACK already), so a hook that busy-waits then samples the rail images
+// the check WITHOUT shifting it — the basis for equivalent-time sampling. Used
+// by ETSRECON. The frame is then finished normally (checksum + STOP); the read
+// NACKs (at RDP1) / needs no address (we only want the check to execute).
+bool i2c_bl_send_cmd_postackhook(uint8_t a, uint8_t cmd, void (*post_hook)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    // clock out the command byte, MSB first
+    for (int i = 7; i >= 0; i--) {
+        if (cmd & (1u << i)) sda_hi(); else sda_lo();
+        dly();
+        scl_hi(); dly();
+        scl_lo(); dly();
+    }
+    sda_hi();                 // release SDA for the ACK
+    dly();
+    scl_hi();                 // ACK clock rises  == t0 reference
+    if (post_hook) post_hook();   // fires AFTER t0, SCL held high (no coupling)
+    dly();
+    (void)sda_get();          // ACK bit (ignored — recon only cares the check ran)
+    scl_lo(); dly();
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    return addr_ok;
+}
+
 // Send the command frame and return immediately (no verdict wait) — leaves the
 // ROM inside its post-command processing, the window I2CGATE glitches into.
 bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd) {
@@ -261,11 +293,17 @@ void i2c_bl_enter(void) {
     gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 0);
     i2c_pins_init();
 
+    // Reset into the bootloader. If SWD was live, first do a full POR to clear the
+    // Cortex-M debug domain (nRST alone doesn't), THEN pulse nRST so the SWJ-DP
+    // drops SWD mode and the ROM re-runs its I2C interface detection cleanly.
+    // A lone post-SWD power-cycle (even 300ms) left the target debug-held / not in
+    // the I2C bootloader (no ACK), needing a manual TARGET POWER CYCLE after SWD ID
+    // — this mirrors the UART TARGET SYNC path (power-cycle + reset), which works
+    // after SWD ID.
     if (was_swd) {
-        target_power_cycle(150);   // POR with BOOT0=1 -> clean bootloader boot
-    } else {
-        swd_nrst_pulse(20);        // plain reset into the bootloader
+        target_power_cycle(300);   // POR with BOOT0=1 clears the debug domain
     }
+    swd_nrst_pulse(20);            // reset into the bootloader (BOOT0=1)
     sleep_ms(60);                  // ROM comes up + interface detection arms
     uart_cli_send("OK: target reset into bootloader; I2C master on GP4=SCL/GP5=SDA\r\n");
 }
