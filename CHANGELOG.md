@@ -1,3 +1,21 @@
+## [0.19] — 2026-10-06 — Lock TARGET I2C to STM32 + robust post-SWD I2C POR
+
+### Fixed
+- **`TARGET I2C` now requires a set STM32 target type**, mirroring the UART
+  `TARGET BL` discipline. The I2C ROM bootloader is STM32-only (LPC has no I2C
+  ISP), but the I2C path previously ran with no target type set — so destructive
+  commands (`ERASE ALL WIPE`, `RP CONFIRM`, `RU WIPE`, `WRITE`) could fire on an
+  unknown or non-STM32 part. Now rejects `TARGET_NONE` ("set a type / SWD ID
+  first") and non-STM32 types up front.
+- **`i2c_bl_enter()` now does a full POR *and* an nRST pulse after SWD.** After
+  `SWD ID`, `TARGET I2C SYNC` needed a manual `TARGET POWER CYCLE` first: the
+  was-SWD path did only a power-cycle (no nRST), which left the SWJ-DP in SWD mode
+  / debug-held, so the ROM never re-ran its I2C interface detection (no ACK) — and
+  a longer power-cycle alone did not fix it. It now power-cycles (POR, 300ms, to
+  clear the debug domain) **then pulses nRST** so the SWJ-DP drops SWD mode and the
+  bootloader comes up clean — mirroring the UART `TARGET SYNC` path (power-cycle +
+  reset), which already worked after `SWD ID`.
+
 ## [0.18] — 2026-10-06 — Bootloader sync fixes + SHADOWTRACE POR characterisation
 
 ### Fixed — bootloader sync

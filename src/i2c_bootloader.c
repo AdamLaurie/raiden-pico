@@ -293,11 +293,17 @@ void i2c_bl_enter(void) {
     gpio_init(PIN_BOOT1); gpio_set_dir(PIN_BOOT1, GPIO_OUT); gpio_put(PIN_BOOT1, 0);
     i2c_pins_init();
 
+    // Reset into the bootloader. If SWD was live, first do a full POR to clear the
+    // Cortex-M debug domain (nRST alone doesn't), THEN pulse nRST so the SWJ-DP
+    // drops SWD mode and the ROM re-runs its I2C interface detection cleanly.
+    // A lone post-SWD power-cycle (even 300ms) left the target debug-held / not in
+    // the I2C bootloader (no ACK), needing a manual TARGET POWER CYCLE after SWD ID
+    // — this mirrors the UART TARGET SYNC path (power-cycle + reset), which works
+    // after SWD ID.
     if (was_swd) {
-        target_power_cycle(150);   // POR with BOOT0=1 -> clean bootloader boot
-    } else {
-        swd_nrst_pulse(20);        // plain reset into the bootloader
+        target_power_cycle(300);   // POR with BOOT0=1 clears the debug domain
     }
+    swd_nrst_pulse(20);            // reset into the bootloader (BOOT0=1)
     sleep_ms(60);                  // ROM comes up + interface detection arms
     uart_cli_send("OK: target reset into bootloader; I2C master on GP4=SCL/GP5=SDA\r\n");
 }

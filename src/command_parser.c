@@ -570,7 +570,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.18\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.19\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1625,6 +1625,17 @@ void command_parser_execute(cmd_parts_t *parts) {
             // bootloader and drives I2C — never mixes with a USART 0x7F sync.
             if (parts->count < 3) {
                 api_error("ERROR: Usage: TARGET I2C <SCAN|SYNC|GET|GV|GID|READ <addr> <len>|WRITE <addr> <hex>|GO <addr>|PROBE <cmd_hex>|ERASE ALL WIPE|RP CONFIRM|RU WIPE> [addr7]\r\n");
+                goto api_response;
+            }
+            // The I2C ROM bootloader is STM32-only (LPC has no I2C ISP). Lock the
+            // whole TARGET I2C path to a set STM32 target type, mirroring the UART
+            // TARGET BL discipline, so destructive commands (ERASE/RP/RU/WRITE)
+            // can't run on an unknown or non-STM32 part.
+            if (!target_is_stm32(target_get_type())) {
+                if (target_get_type() == TARGET_NONE)
+                    api_error("ERROR: No target type set. Use TARGET STM32F1|STM32F3|STM32F4|STM32L4 (or SWD ID to auto-detect) first\r\n");
+                else
+                    api_error("ERROR: TARGET I2C is STM32-only (I2C ROM bootloader); current target is not STM32\r\n");
                 goto api_response;
             }
             if (strcmp(parts->parts[2], "SCAN") == 0) {
