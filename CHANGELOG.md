@@ -1,3 +1,74 @@
+## [0.18] — 2026-10-06 — Bootloader sync fixes + SHADOWTRACE POR characterisation
+
+### Fixed — bootloader sync
+- **`TARGET BL` auto-sync now runs the exact same sequence as explicit `TARGET SYNC`.**
+  The two had diverged: the inline auto-sync copy **omitted `target_power_ensure_on()`**,
+  so `TARGET BL GV/GET/GID` would NACK ("No response — run TARGET SYNC first") where an
+  explicit `TARGET SYNC` beforehand succeeded. Both paths now call one shared
+  `target_bl_sync_sequence()` helper, so they cannot drift apart again.
+- **Stale `bootloader_synced` latch.** The flag was only cleared on a target-type
+  change — never on a reset or power-cycle. So after any reset/power-cycle (including
+  the ones SHADOWTRACE/SHADOWBYPASS perform) the Pico still believed it was synced,
+  **skipped auto-sync**, and `TARGET BL` failed with "No response" without even trying.
+  Now cleared in both `target_reset_execute()` and `target_power_cycle()`.
+- **`TARGET I2C SYNC` desync.** The bus scan's bare address probe (address + STOP, no
+  command frame) desynced the freshly-reset STM32 I2C bootloader, so SYNC's confirming
+  Get then NACKed (while `TARGET I2C GET`, which skips the scan, worked). SYNC now
+  re-enters the bootloader (clean reset) after the scan, before the Get.
+
+### Added — SHADOWTRACE POR characterisation (`TARGET GLITCH SHADOWTRACE [samples] [reps] [hold_nrst]`)
+- **`hold_nrst=1`** drives nRST low throughout the capture (core held in reset), to
+  classify a trace feature as chip reset-exit activity vs a rig/rail/analog artifact.
+  (Used to identify the dominant ~1.4ms POR dip as the reset-INDEPENDENT internal
+  regulator/VCAP inrush — NOT the option-byte load.)
+- **nRST-referenced output**: detects the GP15 nRST rising edge during capture and
+  reports every row relative to it (`n=` column + `SHADOWTRACE_NRST_US:` line).
+- **Un-clipped visualisation**: ASCII bars auto-zoom to the settled band (the rail-
+  charge ramp no longer squashes plateau detail), plus a full-sample `SHADOWTRACE_CSV:`
+  line for external plotting at arbitrary scale.
+
+## [0.17] — 2026-10-05 — Fix RDP-campaign test apparatus + trustworthy I2CPROBE catch-state
+
+### Added
+- **I2CPROBE now reports catch-state** so its PC histogram is interpretable
+  (audit gap): it reads **DHCSR before halting** (S_HALT/S_SLEEP → core was
+  already stopped/waiting, PC is NOT a freshly-caught running addr) and **DFSR
+  after** (HALTED bit → our halt caught it). Summary tallies clean-caught vs
+  pre-HALTED vs pre-SLEEP vs EXC/faulted. Only clean-caught PCs locate running
+  code; a histogram dominated by pre-HALT/SLEEP/EXC means the halt cannot catch
+  the core there (and the earlier "core already in HardFault during I2C service"
+  reading was a halt-intrusion artifact, not a target property).
+
+### Fixed (test-validity bugs found in an audit of the v0.15 campaigns)
+- **I2CPULSE PIO one-shot ignored BOTH sweep parameters.** `i2c_pulse_oneshot`
+  (`glitch.pio`) read PAUSE via `out x,32` with autopull DISABLED, so `out`
+  shifted stale OSR (= WIDTH) instead of the FIFO PAUSE, and the post-fire
+  `mov x,osr` read an emptied OSR (= 0). Net: the LOW dip was a fixed ~1–2 cycles
+  (~13 ns) at an offset tied to the WIDTH value, and the swept PAUSE/WIDTH did
+  nothing. The ~4500-shot RDP1 result ("open-loop PIO sink cannot reach the
+  corrupting band") therefore characterised a degenerate 13 ns pulse, not the
+  intended window — **that negative is void.** Fixed: PAUSE is now pulled from the
+  TX FIFO each shot (`pull block; out x,32`) and WIDTH is taken from Y (loaded once
+  at start via `mov x,y`), so both parameters are live.
+- **I2CGATE / I2CPULSE did not re-fire the warm-up frame after an in-loop
+  re-entry.** The pre-loop ungated `0x02` warm-up (the first frame after a fresh
+  entry always NACKs on a cold slave) was not repeated after the in-loop
+  `i2c_bl_enter()` re-boots that follow a BOR/bus-dead. In an aggressive dip
+  campaign (frequent BORs) the attempt right after each re-entry ate a guaranteed
+  cold-slave NACK, which — with the rail dipped — was tallied as a "corrupted
+  check HIT". Since RDP0 timing is calibrated by requiring corruption-rate > 0,
+  this could validate the WRONG window and send the RDP1 search off-target. Fixed:
+  a warm-up `0x02` frame is now fired after every re-entry in both campaigns.
+
+### Changed — honest read classification (rdp-payload-check discipline)
+- I2CGATE/I2CPULSE no longer count an **all-0xFF read as a "clean read / data path
+  proven"** success. A blank/erased chip, a blocked read, and a poison return are
+  indistinguishable at 0xFF, so all-FF is now reported as **INCONCLUSIVE**; only a
+  **non-FF** read is meaningful (at RDP0 it must recover the known marker to prove
+  the path; at RDP1 it is a dump). Summaries now split `non-FF/real` vs
+  `all-FF/inconclusive` vs `read-fail`, warn when zero non-FF reads were seen
+  (data path unproven), and no longer imply an RDP1 gated-NACK is a bypass.
+
 ## [0.16] — 2026-10-05 — SWD auto-attach-under-reset for sleeping targets
 
 ### Fixed

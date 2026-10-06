@@ -674,3 +674,43 @@ class TestRomgadgetErrors:
         r = raiden.cmd("TARGET GLITCH ROMGADGET WIBBLE")
         assert "ERROR" in r
         assert "Bad ROMGADGET variant" in r
+
+
+# ── TARGET GLITCH ETSRECON (cli-errors rule: explicit errors) ──
+
+class TestEtsreconErrors:
+    """ETSRECON's run path drives I2C + ADC on hardware (never run here);
+    these cover only the argument-validation error paths, which are USB-only."""
+
+    def test_etsrecon_garbage_phases(self, raiden):
+        # non-numeric phases must error, not strtoul->0 and launch the sweep
+        r = raiden.cmd("TARGET GLITCH ETSRECON WIBBLE")
+        assert "ERROR" in r
+        assert "Bad ETSRECON phases" in r
+
+    def test_etsrecon_phases_out_of_range(self, raiden):
+        r = raiden.cmd("TARGET GLITCH ETSRECON 9999")
+        assert "ERROR" in r
+        assert "Bad ETSRECON phases" in r
+
+    def test_etsrecon_garbage_reps(self, raiden):
+        r = raiden.cmd("TARGET GLITCH ETSRECON 80 WIBBLE")
+        assert "ERROR" in r
+        assert "Bad ETSRECON reps" in r
+
+
+# ── TARGET GLITCH SHADOWTRACE (cli-errors rule: explicit errors) ──
+
+class TestShadowtraceErrors:
+    """SHADOWTRACE drives POR power-cycling + ADC1 capture on hardware (never run
+    here); these cover only the argument-validation error paths (USB-only)."""
+
+    def test_shadowtrace_garbage_samples(self, raiden):
+        r = raiden.cmd("TARGET GLITCH SHADOWTRACE WIBBLE")
+        assert "ERROR" in r
+        assert "Invalid samples" in r
+
+    def test_shadowtrace_garbage_reps(self, raiden):
+        r = raiden.cmd("TARGET GLITCH SHADOWTRACE 1400 WIBBLE")
+        assert "ERROR" in r
+        assert "Invalid reps" in r

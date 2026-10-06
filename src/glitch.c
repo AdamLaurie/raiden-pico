@@ -134,15 +134,16 @@ bool i2cpulse_start(uint32_t width_cycles) {
 void i2cpulse_push_pause(uint32_t pause_cycles) {
     if (!i2c_pulse_active) return;
     // Drop any stale unconsumed pause, then push this shot's value. The shot's
-    // `out x, 32` (first instruction after fire) consumes exactly one entry.
+    // `pull block` (first instruction after fire) consumes exactly one entry.
     pio_sm_clear_fifos(glitch_pio, sm_crowbar);
     pio_sm_put(glitch_pio, sm_crowbar, pause_cycles);
 }
 
 void i2cpulse_fire(void) {
     if (!i2c_pulse_active) return;
-    // Jump the PC straight to the `out x, 32` (start + 1): executes next cycle,
-    // ~6.7ns fire latency. The SM then runs pause -> LOW -> width -> back to wait.
+    // Jump the PC straight to the `pull block` (start + 1): executes next cycle,
+    // ~6.7ns fire latency. The SM then runs pull(pause) -> pause -> LOW -> width
+    // -> back to wait.
     pio_sm_exec(glitch_pio, sm_crowbar, pio_encode_jmp(offset_i2c_pulse + 1));
 }
 

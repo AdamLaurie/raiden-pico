@@ -194,6 +194,38 @@ bool i2c_bl_send_cmd_ackhook(uint8_t a, uint8_t cmd, void (*ack_hook)(void)) {
     return addr_ok;
 }
 
+// Like send_cmd_ackhook, but the hook fires immediately AFTER the ACK-clock
+// rise (scl_hi) — i.e. at t0 of the ROM's dispatch+rdp_locked()+verdict
+// sequence — while the master HOLDS SCL high (does not clock further). The ROM
+// runs the check ~0.6us after t0 regardless of further clocking (it has the cmd
+// byte + ACK already), so a hook that busy-waits then samples the rail images
+// the check WITHOUT shifting it — the basis for equivalent-time sampling. Used
+// by ETSRECON. The frame is then finished normally (checksum + STOP); the read
+// NACKs (at RDP1) / needs no address (we only want the check to execute).
+bool i2c_bl_send_cmd_postackhook(uint8_t a, uint8_t cmd, void (*post_hook)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    // clock out the command byte, MSB first
+    for (int i = 7; i >= 0; i--) {
+        if (cmd & (1u << i)) sda_hi(); else sda_lo();
+        dly();
+        scl_hi(); dly();
+        scl_lo(); dly();
+    }
+    sda_hi();                 // release SDA for the ACK
+    dly();
+    scl_hi();                 // ACK clock rises  == t0 reference
+    if (post_hook) post_hook();   // fires AFTER t0, SCL held high (no coupling)
+    dly();
+    (void)sda_get();          // ACK bit (ignored — recon only cares the check ran)
+    scl_lo(); dly();
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    return addr_ok;
+}
+
 // Send the command frame and return immediately (no verdict wait) — leaves the
 // ROM inside its post-command processing, the window I2CGATE glitches into.
 bool i2c_bl_send_cmd_raw(uint8_t a, uint8_t cmd) {

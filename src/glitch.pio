@@ -201,19 +201,19 @@ low_boost:
 .wrap
 
 ; One-shot pulse for CPU-synchronous glitching (I2CPULSE):
-; CPU pushes [pause_cycles, width_cycles] then fires pio_sm_exec(jmp offset+5)
-; (wrap_target = the 'wait' instruction) to start the pulse with ~13ns latency.
-; SET pin = target-rail sink pin (GP10, active-LOW via outover invert: pulse
-; drives the pin LOW for WIDTH cycles after PAUSE cycles of HIGH).
-; Not shared with the IRQ-trigger pulse generator — this SM idles at 'wait 1 irq'
-; on IRQ1, never triggered by the glitch machinery.
-; One-shot pulse for CPU-synchronous glitching (I2CPULSE):
-; CPU pushes [pause_cycles, width_cycles] then fires pio_sm_exec(jmp to 'out x,32')
-; to start the pulse with ~13ns latency (no FIFO/blocking wait in the fire path).
-; SET pin = GP10 (POWER_PIN1). Idle = HIGH (rail powered); pulse = LOW for WIDTH
-; cycles after PAUSE cycles (sinks the target rail, exactly like the ADC-dip hook).
+; WIDTH is loaded once into Y at start (i2cpulse_start: push WIDTH, pull, mov y,osr).
+; Per shot the CPU pushes PAUSE to the TX FIFO (i2cpulse_push_pause) then fires
+; pio_sm_exec(jmp to the 'pull block' at offset+1). The dip lands PAUSE cycles
+; (6.67ns each at 150MHz) after the fire and holds LOW for WIDTH cycles.
+; SET/SIDE pin = GP10 (POWER_PIN1). Idle = HIGH (rail up); pulse = LOW (sinks rail).
 ; Not shared with the IRQ-trigger pulse generator: this SM idles at 'wait 1 irq 1'
 ; (IRQ1 is never raised by the glitch machinery).
+;
+; FIX (2026-10-05): the previous version read PAUSE via `out x,32` with autopull
+; DISABLED, so `out` shifted stale OSR (=WIDTH) instead of the FIFO PAUSE, and
+; the post-fire `mov x,osr` read an emptied OSR (=0) -> dip width was a fixed
+; ~1 cycle and the swept PAUSE/WIDTH did nothing. Now PAUSE is pulled from the
+; FIFO each shot and WIDTH is taken from Y, so both sweep parameters are live.
 .program i2c_pulse_oneshot
 .side_set 1                       ; GP10 is the PIO sink; GP11/12 released to
                                   ; inputs by i2cpulse_reattach (zero-source
@@ -222,11 +222,12 @@ low_boost:
 .wrap_target
 start:
     wait 1 irq 1        side 1   ; idle: GP10 HIGH (rail up)
-    out x, 32           side 1   ; pause_cycles (width pre-pulled into OSR)
+    pull block          side 1   ; FIRE entry (offset+1): PAUSE <- TX FIFO -> OSR
+    out x, 32           side 1   ; X = PAUSE
 pause_loop:
     jmp x-- pause_loop  side 1   ; wait PAUSE cycles (pin stays HIGH)
     set pins, 0         side 1   ; FIRE: GP10 LOW -> sink rail
-    mov x, osr          side 0   ; width_cycles
+    mov x, y            side 0   ; X = WIDTH (Y set once at start)
 width_loop:
     jmp x-- width_loop  side 0   ; hold LOW for WIDTH cycles
     jmp start           side 1   ; back to idle (GP10 restored HIGH)
