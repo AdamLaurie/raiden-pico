@@ -16,13 +16,20 @@ fi
 
 echo "Using Pico SDK at: $PICO_SDK_PATH"
 
+# Per-user build directory. CMake's configure_file re-stamps generated files'
+# mode/timestamps, which only the file's owner may do, so a build dir shared
+# between users fails with "Operation not permitted". Each user gets their own
+# (override with BUILD_DIR=... for a custom location).
+BUILD_DIR="${BUILD_DIR:-build-$(id -un)}"
+echo "Build directory: $BUILD_DIR"
+
 # Create build directory
-if [ ! -d "build" ]; then
+if [ ! -d "$BUILD_DIR" ]; then
     echo "Creating build directory..."
-    mkdir build
+    mkdir "$BUILD_DIR"
 fi
 
-cd build
+cd "$BUILD_DIR"
 
 # Run CMake
 echo "Running CMake configuration..."

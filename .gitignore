@@ -1,5 +1,6 @@
-# Build directory
+# Build directories (build/ plus per-user build-<user>/ from build.sh)
 build/
+build-*/
 
 # Generated PIO headers
 *.pio.h
