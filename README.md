@@ -613,6 +613,43 @@ Bit-banged JTAG for scanning and identifying devices. Shares clock and data pins
 **`JTAG DR <value> [bits]`** - Shift data register
 - Default: 32 bits
 
+##### ADIv6 JTAG-DP (ARM ADIv6 / DPv3 debug ports)
+
+For ARM targets whose debug port is a JTAG-DP (IR length 4) and does not speak
+SWD: bring the DP up, enumerate the APs, and read/write target memory through a
+MEM-AP. All transfers use the 35-bit JTAG-DP DPACC/APACC scan with WAIT retry.
+
+**`JTAG DPINIT`** - Reset the TAP, read TAP IDCODE + DP IDR, and request the
+debug power domains (writes CTRL/STAT `0x50000000`). Reports whether the power
+ACK bits came up — while they are down, AP reads return junk.
+
+**`JTAG CTRLSTAT`** - Read DP CTRL/STAT: the power-domain acks (top nibble) and
+the sticky error flags.
+
+**`JTAG ABORT`** - Clear the DP sticky error flags to recover after a failed
+transfer, then re-read CTRL/STAT.
+
+**`JTAG DEVICEEN [ap_base]`** - Read a MEM-AP CSW and print `DEVICEEN` (bit 6,
+which enables memory accesses through the MEM-AP) and the raw CSW. Defaults to
+MEM-AP `0x7c004000`. Run `JTAG DPINIT` first.
+
+**`JTAG APREAD <ap_base> <reg_offset>`** - Read any AP register by full ADIv6
+address (SELECT carries ADDR[31:4]; the scan's A[3:2] the low bits).
+
+**`JTAG MEMREAD <addr> [ap_base]`** - Read a 32-bit word of target memory via
+the MEM-AP (TAR + DRW). Requires CSW DeviceEn = 1.
+
+**`JTAG MEMWRITE <addr> <val> [ap_base]`** - Write a 32-bit word via the MEM-AP.
+
+**`JTAG MEMDUMP <addr> <nwords> [ap_base]`** - Block-read memory via the MEM-AP
+with TAR auto-increment (up to 1024 words per call), re-arming TAR at each 1 KB
+boundary. Output is hex lines terminated by `DUMP_END`.
+
+**`JTAG DPRAW`** - Diagnostic. Issues three raw DPACC reads of DP IDR and prints
+each 35-bit scan's raw value, ACK (bits `[2:0]`) and data (bits `[34:3]`). Use it
+to inspect the ACK encoding and the read pipeline when bringing up a new DP — a
+read's data appears on the *following* scan, so scan 1/2 should show DP IDR.
+
 #### GRBL XY Platform Control
 
 Built-in UART control for GRBL-based XY positioning platforms (CNC routers, laser cutters, etc.) useful for automated EMFI probe positioning.

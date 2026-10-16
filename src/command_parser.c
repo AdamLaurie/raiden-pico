@@ -356,8 +356,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
-            const char *jtag_subcmds[] = {"RESET", "TEST", "IDCODE", "SCAN", "IR", "DR"};
-            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 6, "JTAG sub-command")) {
+            const char *jtag_subcmds[] = {"RESET", "TEST", "IDCODE", "SCAN", "IR", "DR",
+                                          "DPINIT", "DEVICEEN", "APREAD", "MEMREAD",
+                                          "MEMWRITE", "MEMDUMP", "CTRLSTAT", "ABORT", "DPRAW"};
+            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 15, "JTAG sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "PSU") == 0) {
@@ -561,6 +563,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("JTAG SCAN              - Scan chain for devices\r\n");
         uart_cli_send("JTAG IR <value> [bits] - Shift instruction register (default 4 bits)\r\n");
         uart_cli_send("JTAG DR <value> [bits] - Shift data register (default 32 bits)\r\n");
+        uart_cli_send("JTAG DPINIT            - ADIv6 JTAG-DP bring-up + debug power request\r\n");
+        uart_cli_send("JTAG CTRLSTAT          - Read DP CTRL/STAT (power/sticky status)\r\n");
+        uart_cli_send("JTAG ABORT             - Clear DP sticky error flags\r\n");
+        uart_cli_send("JTAG DEVICEEN [ap]     - Read MEM-AP CSW + DeviceEn bit6\r\n");
+        uart_cli_send("JTAG APREAD <ap> <reg> - Read an AP register (ADIv6 full address)\r\n");
+        uart_cli_send("JTAG MEMREAD <addr>[ap]- Read a 32-bit word via MEM-AP\r\n");
+        uart_cli_send("JTAG MEMWRITE <addr> <val> [ap] - Write a 32-bit word via MEM-AP\r\n");
+        uart_cli_send("JTAG MEMDUMP <addr> <nwords> [ap] - Block-read memory via MEM-AP\r\n");
+        uart_cli_send("JTAG DPRAW             - Diagnostic: raw DPACC DPIDR scans (ack+data)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== General ==\r\n");
         uart_cli_send("VERSION                - Show firmware version and features\r\n");
@@ -570,7 +581,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.19\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.20\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -3780,13 +3791,22 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "JTAG") == 0) {
         // JTAG debug interface commands
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: JTAG <RESET|IDCODE|SCAN|IR|DR|TEST>\r\n");
+            uart_cli_send("ERROR: Usage: JTAG <RESET|IDCODE|SCAN|IR|DR|TEST|DPINIT|CTRLSTAT|ABORT|DEVICEEN|APREAD|MEMREAD|MEMWRITE|MEMDUMP|DPRAW>\r\n");
             uart_cli_send("  JTAG RESET             - Reset TAP state machine\r\n");
             uart_cli_send("  JTAG IDCODE            - Read device IDCODE\r\n");
             uart_cli_send("  JTAG SCAN              - Scan chain for devices\r\n");
             uart_cli_send("  JTAG IR <value> [bits] - Shift IR (default 4 bits)\r\n");
             uart_cli_send("  JTAG DR <value> [bits] - Shift DR (default 32 bits)\r\n");
             uart_cli_send("  JTAG TEST              - Test pin connections and RTCK\r\n");
+            uart_cli_send("  JTAG DPINIT            - ADIv6 JTAG-DP bring-up + debug power request\r\n");
+            uart_cli_send("  JTAG CTRLSTAT          - Read DP CTRL/STAT (power/sticky status)\r\n");
+            uart_cli_send("  JTAG ABORT             - Clear DP sticky error flags\r\n");
+            uart_cli_send("  JTAG DEVICEEN [ap]     - Read MEM-AP CSW + DeviceEn (bit 6)\r\n");
+            uart_cli_send("  JTAG APREAD <ap> <reg> - Read an AP register (ADIv6 full address)\r\n");
+            uart_cli_send("  JTAG MEMREAD <addr> [ap] - Read a 32-bit word via MEM-AP\r\n");
+            uart_cli_send("  JTAG MEMWRITE <addr> <val> [ap] - Write a 32-bit word via MEM-AP\r\n");
+            uart_cli_send("  JTAG MEMDUMP <addr> <nwords> [ap] - Block-read memory via MEM-AP\r\n");
+            uart_cli_send("  JTAG DPRAW             - Diagnostic: raw DPACC DPIDR scans (ack+data)\r\n");
             goto api_response;
         }
 
@@ -3942,6 +3962,162 @@ void command_parser_execute(cmd_parts_t *parts) {
 
             uint32_t result = jtag_dr_shift(value, bits);
             uart_cli_printf("OK: DR shift: in=0x%08X, out=0x%08X (%u bits)\r\n", value, result, bits);
+
+        } else if (strcmp(parts->parts[1], "DPINIT") == 0) {
+            // ADIv6 JTAG-DP bring-up: reset the TAP, read TAP IDCODE + DP IDR,
+            // and request the debug power domains.
+            uint32_t tapid = 0, dpidr = 0, cs = 0;
+            if (!jtag_adiv6_dp_init(&tapid, &dpidr, &cs)) {
+                if (tapid == 0 || tapid == 0xFFFFFFFF)
+                    api_error_printf("ERROR: no TAP (IDCODE 0x%08X) - check wiring/power\r\n", tapid);
+                else
+                    api_error_printf("ERROR: TAP ok (0x%08X) but DP not responding (DP IDR 0x%08X)\r\n",
+                                     tapid, dpidr);
+                goto api_response;
+            }
+            uart_cli_printf("OK: TAP IDCODE = 0x%08X\r\n", tapid);
+            uart_cli_printf("  DP IDR    = 0x%08X\r\n", dpidr);
+            uart_cli_printf("  CTRL/STAT = 0x%08X %s\r\n", cs,
+                            ((cs & 0xA0000000u) == 0xA0000000u) ? "(powered up)"
+                                                               : "(POWER DOWN - AP reads will be ROM junk)");
+
+        } else if (strcmp(parts->parts[1], "DEVICEEN") == 0) {
+            // CSW bit 6 (DeviceEn) of a MEM-AP. Defaults to the default MEM-AP;
+            // an optional arg overrides the AP base.
+            uint32_t ap = ADIV6_AXI_AP;
+            if (parts->count >= 3 && !parse_u32(parts->parts[2], 0, &ap)) {
+                api_error("ERROR: Invalid AP base. Usage: JTAG DEVICEEN [ap_base]\r\n");
+                goto api_response;
+            }
+            uint32_t csw = 0;
+            int de = jtag_adiv6_deviceen(ap, &csw);
+            if (de < 0) {
+                api_error("ERROR: AP CSW read failed (run JTAG DPINIT first)\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("OK: DEVICEEN=%d CSW=0x%08X AP=0x%08X\r\n", de, csw, ap);
+
+        } else if (strcmp(parts->parts[1], "APREAD") == 0) {
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: JTAG APREAD <ap_base> <reg_offset>\r\n");
+                goto api_response;
+            }
+            uint32_t ap, reg;
+            if (!parse_u32(parts->parts[2], 0, &ap) || !parse_u32(parts->parts[3], 0, &reg)) {
+                api_error("ERROR: Invalid args. Usage: JTAG APREAD <ap_base> <reg_offset>\r\n");
+                goto api_response;
+            }
+            uint32_t val = 0;
+            if (!jtag_adiv6_ap_read(ap, reg, &val)) {
+                api_error("ERROR: AP read failed\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("OK: AP[0x%08X]+0x%X = 0x%08X\r\n", ap, reg, val);
+
+        } else if (strcmp(parts->parts[1], "MEMREAD") == 0) {
+            // Read one 32-bit word of target memory via the MEM-AP (TAR + DRW).
+            if (parts->count < 3) {
+                api_error("ERROR: Usage: JTAG MEMREAD <addr> [ap_base]\r\n");
+                goto api_response;
+            }
+            uint32_t addr, ap = ADIV6_AXI_AP;
+            if (!parse_u32(parts->parts[2], 0, &addr)) {
+                api_error("ERROR: Invalid addr. Usage: JTAG MEMREAD <addr> [ap_base]\r\n");
+                goto api_response;
+            }
+            if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &ap)) {
+                api_error("ERROR: Invalid ap_base\r\n");
+                goto api_response;
+            }
+            uint32_t val = 0;
+            if (!jtag_adiv6_mem_read(ap, addr, &val)) {
+                api_error("ERROR: mem read failed (DeviceEn=0, or the bus is wedged)\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("OK: [0x%08X] = 0x%08X\r\n", addr, val);
+
+        } else if (strcmp(parts->parts[1], "CTRLSTAT") == 0) {
+            // Read DP CTRL/STAT: power-domain acks (top nibble) and sticky flags.
+            uint32_t cs = 0;
+            if (!jtag_adiv6_ctrlstat(&cs)) {
+                api_error("ERROR: CTRL/STAT read failed (run JTAG DPINIT first)\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("OK: CTRL/STAT = 0x%08X %s%s\r\n", cs,
+                            ((cs & 0xA0000000u) == 0xA0000000u) ? "(powered up)"
+                                                               : "(POWER DOWN)",
+                            jtag_adiv6_ctrlstat_sticky(cs) ? " STICKY!" : "");
+
+        } else if (strcmp(parts->parts[1], "DPRAW") == 0) {
+            // Diagnostic: dump raw DPACC DPIDR-read scans (ACK + data).
+            uint64_t raw[3] = {0, 0, 0};
+            jtag_adiv6_dpraw(raw);
+            for (int i = 0; i < 3; i++) {
+                uint32_t ack = (uint32_t)(raw[i] & 0x7u);
+                uint32_t data = (uint32_t)(raw[i] >> 3);
+                uart_cli_printf("OK: scan%d raw=0x%09llX ack=%u data=0x%08X\r\n",
+                                i, (unsigned long long)raw[i], ack, data);
+            }
+
+        } else if (strcmp(parts->parts[1], "ABORT") == 0) {
+            // Clear the DP sticky error flags and re-read CTRL/STAT.
+            bool clean = jtag_adiv6_clear_sticky();
+            uint32_t cs = 0;
+            jtag_adiv6_ctrlstat(&cs);
+            uart_cli_printf("OK: ABORT done, CTRL/STAT = 0x%08X %s\r\n", cs,
+                            clean ? "(clean)" : "(still sticky)");
+
+        } else if (strcmp(parts->parts[1], "MEMWRITE") == 0) {
+            // Write one 32-bit word of target memory via the MEM-AP (TAR + DRW).
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: JTAG MEMWRITE <addr> <val> [ap_base]\r\n");
+                goto api_response;
+            }
+            uint32_t addr, val, ap = ADIV6_AXI_AP;
+            if (!parse_u32(parts->parts[2], 0, &addr) || !parse_u32(parts->parts[3], 0, &val)) {
+                api_error("ERROR: Invalid args. Usage: JTAG MEMWRITE <addr> <val> [ap_base]\r\n");
+                goto api_response;
+            }
+            if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &ap)) {
+                api_error("ERROR: Invalid ap_base\r\n");
+                goto api_response;
+            }
+            if (!jtag_adiv6_mem_write(ap, addr, val)) {
+                api_error("ERROR: mem write failed (DeviceEn=0, or the bus is wedged)\r\n");
+                goto api_response;
+            }
+            uart_cli_printf("OK: [0x%08X] <- 0x%08X\r\n", addr, val);
+
+        } else if (strcmp(parts->parts[1], "MEMDUMP") == 0) {
+            // Block-read memory via the MEM-AP with TAR auto-increment. Capped per
+            // call to bound the USB output; chunk larger dumps on the host.
+            if (parts->count < 4) {
+                api_error("ERROR: Usage: JTAG MEMDUMP <addr> <nwords> [ap_base]\r\n");
+                goto api_response;
+            }
+            uint32_t addr, nwords, ap = ADIV6_AXI_AP;
+            if (!parse_u32(parts->parts[2], 0, &addr) || !parse_u32(parts->parts[3], 0, &nwords)) {
+                api_error("ERROR: Invalid args. Usage: JTAG MEMDUMP <addr> <nwords> [ap_base]\r\n");
+                goto api_response;
+            }
+            if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &ap)) {
+                api_error("ERROR: Invalid ap_base\r\n");
+                goto api_response;
+            }
+            if (nwords == 0 || nwords > 1024u) {
+                api_error("ERROR: nwords must be 1..1024 per call\r\n");
+                goto api_response;
+            }
+            static uint32_t dumpbuf[1024];
+            uint32_t got = jtag_adiv6_mem_read_block(ap, addr, dumpbuf, nwords);
+            uart_cli_printf("OK: DUMP 0x%08X %u/%u words\r\n", addr, got, nwords);
+            for (uint32_t i = 0; i < got; i += 8u) {
+                uart_cli_printf("%08X:", addr + i * 4u);
+                for (uint32_t j = i; j < i + 8u && j < got; j++)
+                    uart_cli_printf(" %08X", dumpbuf[j]);
+                uart_cli_send("\r\n");
+            }
+            uart_cli_send("DUMP_END\r\n");
 
         } else {
             api_error("ERROR: Unknown JTAG command\r\n");

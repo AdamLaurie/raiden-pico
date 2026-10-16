@@ -88,4 +88,35 @@ jtag_tap_state_t jtag_get_state(void);
 // Check if RTCK adaptive clocking is available
 bool jtag_rtck_available(void);
 
+// --- ARM ADIv6 JTAG-DP access ---
+// Default MEM-AP base used by the convenience commands; override per target.
+#define ADIV6_AXI_AP    0x7c004000u
+
+// Raw DP/AP register transfers (ir = DP_IR_DPACC/DP_IR_APACC, defined in jtag.c).
+bool jtag_dp_write(uint8_t ir, uint32_t reg, uint32_t val);
+bool jtag_dp_read(uint8_t ir, uint32_t reg, uint32_t *out);
+// Reset TAP, read TAP IDCODE + DP IDR, request debug power domains.
+bool jtag_adiv6_dp_init(uint32_t *tap_idcode, uint32_t *dp_idr, uint32_t *ctrlstat);
+// AP register access by full ADIv6 address (ap_base + reg offset).
+bool jtag_adiv6_ap_read(uint32_t ap_base, uint32_t reg, uint32_t *out);
+bool jtag_adiv6_ap_write(uint32_t ap_base, uint32_t reg, uint32_t val);
+// DeviceEn (CSW bit 6): 0/1, or -1 on access failure.
+int  jtag_adiv6_deviceen(uint32_t ap_base, uint32_t *csw_out);
+// One 32-bit word of target memory via the MEM-AP (TAR + DRW).
+bool jtag_adiv6_mem_read(uint32_t ap_base, uint32_t addr, uint32_t *out);
+// One 32-bit word WRITE via the MEM-AP (TAR + DRW); needs CSW DeviceEn = 1.
+bool jtag_adiv6_mem_write(uint32_t ap_base, uint32_t addr, uint32_t val);
+// Block read with MEM-AP TAR auto-increment; returns words read (stops on error).
+uint32_t jtag_adiv6_mem_read_block(uint32_t ap_base, uint32_t addr,
+                                   uint32_t *buf, uint32_t count);
+// DP CTRL/STAT read, sticky test, ABORT, and sticky-clear recovery.
+bool jtag_adiv6_ctrlstat(uint32_t *out);
+bool jtag_adiv6_ctrlstat_sticky(uint32_t cs);
+void jtag_dp_abort(uint32_t flags);
+bool jtag_adiv6_clear_sticky(void);
+// Set MEM-AP CSW: Size=word, AddrInc single (true) or off (false).
+bool jtag_adiv6_csw_config(uint32_t ap_base, bool addrinc);
+// Diagnostic: three raw DPACC DPIDR-read scans (inspect ACK + data).
+void jtag_adiv6_dpraw(uint64_t out[3]);
+
 #endif // JTAG_H

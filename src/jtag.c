@@ -442,3 +442,227 @@ uint8_t jtag_scan_chain(uint32_t *idcodes, uint8_t max_devices) {
 bool jtag_rtck_available(void) {
     return rtck_available;
 }
+
+/* ======================================================================
+ * ARM ADIv6 JTAG-DP access
+ *
+ * For ARM debug ports that are an ADIv6 / DPv3 JTAG-DP (IR length 4) and do not
+ * speak SWD. This is the memory-access debug path: bring the DP up, enumerate the
+ * APs, and read/write target memory through a MEM-AP.
+ *
+ *   - power up:  write DP CTRL/STAT (0x4) = 0x50000000 (CSYSPWRUPREQ |
+ *                CDBGPWRUPREQ), poll for the ACK bits (0xA0000000).
+ *   - AP select: ADIv6 APs are addressed by a full register address. DP
+ *                SELECT (0x8) carries ADDR[31:4]; the scan's A[3:2] field
+ *                carries ADDR[3:2]. (32-bit AP addresses, so SELECT1 stays 0.)
+ *   - MEM-AP registers are at the AP base: CSW=+0xd00, TAR=+0xd04, DRW=+0xd0c.
+ *
+ * Every transfer is the 35-bit JTAG-DP scan:
+ *   in  = (DATA[31:0] << 3) | (A[3:2] << 1) | RnW
+ *   out = (prevDATA[31:0] << 3) | ACK[2:0]
+ * A read's data is returned on the FOLLOWING transfer, so each read issues the
+ * request then clocks one more scan (RDBUFF) to shift the value out.
+ * ====================================================================== */
+
+#define DP_IR_ABORT     0x8u
+#define DP_IR_DPACC     0xAu
+#define DP_IR_APACC     0xBu
+#define DP_ACK_WAIT     0x1u
+#define DP_ACK_OK       0x2u
+// Some ADI JTAG-DP implementations report the OK/FAULT ack as 0b100 instead of
+// the nominal 0b010 (observed on a DPv3/ADIv6 part: reads return correct data
+// with ack=0b100). Accept both so the driver works on either encoding.
+#define DP_ACK_OK_ALT   0x4u
+
+static inline bool dp_ack_ok(uint8_t a) {
+    return a == DP_ACK_OK || a == DP_ACK_OK_ALT;
+}
+
+#define DP_REG_CTRLSTAT 0x4u
+#define DP_REG_SELECT   0x8u
+#define DP_REG_RDBUFF   0xCu
+
+#define AP_REG_CSW      0xd00u
+#define AP_REG_TAR      0xd04u
+#define AP_REG_DRW      0xd0cu
+
+// One raw 35-bit DPACC/APACC scan. `reg` is the register's byte address; its
+// bits [3:2] form the A field. Returns the 32-bit data shifted out (the result
+// of the PREVIOUS transfer) and the ACK of THIS one.
+static uint32_t dp_xfer(uint8_t ir, bool rnw, uint32_t reg, uint32_t wdata, uint8_t *ack) {
+    jtag_ir_shift(ir, 4);
+    uint64_t scan = ((uint64_t)wdata << 3)
+                  | (uint64_t)(((reg >> 2) & 0x3u) << 1)
+                  | (rnw ? 1u : 0u);
+    uint64_t out = jtag_dr_shift64(scan, 35);
+    if (ack) *ack = (uint8_t)(out & 0x7u);
+    return (uint32_t)(out >> 3);
+}
+
+// Retry while the DP answers WAIT.
+static uint32_t dp_xfer_retry(uint8_t ir, bool rnw, uint32_t reg, uint32_t wdata, uint8_t *ack) {
+    uint8_t a = 0;
+    uint32_t d = 0;
+    for (int i = 0; i < 32; i++) {
+        d = dp_xfer(ir, rnw, reg, wdata, &a);
+        if (a != DP_ACK_WAIT) break;
+    }
+    if (ack) *ack = a;
+    return d;
+}
+
+// Diagnostic: raw DPACC reads of DPIDR (A=00, RnW=1). Fills three raw 35-bit
+// scan outputs so the ACK (bits [2:0]) and data (bits [34:3]) can be inspected
+// directly -- a read's data appears on the FOLLOWING scan.
+void jtag_adiv6_dpraw(uint64_t out[3]) {
+    jtag_reset();
+    jtag_idle();
+    (void)jtag_dr_shift(0, 32);          // consume the TAP IDCODE
+    for (int i = 0; i < 3; i++) {
+        jtag_ir_shift(DP_IR_DPACC, 4);
+        out[i] = jtag_dr_shift64(1ull, 35);   // (data<<3)|(A=00<<1)|RnW=1
+    }
+}
+
+bool jtag_dp_write(uint8_t ir, uint32_t reg, uint32_t val) {
+    uint8_t ack;
+    dp_xfer_retry(ir, false, reg, val, &ack);
+    return dp_ack_ok(ack);
+}
+
+// Read a DP or AP register: push the read, then clock RDBUFF to shift the
+// value out (RDBUFF's scan-out carries the previous read's data).
+bool jtag_dp_read(uint8_t ir, uint32_t reg, uint32_t *out) {
+    uint8_t ack;
+    dp_xfer_retry(ir, true, reg, 0, &ack);
+    if (!dp_ack_ok(ack)) return false;
+    uint32_t d = dp_xfer_retry(DP_IR_DPACC, true, DP_REG_RDBUFF, 0, &ack);
+    if (!dp_ack_ok(ack)) return false;
+    if (out) *out = d;
+    return true;
+}
+
+// Reset the TAP, confirm the DP, request the debug power domains.
+bool jtag_adiv6_dp_init(uint32_t *tap_idcode, uint32_t *dp_idr, uint32_t *ctrlstat) {
+    jtag_reset();
+    jtag_idle();
+    uint32_t id = jtag_dr_shift(0, 32);     // IDCODE sits in DR after TAP reset
+    if (tap_idcode) *tap_idcode = id;
+    if (id == 0 || id == 0xFFFFFFFF) return false;
+
+    jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, 0);   // DPBANKSEL = 0
+
+    uint32_t idr = 0;
+    bool dpidr_ok = jtag_dp_read(DP_IR_DPACC, 0x0u /*DPIDR*/, &idr);
+    if (dp_idr) *dp_idr = idr;
+    // TAP is alive but the DPACC read of DP IDR did not return valid data: the
+    // DP is not responding to register access, so report failure.
+    if (!dpidr_ok || idr == 0 || idr == 0xFFFFFFFF) return false;
+
+    jtag_dp_write(DP_IR_DPACC, DP_REG_CTRLSTAT, 0x50000000u);
+    uint32_t cs = 0;
+    for (int i = 0; i < 50; i++) {
+        if (!jtag_dp_read(DP_IR_DPACC, DP_REG_CTRLSTAT, &cs)) break;
+        if ((cs & 0xA0000000u) == 0xA0000000u) break;   // CSYSPWRUPACK | CDBGPWRUPACK
+    }
+    if (ctrlstat) *ctrlstat = cs;
+    return true;
+}
+
+// Read one AP register (full ADIv6 register address = ap_base + reg).
+bool jtag_adiv6_ap_read(uint32_t ap_base, uint32_t reg, uint32_t *out) {
+    uint32_t full = ap_base + reg;
+    if (!jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, full & 0xFFFFFFF0u)) return false;
+    return jtag_dp_read(DP_IR_APACC, full, out);
+}
+
+bool jtag_adiv6_ap_write(uint32_t ap_base, uint32_t reg, uint32_t val) {
+    uint32_t full = ap_base + reg;
+    if (!jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, full & 0xFFFFFFF0u)) return false;
+    return jtag_dp_write(DP_IR_APACC, full, val);
+}
+
+// DeviceEn (CSW bit 6) of a MEM-AP -- when 0, the MEM-AP refuses memory
+// accesses. Returns 0/1, or -1 on access failure.
+int jtag_adiv6_deviceen(uint32_t ap_base, uint32_t *csw_out) {
+    uint32_t csw = 0;
+    if (!jtag_adiv6_ap_read(ap_base, AP_REG_CSW, &csw)) return -1;
+    if (csw_out) *csw_out = csw;
+    return (int)((csw >> 6) & 1u);
+}
+
+// Read one 32-bit word of target memory through the MEM-AP (TAR + DRW).
+bool jtag_adiv6_mem_read(uint32_t ap_base, uint32_t addr, uint32_t *out) {
+    if (!jtag_adiv6_ap_write(ap_base, AP_REG_TAR, addr)) return false;
+    return jtag_adiv6_ap_read(ap_base, AP_REG_DRW, out);
+}
+
+// Read DP CTRL/STAT (DPACC 0x4). Healthy = CSYSPWRUPACK|CDBGPWRUPACK (0xA0000000
+// in the top nibble); if the power domains are down, AP reads return junk, so
+// re-check this before trusting an AP read.
+bool jtag_adiv6_ctrlstat(uint32_t *out) {
+    if (!jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, 0u)) return false;   // DPBANKSEL=0
+    return jtag_dp_read(DP_IR_DPACC, DP_REG_CTRLSTAT, out);
+}
+
+// True if CTRL/STAT shows any sticky flag: STICKYORUN(b1), STICKYCMP(b4),
+// STICKYERR(b5), WDATAERR(b7). Any of these poisons every subsequent read.
+bool jtag_adiv6_ctrlstat_sticky(uint32_t cs) {
+    return (cs & ((1u << 1) | (1u << 4) | (1u << 5) | (1u << 7))) != 0u;
+}
+
+// Write the DP ABORT register (IR=ABORT, A=00, write). 0x1F clears all sticky
+// flags (DAPABORT|STKCMPCLR|STKERRCLR|WDERRCLR|ORUNERRCLR) -- the standard way
+// to recover the DP after a sticky error. NOTE: this does NOT clear a MEM-AP
+// transfer-in-progress wedge (CSW TrInProg, bit 7); that needs a target reset.
+void jtag_dp_abort(uint32_t flags) {
+    jtag_ir_shift(DP_IR_ABORT, 4);
+    uint64_t scan = ((uint64_t)flags << 3);   // A[3:2]=00, RnW=0
+    jtag_dr_shift64(scan, 35);
+}
+
+// Clear sticky and report whether CTRL/STAT came back clean afterwards.
+bool jtag_adiv6_clear_sticky(void) {
+    jtag_dp_abort(0x1Fu);
+    uint32_t cs = 0;
+    if (!jtag_adiv6_ctrlstat(&cs)) return false;
+    return !jtag_adiv6_ctrlstat_sticky(cs);
+}
+
+// Configure a MEM-AP CSW while preserving the prot/domain bits the device
+// already has: Size=word (0b010), AddrInc = single (0b01) or off (0b00).
+bool jtag_adiv6_csw_config(uint32_t ap_base, bool addrinc) {
+    uint32_t csw = 0;
+    if (!jtag_adiv6_ap_read(ap_base, AP_REG_CSW, &csw)) return false;
+    csw = (csw & ~0x3Fu) | (addrinc ? 0x10u : 0x00u) | 0x02u;  // [5:4]=AddrInc, [2:0]=Size
+    return jtag_adiv6_ap_write(ap_base, AP_REG_CSW, csw);
+}
+
+// Write one 32-bit word to target memory via the MEM-AP (TAR + DRW).
+// Requires the MEM-AP to permit memory access (CSW DeviceEn = 1).
+bool jtag_adiv6_mem_write(uint32_t ap_base, uint32_t addr, uint32_t val) {
+    if (!jtag_adiv6_ap_write(ap_base, AP_REG_TAR, addr)) return false;
+    return jtag_adiv6_ap_write(ap_base, AP_REG_DRW, val);
+}
+
+// Block read with TAR auto-increment. ADIv6 only guarantees the MEM-AP TAR
+// auto-increment within a 1 KB (0x400) window, so TAR is re-armed at every
+// boundary. Returns the number of words actually read; stops on the first failed
+// transfer so a wedge/sticky truncates the dump instead of returning garbage.
+uint32_t jtag_adiv6_mem_read_block(uint32_t ap_base, uint32_t addr,
+                                   uint32_t *buf, uint32_t count) {
+    if (!jtag_adiv6_csw_config(ap_base, true)) return 0;
+    uint32_t done = 0;
+    bool need_tar = true;
+    while (done < count) {
+        if (need_tar || (addr & 0x3FFu) == 0u) {
+            if (!jtag_adiv6_ap_write(ap_base, AP_REG_TAR, addr)) break;
+            need_tar = false;
+        }
+        uint32_t w = 0;
+        if (!jtag_adiv6_ap_read(ap_base, AP_REG_DRW, &w)) break;
+        buf[done++] = w;
+        addr += 4u;
+    }
+    return done;
+}

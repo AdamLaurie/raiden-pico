@@ -1,3 +1,29 @@
+## [0.20] — 2026-10-15 — ADIv6 JTAG-DP debug access (memory read/write)
+
+### Added
+- **ARM ADIv6 / DPv3 JTAG-DP support**, for debug ports that are a JTAG-DP
+  (IR length 4) and do not speak SWD: bring the DP up, enumerate the APs, and
+  read/write target memory through a MEM-AP. New CLI commands:
+  - `JTAG DPINIT` — reset the TAP, read TAP IDCODE and DP IDR, and request the
+    debug power domains (CTRL/STAT `0x50000000`; reports whether the ACK bits
+    came up, since AP reads return junk while the domains are down).
+  - `JTAG CTRLSTAT` — read DP CTRL/STAT (power-domain acks and sticky flags).
+  - `JTAG ABORT` — clear the DP sticky error flags to recover after a failed
+    transfer.
+  - `JTAG DEVICEEN [ap]` — read a MEM-AP CSW and print `DEVICEEN` (bit 6, which
+    enables memory accesses) and the raw CSW. Defaults to MEM-AP `0x7c004000`.
+  - `JTAG APREAD <ap_base> <reg_offset>` — read any AP register by its full
+    ADIv6 address (SELECT carries ADDR[31:4], the scan's A[3:2] the low bits).
+  - `JTAG MEMREAD <addr> [ap]` — read a 32-bit word via the MEM-AP (TAR + DRW).
+  - `JTAG MEMWRITE <addr> <val> [ap]` — write a 32-bit word via the MEM-AP.
+  - `JTAG MEMDUMP <addr> <nwords> [ap]` — block-read memory with TAR
+    auto-increment (up to 1024 words/call), re-arming TAR at each 1 KB boundary.
+  - `JTAG DPRAW` — diagnostic: three raw DPACC DP IDR scans, printing each scan's
+    raw value, ACK and data, for inspecting a new DP's ACK encoding and pipeline.
+- All transfers use the standard 35-bit JTAG-DP DPACC/APACC scan with WAIT retry.
+- The OK/FAULT ACK check accepts both `0b010` and `0b100`, since some ADI
+  JTAG-DP implementations report the OK ACK as `0b100`.
+
 ## [0.19] — 2026-10-06 — Lock TARGET I2C to STM32 + robust post-SWD I2C POR
 
 ### Fixed
