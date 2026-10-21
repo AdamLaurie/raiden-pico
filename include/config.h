@@ -23,7 +23,7 @@
 #define PSU_UART_ID      uart1
 #define PSU_UART_TX_PIN  10    // GP10 -> PSU RX (via MAX3232)
 #define PSU_UART_RX_PIN  11    // GP11 <- PSU TX (via MAX3232)
-#define PSU_UART_BAUD    9600  // TENMA 72-2540 / Korad default (8N1)
+#define PSU_UART_BAUD    9600  // TENMA 72-2540 / Multicomp Pro (8N1); runtime-tunable via PSU BAUD
 #define PIN_GLITCH_OUT 2       // Glitch pulse output (normal)
 #define PIN_GLITCH_OUT_INV 7   // Glitch pulse output (inverted)
 #define PIN_CLOCK 6            // Clock generator output

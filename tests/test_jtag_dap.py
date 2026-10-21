@@ -1,5 +1,5 @@
-"""Config NONE: ADIv6 JTAG-DP commands (DPINIT/CTRLSTAT/ABORT/DEVICEEN/APREAD/
-MEMREAD/MEMWRITE/MEMDUMP).
+"""Config NONE: ADIv6 JTAG-DP commands (DPINIT/PROBE/CTRLSTAT/ABORT/DEVICEEN/
+APREAD/MEMREAD/MEMWRITE/MEMDUMP).
 
 Wiring: None required. These assert the commands are registered, dispatch, and
 error explicitly on bad input. The happy path (a real memory readback) needs a
@@ -16,7 +16,7 @@ class TestJtagDapRegistration:
     def test_jtag_usage_lists_dap_commands(self, raiden):
         """Bare JTAG prints usage including the new sub-commands."""
         r = raiden.cmd("JTAG", wait=2)
-        for sub in ["DPINIT", "CTRLSTAT", "ABORT", "DEVICEEN", "APREAD",
+        for sub in ["DPINIT", "PROBE", "CTRLSTAT", "ABORT", "DEVICEEN", "APREAD",
                     "MEMREAD", "MEMWRITE", "MEMDUMP"]:
             assert sub in r, f"JTAG usage missing: {sub}"
 
@@ -37,13 +37,21 @@ class TestJtagDapDispatch:
 
     def test_dpinit_responds(self, raiden):
         r = raiden.cmd("JTAG DPINIT", wait=3)
-        # Either the DP came up (OK + TAP IDCODE) or it explicitly failed.
-        assert ("OK: TAP IDCODE" in r) or ("DP init failed" in r), r
+        # config_none must not assume a live target: accept either the DP coming
+        # up (OK + TAP IDCODE) or an explicit error (no TAP / DP not responding /
+        # check wiring) — the point is an explicit response, never a silent no-op.
+        assert ("OK: TAP IDCODE" in r) or ("ERROR" in r), r
 
     def test_deviceen_responds(self, raiden):
         r = raiden.cmd("JTAG DEVICEEN", wait=3)
         # Either a reading (DEVICEEN=0/1) or an explicit read failure.
         assert ("DEVICEEN=" in r) or ("CSW read failed" in r), r
+
+    def test_probe_responds(self, raiden):
+        r = raiden.cmd("JTAG PROBE", wait=4)
+        # Either the DP came up (OK + DP TAP, then BASEPTR / walk) or it
+        # explicitly failed — never a silent no-op.
+        assert ("OK: DP TAP" in r) or ("DP init failed" in r), r
 
 
 class TestJtagDapArgErrors:

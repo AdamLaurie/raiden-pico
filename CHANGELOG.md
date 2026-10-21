@@ -1,3 +1,63 @@
+## [0.21] — 2026-10-17 — PSU set-points, GRBL Z axis, JTAG PROBE + pin-reclaim fix
+
+### Added
+- **`PSU STATUS` now reports the configured set-points, not just the delivered
+  output.** The TENMA/Korad controller keeps no local record of values pushed
+  with `PSU VOLT` / `PSU CURR`, so there was previously no way to read back what
+  the PSU was *told* to do. STATUS now queries `VSET1?`/`ISET1?` (configured
+  voltage and current limit) and prints them above the measured `VOUT1?`/`IOUT1?`:
+  ```
+  PSU set:  Vset: 3.30 V  Iset: 0.500 A
+  PSU out:  Vout: 3.30  Iout: 0.012
+  ```
+- New driver queries `psu_read_setpoint_voltage()` / `psu_read_setpoint_current()`.
+- **PSU UART baud is now runtime-tunable via a new `PSU BAUD [rate]` command**
+  that shows or sets the rate (1200–921600) without a reflash — applied live if
+  the UART is already claimed, otherwise on the next PSU command. New driver
+  helpers `psu_get_baud()` / `psu_set_baud()`. The compiled-in default stays at
+  9600 (the verified TENMA 72-2540 / Multicomp Pro native rate); the command
+  earns its keep as a diagnostic — a baud-independent echo on every rate is how
+  we fingerprinted a dead MAX3232's TX→RX leak rather than a baud mismatch.
+- **GRBL Z axis on its own `GRBL Z ...` sub-command set.** The Z axis is only
+  needed during initial probe setup (lowering/raising the EMFI probe over the
+  DUT), never during a sweep campaign, so it is kept deliberately separate from
+  the XY `MOVE`/`STEP` commands — those still take X/Y only, so a Z move can
+  never creep into a sweep script. New commands: `GRBL Z MOVE <Z>` (absolute),
+  `GRBL Z STEP <DZ>` (relative), `GRBL Z POS`, and `GRBL Z ZERO` (set current Z
+  as zero via `G92 Z0`, leaving the X/Y origin untouched). Z moves default to a
+  slow 100 mm/min for safe descent. Same GRBL controller / shared UART1 (GP8/9);
+  new driver helpers `grbl_move_absolute_z_sync()` / `grbl_move_relative_z_sync()`.
+
+### Fixed
+- **JTAG commands now reclaim the shared debug GPIOs before each operation**, so
+  a JTAG command issued after SWD no longer reads a dead TAP (`IDCODE
+  0xFFFFFFFF`). SWD shares SWCLK/SWDIO (GP17/18) and nRST (GP15) with JTAG;
+  `SWD CONNECT` then `SWD DISCONNECT` leaves GP17/18 as high-Z inputs, but
+  `jtag_init()` latched `initialized=true` at boot and never re-asserted the
+  pins, so the bit-bang drove floating pins and the TAP never clocked (only a
+  reboot recovered it). New `jtag_ensure_pins()` re-drives GP15/17/18/19/20 to
+  their JTAG idle levels (idempotent, no clocking) and runs at the head of every
+  JTAG command — same class of latched-ownership bug as the documented UART1
+  bleed fix. Found by a full `config_none` test run leaving the target TAP
+  unresponsive; bisected to the `SWD CONNECT`→`DISCONNECT` pair.
+- **`JTAG IDCODE` now identifies TAP IDCODE `0x4BA06477`** (ARM part `0xBA06`) as a
+  CoreSight SoC-600 / ADIv6 JTAG-DP rather than reporting "unknown". The decode
+  notes this is the debug access port (not a core ID) and points at `JTAG PROBE`
+  (below) to identify the core behind it.
+- **New `JTAG PROBE`** — one-shot ADIv6 discovery that automates the manual
+  `DPINIT` → `MEMREAD` dance: it brings the DP up, reads the DP `BASEPTR` to find
+  the *root* CoreSight ROM table (instead of assuming a fixed MEM-AP base), walks
+  it, and identifies each component (trace/debug blocks by `DEVTYPE`, well-known
+  parts by part number). For each MEM-AP it prints `DeviceEn` + the debug-ROM
+  pointer and descends *through* an enabled MEM-AP into its memory-mapped ROM to
+  reach the CPU debug block (`DEVTYPE 0x15`); when a MEM-AP is `DeviceEn=0` it
+  reports that the core subsystem is powered down / held in reset and says to
+  release it and re-probe. Clears DP sticky errors as it walks. New driver
+  helpers `jtag_adiv6_dp_baseptr()` / `jtag_adiv6_dpidr1()`.
+  - Validated live against a real ADIv6 JTAG-DP target: brings the DP up, reads
+    `BASEPTR`, enumerates the root ROM table's APs/components, and correctly
+    reports a gated MEM-AP (`DeviceEn=0`) when the core subsystem is held off.
+
 ## [0.20] — 2026-10-15 — ADIv6 JTAG-DP debug access (memory read/write)
 
 ### Added

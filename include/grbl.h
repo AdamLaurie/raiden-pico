@@ -31,6 +31,11 @@ bool grbl_move_absolute_sync(float x, float y, float feedrate, uint32_t timeout_
 // Move relative and wait for completion (synchronous)
 bool grbl_move_relative_sync(float dx, float dy, float feedrate, uint32_t timeout_ms);
 
+// Z axis (separate ZAXIS command set; setup-only, not used during sweeps).
+// Absolute / relative Z move, waits for ack + idle (synchronous).
+bool grbl_move_absolute_z_sync(float z, float feedrate, uint32_t timeout_ms);
+bool grbl_move_relative_z_sync(float dz, float feedrate, uint32_t timeout_ms);
+
 // Home the machine (async)
 void grbl_home(void);
 

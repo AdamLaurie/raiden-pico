@@ -312,6 +312,145 @@ static bool target_bl_sync_sequence(uint32_t baud, uint32_t crystal_khz,
     return false;
 }
 
+// --- CoreSight ROM-table walk (ADIv6), used by JTAG PROBE ------------------
+// Each CoreSight component occupies a 4 KB block ending in ID registers.
+#define CS_PIDR0      0xFE0u
+#define CS_PIDR1      0xFE4u
+#define CS_CIDR0      0xFF0u
+#define CS_CIDR1      0xFF4u
+#define CS_CIDR3      0xFFCu
+#define CS_DEVARCH    0xFBCu
+#define CS_DEVTYPE    0xFCCu
+#define CS_MEMAP_CSW  0xD00u
+#define CS_MEMAP_BASE 0xDF8u
+#define CS_ARCHID_ROM   0x0AF7u   // CoreSight ROM table (class 9)
+#define CS_ARCHID_MEMAP 0x0A17u   // CoreSight MEM-AP
+
+// DEVTYPE (major[3:0] | sub[7:4]) names the component's function — this is the
+// reliable way to spot the CPU debug block (0x15) regardless of part number.
+static const char *cs_devtype_name(uint32_t devtype) {
+    switch (devtype & 0xFFu) {
+        case 0x11: return "trace sink: port (TPIU)";
+        case 0x12: return "trace sink: buffer (ETB)";
+        case 0x13: return "trace source: core (ETM/PTM)";
+        case 0x14: return "debug control: cross-trigger (CTI)";
+        case 0x15: return "CPU debug (processor debug logic)";
+        case 0x16: return "trace sink: router";
+        case 0x21: return "trace link: funnel/router";
+        case 0x24: return "debug control: trigger matrix";
+        case 0x45: return "debug: performance monitor (PMU)";
+        default:   return NULL;
+    }
+}
+
+// Well-known ARM CoreSight part numbers (designer assumed ARM).
+static const char *cs_part_name(uint32_t part) {
+    switch (part) {
+        case 0x906: return "CoreSight CTI";
+        case 0x907: return "CoreSight ETB";
+        case 0x908: return "CoreSight trace funnel";
+        case 0x912: return "CoreSight TPIU";
+        case 0x913: return "CoreSight ITM";
+        case 0x914: return "CoreSight SWO";
+        case 0x950: return "CoreSight PTM";
+        case 0x9A0: return "CoreSight PMU";
+        case 0x9A1: return "CoreSight TPIU-lite";
+        default:    return NULL;
+    }
+}
+
+// Read a component register in one of two address spaces: the DP's APACC space
+// (mem_ap == 0, read AP register base+reg) or the memory behind a MEM-AP
+// (mem_ap != 0, read memory address base+reg via TAR/DRW).
+static bool cs_rd(uint32_t mem_ap, uint32_t base, uint32_t reg, uint32_t *out) {
+    if (mem_ap) return jtag_adiv6_mem_read(mem_ap, base + reg, out);
+    return jtag_adiv6_ap_read(base, reg, out);
+}
+
+// Confirm a CoreSight component is present at `base` (CIDR preamble 0x0D..0xB1)
+// and read its class, part number, DEVTYPE and DEVARCH.
+static bool cs_read_component(uint32_t mem_ap, uint32_t base, uint32_t *cls,
+                              uint32_t *part, uint32_t *devtype, uint32_t *devarch) {
+    uint32_t c0 = 0, c1 = 0, c3 = 0, p0 = 0, p1 = 0;
+    if (!cs_rd(mem_ap, base, CS_CIDR0, &c0)) return false;
+    cs_rd(mem_ap, base, CS_CIDR1, &c1);
+    cs_rd(mem_ap, base, CS_CIDR3, &c3);
+    if ((c0 & 0xFFu) != 0x0Du || (c3 & 0xFFu) != 0xB1u) return false;  // not a component
+    cs_rd(mem_ap, base, CS_PIDR0, &p0);
+    cs_rd(mem_ap, base, CS_PIDR1, &p1);
+    cs_rd(mem_ap, base, CS_DEVTYPE, devtype);
+    cs_rd(mem_ap, base, CS_DEVARCH, devarch);
+    *cls  = (c1 >> 4) & 0xFu;
+    *part = ((p1 & 0xFu) << 8) | (p0 & 0xFFu);
+    return true;
+}
+
+// Depth-limited recursive ROM-table walk. In APACC space (mem_ap==0) this walks
+// the DP ROM and descends through each enabled MEM-AP into its memory-mapped
+// debug ROM (mem_ap = that AP's base). `budget` caps total components so a
+// malformed/looping table can't run away; `cpu_found` is set when a CPU-debug
+// component (DEVTYPE 0x15) is printed.
+static void cs_walk(uint32_t mem_ap, uint32_t base, int depth,
+                    int *budget, bool *cpu_found) {
+    if (depth > 4 || *budget <= 0) return;
+    uint32_t cls = 0, part = 0, devtype = 0, devarch = 0;
+    if (!cs_read_component(mem_ap, base, &cls, &part, &devtype, &devarch)) {
+        jtag_adiv6_clear_sticky();   // a faulting read poisons the DP; recover
+        return;
+    }
+    (*budget)--;
+    uint32_t archid = devarch & 0xFFFFu;
+    bool is_rom = (cls == 0x1u) || (cls == 0x9u && archid == CS_ARCHID_ROM);
+
+    if (is_rom) {
+        uart_cli_printf("  @0x%08X  ROM table (class 0x%X)\r\n", base, cls);
+        for (int i = 0; i < 256 && *budget > 0; i++) {
+            uint32_t entry = 0;
+            if (!cs_rd(mem_ap, base, (uint32_t)(i * 4), &entry)) { jtag_adiv6_clear_sticky(); break; }
+            if (entry == 0) break;                 // end of table
+            if (!(entry & 0x1u)) continue;         // entry not present
+            int32_t off = (int32_t)(entry & 0xFFFFF000u);
+            cs_walk(mem_ap, base + (uint32_t)off, depth + 1, budget, cpu_found);
+        }
+        return;
+    }
+
+    // A MEM-AP in APACC space: report reachability, then descend into its
+    // memory-mapped debug ROM — but only if memory access is enabled.
+    if (mem_ap == 0 && archid == CS_ARCHID_MEMAP) {
+        uint32_t csw = 0, apbase = 0;
+        cs_rd(0, base, CS_MEMAP_CSW, &csw);
+        cs_rd(0, base, CS_MEMAP_BASE, &apbase);
+        int deviceen = (int)((csw >> 6) & 1u);
+        bool base_present = (apbase & 0x1u) != 0u;
+        uart_cli_printf("  @0x%08X  MEM-AP  DeviceEn=%d  debug-ROM=0x%08X%s\r\n",
+                        base, deviceen, apbase & 0xFFFFF000u,
+                        base_present ? "" : " (none)");
+        if (!base_present) return;
+        if (!deviceen) {
+            uart_cli_send("      memory access DISABLED (DeviceEn=0) — core/subsystem "
+                          "powered down or held in reset; release it and re-probe\r\n");
+            return;
+        }
+        cs_walk(base, apbase & 0xFFFFF000u, depth + 1, budget, cpu_found);
+        return;
+    }
+
+    // Leaf component.
+    const char *pn = cs_part_name(part);
+    const char *dt = cs_devtype_name(devtype);
+    uart_cli_printf("  @0x%08X  part 0x%03X%s%s%s  DEVTYPE 0x%02X%s%s  ARCHID 0x%04X\r\n",
+                    base, part,
+                    pn ? " (" : "", pn ? pn : "", pn ? ")" : "",
+                    devtype & 0xFFu,
+                    dt ? " = " : "", dt ? dt : "",
+                    archid);
+    if ((devtype & 0xFFu) == 0x15u) {
+        *cpu_found = true;
+        uart_cli_send("      ^ CPU debug block — the core behind this DAP\r\n");
+    }
+}
+
 void command_parser_execute(cmd_parts_t *parts) {
     if (!parts || parts->count == 0) {
         return;
@@ -357,14 +496,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
             const char *jtag_subcmds[] = {"RESET", "TEST", "IDCODE", "SCAN", "IR", "DR",
-                                          "DPINIT", "DEVICEEN", "APREAD", "MEMREAD",
+                                          "DPINIT", "PROBE", "DEVICEEN", "APREAD", "MEMREAD",
                                           "MEMWRITE", "MEMDUMP", "CTRLSTAT", "ABORT", "DPRAW"};
-            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 15, "JTAG sub-command")) {
+            if (!match_and_replace(&parts->parts[1], jtag_subcmds, 16, "JTAG sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "PSU") == 0) {
-            const char *psu_subcmds[] = {"VOLT", "CURR", "ON", "OFF", "STATUS", "ID", "RELEASE"};
-            if (!match_and_replace(&parts->parts[1], psu_subcmds, 7, "PSU sub-command")) {
+            const char *psu_subcmds[] = {"VOLT", "CURR", "ON", "OFF", "STATUS", "ID", "BAUD", "RELEASE"};
+            if (!match_and_replace(&parts->parts[1], psu_subcmds, 8, "PSU sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TRACE") == 0 && parts->count >= 2) {
@@ -524,10 +663,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("PSU VOLT <mV>          - Set output voltage (0-30000 mV)\r\n");
         uart_cli_send("PSU CURR <mA>          - Set current limit (0-5000 mA)\r\n");
         uart_cli_send("PSU ON | OFF           - Enable / disable output\r\n");
-        uart_cli_send("PSU STATUS             - Read Vout/Iout + CV/CC + output state\r\n");
+        uart_cli_send("PSU STATUS             - Read Vset/Iset (configured) + Vout/Iout + CV/CC + output state\r\n");
         uart_cli_send("PSU ID                 - Identify the PSU (connectivity check)\r\n");
+        uart_cli_send("PSU BAUD [rate]        - Show/set PSU UART baud (default 9600; 1200-921600)\r\n");
         uart_cli_send("PSU RELEASE            - Return GP10/11 to the target power group\r\n");
-        uart_cli_send("  UART1 on GP10/GP11 @ 9600 8N1 (needs a MAX3232 on the DB9).\r\n");
+        uart_cli_send("  UART1 on GP10/GP11 @ 9600 8N1 default (PSU BAUD to change; needs a MAX3232 on the DB9).\r\n");
         uart_cli_send("  Mutually exclusive with TARGET POWER (shares GP10/11).\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
@@ -542,6 +682,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GRBL RESET             - Soft reset Grbl controller\r\n");
         uart_cli_send("GRBL TEST              - Test UART loopback\r\n");
         uart_cli_send("GRBL DEBUG             - Debug RX FIFO status\r\n");
+        uart_cli_send("  -- Z axis (setup only; separate from XY, not used in sweeps) --\r\n");
+        uart_cli_send("GRBL Z MOVE <Z> [F]    - Move Z to absolute position (mm, feedrate mm/min)\r\n");
+        uart_cli_send("GRBL Z STEP <DZ> [F]   - Move Z relative distance (mm, feedrate mm/min)\r\n");
+        uart_cli_send("GRBL Z POS             - Get current Z (and XY) position\r\n");
+        uart_cli_send("GRBL Z ZERO            - Set current Z as zero (G92 Z0; XY origin untouched)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== SWD Debug Interface (GP17=SWCLK, GP18=SWDIO) ==\r\n");
         uart_cli_send("SWD                    - Show full SWD command list\r\n");
@@ -564,6 +709,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("JTAG IR <value> [bits] - Shift instruction register (default 4 bits)\r\n");
         uart_cli_send("JTAG DR <value> [bits] - Shift data register (default 32 bits)\r\n");
         uart_cli_send("JTAG DPINIT            - ADIv6 JTAG-DP bring-up + debug power request\r\n");
+        uart_cli_send("JTAG PROBE             - DPINIT + find root ROM table + walk/ID CoreSight parts\r\n");
         uart_cli_send("JTAG CTRLSTAT          - Read DP CTRL/STAT (power/sticky status)\r\n");
         uart_cli_send("JTAG ABORT             - Clear DP sticky error flags\r\n");
         uart_cli_send("JTAG DEVICEEN [ap]     - Read MEM-AP CSW + DeviceEn bit6\r\n");
@@ -581,7 +727,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.20\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.21\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -2383,7 +2529,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern bool grbl_get_position(float *x, float *y, float *z);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: GRBL <SEND|UNLOCK|SET|HOME|MOVE|STEP|POS|TEST|DEBUG>\r\n");
+            uart_cli_send("ERROR: Usage: GRBL <SEND|UNLOCK|SET|HOME|MOVE|STEP|POS|Z|TEST|DEBUG>\r\n");
             goto api_response;
         }
 
@@ -2522,6 +2668,65 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
             } else {
                 uart_cli_send("RX FIFO is empty\r\n");
+            }
+        } else if (strcmp(parts->parts[1], "Z") == 0) {
+            // Z axis - a DELIBERATELY SEPARATE sub-command set under GRBL. The Z
+            // axis is only useful during initial probe setup, never during a
+            // sweep campaign, so Z motion is kept off the XY MOVE/STEP commands
+            // (no Z arg there) and confined here, where it cannot creep into a
+            // sweep script. Same Grbl controller, same shared UART1 on GP8/9.
+            extern bool grbl_move_absolute_z_sync(float z, float feedrate, uint32_t timeout_ms);
+            extern bool grbl_move_relative_z_sync(float dz, float feedrate, uint32_t timeout_ms);
+            const float z_default_feed = 100.0f;  // slow by default: probe descent
+
+            if (parts->count < 3) {
+                uart_cli_send("ERROR: Usage: GRBL Z <MOVE|STEP|POS|ZERO>\r\n");
+                goto api_response;
+            }
+
+            if (strcmp(parts->parts[2], "MOVE") == 0) {
+                if (parts->count < 4) {
+                    api_error("ERROR: Usage: GRBL Z MOVE <Z> [FEEDRATE] [TIMEOUT_MS]\r\n");
+                    goto api_response;
+                }
+                float z = atof(parts->parts[3]);
+                float feedrate = z_default_feed;
+                uint32_t timeout_ms = 30000;
+                if (parts->count >= 5) feedrate = atof(parts->parts[4]);
+                if (parts->count >= 6) timeout_ms = atoi(parts->parts[5]);
+                if (grbl_move_absolute_z_sync(z, feedrate, timeout_ms)) {
+                    uart_cli_printf("OK: Z move to Z=%.3f complete\r\n", z);
+                } else {
+                    api_error("ERROR: Z move failed or timeout\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "STEP") == 0) {
+                if (parts->count < 4) {
+                    api_error("ERROR: Usage: GRBL Z STEP <DZ> [FEEDRATE] [TIMEOUT_MS]\r\n");
+                    goto api_response;
+                }
+                float dz = atof(parts->parts[3]);
+                float feedrate = z_default_feed;
+                uint32_t timeout_ms = 30000;
+                if (parts->count >= 5) feedrate = atof(parts->parts[4]);
+                if (parts->count >= 6) timeout_ms = atoi(parts->parts[5]);
+                if (grbl_move_relative_z_sync(dz, feedrate, timeout_ms)) {
+                    uart_cli_printf("OK: Z step DZ=%.3f complete\r\n", dz);
+                } else {
+                    api_error("ERROR: Z step failed or timeout\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "POS") == 0) {
+                float x, y, z;
+                if (grbl_get_position(&x, &y, &z)) {
+                    uart_cli_printf("Position: Z=%.3f (X=%.3f Y=%.3f)\r\n", z, x, y);
+                } else {
+                    api_error("ERROR: Failed to get position\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "ZERO") == 0) {
+                // Set current Z as zero (G92 Z0) without touching the X/Y origin
+                grbl_send("G92 Z0");
+                uart_cli_send("OK: Current Z set as zero (Z0)\r\n");
+            } else {
+                api_error("ERROR: Unknown GRBL Z command\r\n");
             }
         } else {
             api_error("ERROR: Unknown GRBL command\r\n");
@@ -3791,7 +3996,7 @@ void command_parser_execute(cmd_parts_t *parts) {
     } else if (strcmp(parts->parts[0], "JTAG") == 0) {
         // JTAG debug interface commands
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: JTAG <RESET|IDCODE|SCAN|IR|DR|TEST|DPINIT|CTRLSTAT|ABORT|DEVICEEN|APREAD|MEMREAD|MEMWRITE|MEMDUMP|DPRAW>\r\n");
+            uart_cli_send("ERROR: Usage: JTAG <RESET|IDCODE|SCAN|IR|DR|TEST|DPINIT|PROBE|CTRLSTAT|ABORT|DEVICEEN|APREAD|MEMREAD|MEMWRITE|MEMDUMP|DPRAW>\r\n");
             uart_cli_send("  JTAG RESET             - Reset TAP state machine\r\n");
             uart_cli_send("  JTAG IDCODE            - Read device IDCODE\r\n");
             uart_cli_send("  JTAG SCAN              - Scan chain for devices\r\n");
@@ -3809,6 +4014,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  JTAG DPRAW             - Diagnostic: raw DPACC DPIDR scans (ack+data)\r\n");
             goto api_response;
         }
+
+        // Reclaim GP15/17/18/19/20 before any JTAG op — SWD shares SWCLK/SWDIO/
+        // nRST and leaves them high-Z after a disconnect, which otherwise reads a
+        // dead TAP (IDCODE 0xFFFFFFFF) until a reboot.
+        jtag_ensure_pins();
 
         if (strcmp(parts->parts[1], "RESET") == 0) {
             jtag_reset();
@@ -3880,6 +4090,14 @@ void command_parser_execute(cmd_parts_t *parts) {
                     case 0x4BA01477:
                         core_desc = "ARM Cortex-M7";
                         family    = "i.MX RT / LPC55xx — use SWD IDCODE for chip detail";
+                        break;
+                    case 0x4BA06477:
+                        // TAP IDCODE part 0xBA06 (ARM) = a CoreSight SoC-600 /
+                        // ADIv6 JTAG-DP. This names the debug access port, not the
+                        // core — enumerate the core via the AP/ROM table.
+                        core_desc = "ARM CoreSight ADIv6 JTAG-DP (DAP, part 0xBA06)";
+                        family    = "SoC-600-class debug port, not a core ID — bring it up with "
+                                    "JTAG DPINIT/PROBE, then read CPUID/ROM via JTAG MEMREAD.";
                         break;
                     default:
                         break;
@@ -3980,6 +4198,48 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_printf("  CTRL/STAT = 0x%08X %s\r\n", cs,
                             ((cs & 0xA0000000u) == 0xA0000000u) ? "(powered up)"
                                                                : "(POWER DOWN - AP reads will be ROM junk)");
+
+        } else if (strcmp(parts->parts[1], "PROBE") == 0) {
+            // Full auto: bring the DP up, find the root CoreSight ROM table via
+            // the DP BASEPTR, then walk it and identify the components (incl. the
+            // CPU debug block) — so the user doesn't hand-chain DPINIT/MEMREAD.
+            uint32_t tapid = 0, dpidr = 0, cs = 0;
+            if (!jtag_adiv6_dp_init(&tapid, &dpidr, &cs)) {
+                api_error_printf("ERROR: DP init failed (TAP 0x%08X, DP IDR 0x%08X) - check wiring/power\r\n",
+                                 tapid, dpidr);
+                goto api_response;
+            }
+            uart_cli_printf("OK: DP TAP 0x%08X  IDR 0x%08X  CTRL/STAT 0x%08X %s\r\n",
+                            tapid, dpidr, cs,
+                            ((cs & 0xA0000000u) == 0xA0000000u) ? "(powered up)" : "(POWER DOWN)");
+            // A power-up request or a stale transfer can leave a sticky error set,
+            // which poisons every subsequent read — clear it before we walk.
+            jtag_adiv6_clear_sticky();
+            uint32_t dpidr1 = 0;
+            jtag_adiv6_dpidr1(&dpidr1);
+            uint64_t base = 0;
+            bool valid = false;
+            if (!jtag_adiv6_dp_baseptr(&base, &valid)) {
+                api_error("ERROR: BASEPTR read failed (DP not answering) - try JTAG ABORT then PROBE\r\n");
+                goto api_response;
+            }
+            jtag_adiv6_clear_sticky();   // BASEPTR1 may fault on a 32-bit DP
+            uart_cli_printf("  DPIDR1 0x%08X (addr %u-bit)  BASEPTR 0x%08llX VALID=%d\r\n",
+                            dpidr1, (unsigned)(dpidr1 & 0x7Fu),
+                            (unsigned long long)base, valid ? 1 : 0);
+            if (!valid || base == 0) {
+                uart_cli_send("  No valid root ROM table — the debug subsystem is likely powered "
+                              "down or held in reset.\r\n");
+                uart_cli_send("  Next: hold the target in reset while connecting, or power its "
+                              "application domain, then JTAG PROBE again.\r\n");
+                goto api_response;
+            }
+            uart_cli_send("  Walking CoreSight ROM table:\r\n");
+            int budget = 64;
+            bool cpu = false;
+            cs_walk(0, (uint32_t)base, 0, &budget, &cpu);
+            if (!cpu)
+                uart_cli_send("  (no CPU-debug component (DEVTYPE 0x15) reached — core subsystem off/held)\r\n");
 
         } else if (strcmp(parts->parts[1], "DEVICEEN") == 0) {
             // CSW bit 6 (DeviceEn) of a MEM-AP. Defaults to the default MEM-AP;
@@ -4223,12 +4483,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern int  psu_id(char *buf, size_t buflen);
         extern int  psu_read_voltage(char *buf, size_t buflen);
         extern int  psu_read_current(char *buf, size_t buflen);
+        extern int  psu_read_setpoint_voltage(char *buf, size_t buflen);
+        extern int  psu_read_setpoint_current(char *buf, size_t buflen);
         extern bool psu_read_status(uint8_t *status_out);
+        extern uint32_t psu_get_baud(void);
+        extern bool psu_set_baud(uint32_t baud);
 
         if (parts->count < 2) {
-            uart_cli_send("Usage: PSU <VOLT <mV>|CURR <mA>|ON|OFF|STATUS|ID|RELEASE>\r\n");
-            uart_cli_printf("  UART1 on GP%d/GP%d @ %d 8N1 (TENMA 72-2540 / Korad); needs a MAX3232 on the DB9\r\n",
-                            PSU_UART_TX_PIN, PSU_UART_RX_PIN, PSU_UART_BAUD);
+            uart_cli_send("Usage: PSU <VOLT <mV>|CURR <mA>|ON|OFF|STATUS|ID|BAUD [rate]|RELEASE>\r\n");
+            uart_cli_printf("  UART1 on GP%d/GP%d @ %lu 8N1 (TENMA 72-2540 / Korad); needs a MAX3232 on the DB9\r\n",
+                            PSU_UART_TX_PIN, PSU_UART_RX_PIN, (unsigned long)psu_get_baud());
             uart_cli_printf("  Active: %s\r\n", psu_is_active() ? "yes (power group released)" : "no");
         } else if (strcmp(parts->parts[1], "VOLT") == 0) {
             if (parts->count < 3) { api_error("ERROR: Usage: PSU VOLT <millivolts>\r\n"); goto api_response; }
@@ -4254,14 +4518,18 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (n > 0) uart_cli_printf("PSU ID: %s\r\n", buf);
             else if (psu_is_active()) uart_cli_send("ERROR: no response from PSU (check wiring / MAX3232 / baud)\r\n");
         } else if (strcmp(parts->parts[1], "STATUS") == 0) {
-            char v[16], i[16]; uint8_t st = 0;
-            int nv = psu_read_voltage(v, sizeof(v));
-            int ni = psu_read_current(i, sizeof(i));
+            char vs[16], is[16], v[16], i[16]; uint8_t st = 0;
+            // Set-points (what's PROGRAMMED) first, then what's being delivered.
+            int nvs = psu_read_setpoint_voltage(vs, sizeof(vs));
+            int nis = psu_read_setpoint_current(is, sizeof(is));
+            int nv  = psu_read_voltage(v, sizeof(v));
+            int ni  = psu_read_current(i, sizeof(i));
             bool sok = psu_read_status(&st);
-            if (nv <= 0 && ni <= 0 && !sok) {
+            if (nvs <= 0 && nis <= 0 && nv <= 0 && ni <= 0 && !sok) {
                 if (psu_is_active()) uart_cli_send("ERROR: no response from PSU (check wiring / MAX3232 / baud)\r\n");
             } else {
-                uart_cli_printf("PSU Vout: %s  Iout: %s\r\n", nv > 0 ? v : "?", ni > 0 ? i : "?");
+                uart_cli_printf("PSU set:  Vset: %s V  Iset: %s A\r\n", nvs > 0 ? vs : "?", nis > 0 ? is : "?");
+                uart_cli_printf("PSU out:  Vout: %s  Iout: %s\r\n", nv > 0 ? v : "?", ni > 0 ? i : "?");
                 if (sok) {
                     // STATUS byte, verified on a TENMA 72-2540 V5.9:
                     // bit0 = CH1 CV(1)/CC(0), bit4 = beep, bit5 = lock, bit6 = output on
@@ -4273,6 +4541,20 @@ void command_parser_execute(cmd_parts_t *parts) {
                                     (st & 0x20) ? "  [LOCKED]" : "",
                                     st);
                 }
+            }
+        } else if (strcmp(parts->parts[1], "BAUD") == 0) {
+            if (parts->count < 3) {
+                uart_cli_printf("PSU baud: %lu 8N1\r\n", (unsigned long)psu_get_baud());
+            } else {
+                uint32_t baud;
+                if (!parse_u32(parts->parts[2], 10, &baud)) {
+                    api_error("ERROR: Invalid baud rate\r\n"); goto api_response;
+                }
+                if (!psu_set_baud(baud)) {
+                    api_error("ERROR: Baud out of range (1200-921600)\r\n"); goto api_response;
+                }
+                uart_cli_printf("OK: PSU baud = %lu%s\r\n", (unsigned long)baud,
+                                psu_is_active() ? " (applied to live UART)" : " (applied on next PSU command)");
             }
         } else if (strcmp(parts->parts[1], "RELEASE") == 0) {
             psu_release();

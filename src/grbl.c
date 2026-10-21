@@ -204,6 +204,25 @@ bool grbl_move_relative_sync(float dx, float dy, float feedrate, uint32_t timeou
     return grbl_send_sync(cmd, timeout_ms);
 }
 
+// --- Z axis (separate command set) ---
+// The Z axis is only used during initial probe setup, never during a sweep
+// campaign, so its CLI verb (ZAXIS) is kept apart from GRBL (XY). These helpers
+// emit Z-only G-code to the same Grbl controller on the shared UART1 (GP8/9).
+
+// Synchronous absolute Z move - waits for ack and idle before returning
+bool grbl_move_absolute_z_sync(float z, float feedrate, uint32_t timeout_ms) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "G90 G1 Z%.3f F%.0f", z, feedrate);
+    return grbl_send_sync(cmd, timeout_ms);
+}
+
+// Synchronous relative Z move - waits for ack and idle before returning
+bool grbl_move_relative_z_sync(float dz, float feedrate, uint32_t timeout_ms) {
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "G91 G1 Z%.3f F%.0f", dz, feedrate);
+    return grbl_send_sync(cmd, timeout_ms);
+}
+
 void grbl_home(void) {
     uart_cli_send("[Grbl] Homing...\r\n");
     grbl_send("$H");

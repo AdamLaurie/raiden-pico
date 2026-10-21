@@ -44,6 +44,9 @@ __pycache__/
 .env
 node_modules/
 
+# Local-only notes (device-specific target findings; never pushed)
+/local/
+
 # Test results and logs
 *.log
 *.csv

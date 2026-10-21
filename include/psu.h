@@ -27,6 +27,13 @@ void psu_release(void);
 // True when GP10/11 are currently in PSU-UART mode.
 bool psu_is_active(void);
 
+// Runtime UART baud control. Default is PSU_UART_BAUD (config.h). psu_set_baud()
+// validates the rate (1200..921600), stores it for the next psu_begin(), and
+// re-applies it live if the UART is already claimed; returns false on an
+// out-of-range rate.
+uint32_t psu_get_baud(void);
+bool psu_set_baud(uint32_t baud);
+
 // High-level commands. Each calls psu_begin() first; on a claim failure they
 // return false without sending anything.
 bool psu_set_voltage_mv(uint32_t mv);   // VSET1:NN.NN
@@ -36,8 +43,14 @@ bool psu_output(bool on);               // OUT1 / OUT0
 // Queries. Write an ASCII, NUL-terminated response into buf; return the number
 // of bytes received (0 = no response / not connected). buf is always terminated.
 int psu_id(char *buf, size_t buflen);            // *IDN?
-int psu_read_voltage(char *buf, size_t buflen);  // VOUT1?
-int psu_read_current(char *buf, size_t buflen);  // IOUT1?
+int psu_read_voltage(char *buf, size_t buflen);  // VOUT1? (delivered at the output)
+int psu_read_current(char *buf, size_t buflen);  // IOUT1? (delivered at the output)
+
+// Set-point (configured) queries — what the PSU is PROGRAMMED to, as opposed to
+// what it is currently delivering. Needed because the onboard controller has no
+// local memory of values pushed with PSU VOLT / PSU CURR.
+int psu_read_setpoint_voltage(char *buf, size_t buflen);  // VSET1?
+int psu_read_setpoint_current(char *buf, size_t buflen);  // ISET1?
 
 // STATUS? — reads the 1-byte status. Returns true on a byte received.
 // Bits verified on a TENMA 72-2540 V5.9:

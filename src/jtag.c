@@ -291,6 +291,23 @@ void jtag_init(void) {
     jtag_reset();
 }
 
+// Re-assert ownership of the shared debug GPIOs before a JTAG operation.
+// GP17/18 are also SWD's SWCLK/SWDIO and GP15 is also nRST, so an SWD session
+// (notably SWD CONNECT then SWD DISCONNECT) leaves GP17/18 as high-Z INPUTs.
+// jtag_init() latches `initialized` at boot and never notices, so the bit-bang
+// would gpio_put() onto floating pins and read a dead TAP (IDCODE 0xFFFFFFFF).
+// This re-drives the pins to their JTAG idle levels (idempotent, no clocking),
+// and must be called at the head of every JTAG command. Mirrors the UART1
+// reclaim pattern (target_uart_ensure_active).
+void jtag_ensure_pins(void) {
+    gpio_init(JTAG_TRST_PIN); gpio_set_dir(JTAG_TRST_PIN, GPIO_OUT); gpio_put(JTAG_TRST_PIN, 1);
+    gpio_init(JTAG_TCK_PIN);  gpio_set_dir(JTAG_TCK_PIN, GPIO_OUT);  gpio_put(JTAG_TCK_PIN, 0);
+    gpio_init(JTAG_TMS_PIN);  gpio_set_dir(JTAG_TMS_PIN, GPIO_OUT);  gpio_put(JTAG_TMS_PIN, 1);
+    gpio_init(JTAG_TDI_PIN);  gpio_set_dir(JTAG_TDI_PIN, GPIO_OUT);  gpio_put(JTAG_TDI_PIN, 1);
+    gpio_init(JTAG_TDO_PIN);  gpio_set_dir(JTAG_TDO_PIN, GPIO_IN);   gpio_pull_up(JTAG_TDO_PIN);
+    initialized = true;
+}
+
 void jtag_deinit(void) {
     gpio_set_dir(JTAG_TCK_PIN, GPIO_IN);
     gpio_set_dir(JTAG_TMS_PIN, GPIO_IN);
@@ -567,6 +584,32 @@ bool jtag_adiv6_dp_init(uint32_t *tap_idcode, uint32_t *dp_idr, uint32_t *ctrlst
     }
     if (ctrlstat) *ctrlstat = cs;
     return true;
+}
+
+// Read a banked DP register: DPBANKSEL selects which register sits at DP
+// address 0x0 (DPIDR bank0, DPIDR1 bank1, BASEPTR0 bank2, BASEPTR1 bank3).
+static bool dp_read_banked(uint32_t bank, uint32_t addr, uint32_t *out) {
+    if (!jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, bank & 0xFu)) return false;
+    bool ok = jtag_dp_read(DP_IR_DPACC, addr, out);
+    jtag_dp_write(DP_IR_DPACC, DP_REG_SELECT, 0u);   // restore DPBANKSEL=0
+    return ok;
+}
+
+// Read the ADIv6 DP BASEPTR — the base address of the root CoreSight ROM table
+// that enumerates the APs. VALID (BASEPTR0 bit0) = 0 means the DP exposes no
+// root table (the debug subsystem may be powered down / held in reset).
+bool jtag_adiv6_dp_baseptr(uint64_t *base_out, bool *valid_out) {
+    uint32_t b0 = 0, b1 = 0;
+    if (!dp_read_banked(2u, 0x0u, &b0)) return false;   // BASEPTR0
+    if (!dp_read_banked(3u, 0x0u, &b1)) b1 = 0;         // BASEPTR1 (upper bits; may be absent)
+    if (valid_out) *valid_out = (b0 & 1u) != 0u;
+    if (base_out)  *base_out  = ((uint64_t)b1 << 32) | (uint64_t)(b0 & 0xFFFFF000u);
+    return true;
+}
+
+// Read the ADIv6 DPIDR1 (bank 1) — ASIZE[6:0] is the DP address size in bits.
+bool jtag_adiv6_dpidr1(uint32_t *out) {
+    return dp_read_banked(1u, 0x0u, out);
 }
 
 // Read one AP register (full ADIv6 register address = ap_base + reg).

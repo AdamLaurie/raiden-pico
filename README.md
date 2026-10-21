@@ -623,6 +623,16 @@ MEM-AP. All transfers use the 35-bit JTAG-DP DPACC/APACC scan with WAIT retry.
 debug power domains (writes CTRL/STAT `0x50000000`). Reports whether the power
 ACK bits came up — while they are down, AP reads return junk.
 
+**`JTAG PROBE`** - One-shot discovery: run `DPINIT`, read the DP `BASEPTR` to
+find the *root* CoreSight ROM table (rather than assuming a fixed MEM-AP base),
+then walk it and identify every component — naming trace/debug blocks by
+`DEVTYPE` and well-known parts by part number. For each MEM-AP it prints
+`DeviceEn` and the debug-ROM pointer, and descends *through* an enabled MEM-AP
+(`DeviceEn=1`) into its memory-mapped ROM to reach the CPU debug block
+(`DEVTYPE 0x15`). When a MEM-AP reports `DeviceEn=0`, the core subsystem is
+powered down or held in reset; release it (connect-under-reset / power its
+application domain) and re-probe. Clears sticky errors as it goes.
+
 **`JTAG CTRLSTAT`** - Read DP CTRL/STAT: the power-domain acks (top nibble) and
 the sticky error flags.
 
@@ -695,6 +705,28 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 - Sends Ctrl-X (0x18) to reset GRBL controller
 - Use to recover from error states
 
+##### Z axis (`GRBL Z ...`) — separate, setup-only
+
+The Z axis lives on its own `GRBL Z` sub-command set, deliberately kept apart
+from the XY `MOVE`/`STEP` commands (which take no Z argument). Z is only useful
+during **initial probe setup** — lowering/raising the EMFI probe or needle over
+the DUT — and is never needed during a sweep campaign, so confining it here
+keeps a stray Z move from ever creeping into an XY sweep script. Same GRBL
+controller, same shared UART1 (GP8/9); the controller's own config must have the
+Z axis enabled. Default feedrate is a deliberately slow 100 mm/min for safe
+descent.
+
+**`GRBL Z MOVE <Z> [F] [timeout_ms]`** - Move Z to an absolute height
+- Example: `GRBL Z MOVE 5` (go to Z=5mm) or `GRBL Z MOVE 2 50` (slow)
+
+**`GRBL Z STEP <DZ> [F] [timeout_ms]`** - Move Z a relative distance
+- Example: `GRBL Z STEP -0.5` (lower 0.5mm) / `GRBL Z STEP 1` (raise 1mm)
+
+**`GRBL Z POS`** - Report current Z (and XY for context)
+
+**`GRBL Z ZERO`** - Set the current Z as zero (`G92 Z0`); leaves the XY origin
+untouched (unlike `GRBL SET HOME`, which zeroes all three axes)
+
 #### External PSU Control (TENMA / Multicomp Pro 72-2540, Korad protocol)
 
 Control an external programmable bench supply over serial, for precise
@@ -706,11 +738,14 @@ campaigns — beyond what the onboard GP10/11/12 switching can do.
 **`PSU ON` / `PSU OFF`** - Enable / disable the output
 **`PSU STATUS`** - Read back Vout / Iout, CV/CC mode, and output state
 **`PSU ID`** - Identify the PSU (connectivity check; sends `*IDN?`)
+**`PSU BAUD [rate]`** - Show or set the PSU UART baud (default 9600; 1200–921600)
 **`PSU RELEASE`** - Return GP10/11 to the target power group
 
-- **UART:** UART1 routed to GP10 (TX) / GP11 (RX) at 9600 8N1, using the RP2350
-  alternate funcsel — the same on-the-fly UART-config switching used for
-  Target/GRBL.
+- **UART:** UART1 routed to GP10 (TX) / GP11 (RX) at 9600 8N1 by default (the
+  TENMA/Multicomp Pro native rate), using the RP2350 alternate funcsel — the same
+  on-the-fly UART-config switching used for Target/GRBL. The rate is runtime-
+  tunable with `PSU BAUD <rate>` (applied live if the UART is already claimed)
+  for units set to a different baud.
 - **Wiring:** the 72-2540's DB9 is true RS-232 (±12 V), so a **MAX3232** (or
   equivalent) transceiver is required between the DB9 and GP10/11. Alternatively
   use the unit's USB port via a USB-serial adapter.

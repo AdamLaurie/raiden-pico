@@ -13,7 +13,9 @@
 // External PSU driver — TENMA 72-2540 / Korad ASCII protocol over UART1 on
 // GP10/GP11. See psu.h for the mutual-exclusion contract with the power group.
 //
-// Protocol verified against a real TENMA 72-2540 V5.9 (via USB-RS232): 9600 8N1,
+// Protocol verified against a real TENMA 72-2540 / Multicomp Pro 72-2540 (via
+// USB-RS232 and via a MAX3232 on GP10/11): 9600 8N1 (baud is PSU_UART_BAUD in
+// config.h, runtime-tunable via PSU BAUD),
 // commands sent with NO terminator, queries reply with no terminator after a
 // short latency (*IDN? variable; VSET1?/ISET1?/VOUT1?/IOUT1? are 5 chars;
 // STATUS? is 1 byte). Write format VSET1:NN.NN / ISET1:N.NNN accepted as-is.
@@ -26,6 +28,22 @@
 #define PSU_READ_TOTAL_MS 400    // hard cap on a single query read
 
 static bool psu_active = false;
+
+// Runtime-tunable UART baud (default from config.h). TENMA/Korad units vary and
+// some menus can be set to a non-default rate, so `PSU BAUD <rate>` lets the
+// bench pick it without a reflash. Applied at psu_begin(), or live if claimed.
+static uint32_t psu_baud = PSU_UART_BAUD;
+
+uint32_t psu_get_baud(void) { return psu_baud; }
+
+bool psu_set_baud(uint32_t baud) {
+    if (baud < 1200 || baud > 921600)
+        return false;
+    psu_baud = baud;
+    if (psu_active)
+        uart_set_baudrate(PSU_UART_ID, psu_baud);  // re-apply to the live UART
+    return true;
+}
 
 // Provided by target_uart.c: current supply on/off state, and a release of the
 // GP10/11/12 power-group GPIOs so we can retask GP10/11 as UART.
@@ -58,15 +76,15 @@ bool psu_begin(void) {
 
     gpio_init(PSU_UART_TX_PIN);
     gpio_init(PSU_UART_RX_PIN);
-    uart_init(PSU_UART_ID, PSU_UART_BAUD);
+    uart_init(PSU_UART_ID, psu_baud);
     uart_set_format(PSU_UART_ID, 8, 1, UART_PARITY_NONE);
     gpio_set_function(PSU_UART_TX_PIN, UART_FUNCSEL_NUM(PSU_UART_ID, PSU_UART_TX_PIN));
     gpio_set_function(PSU_UART_RX_PIN, UART_FUNCSEL_NUM(PSU_UART_ID, PSU_UART_RX_PIN));
 
     psu_active = true;
-    uart_cli_printf("PSU UART claimed: UART1 on GP%d(TX)/GP%d(RX) @ %d 8N1 "
+    uart_cli_printf("PSU UART claimed: UART1 on GP%d(TX)/GP%d(RX) @ %lu 8N1 "
                     "(power group released)\r\n",
-                    PSU_UART_TX_PIN, PSU_UART_RX_PIN, PSU_UART_BAUD);
+                    PSU_UART_TX_PIN, PSU_UART_RX_PIN, (unsigned long)psu_baud);
     return true;
 }
 
@@ -160,6 +178,16 @@ int psu_read_voltage(char *buf, size_t buflen) {
 int psu_read_current(char *buf, size_t buflen) {
     if (!psu_begin()) { if (buflen) buf[0] = '\0'; return 0; }
     return psu_do_query("IOUT1?", buf, buflen);
+}
+
+int psu_read_setpoint_voltage(char *buf, size_t buflen) {
+    if (!psu_begin()) { if (buflen) buf[0] = '\0'; return 0; }
+    return psu_do_query("VSET1?", buf, buflen);
+}
+
+int psu_read_setpoint_current(char *buf, size_t buflen) {
+    if (!psu_begin()) { if (buflen) buf[0] = '\0'; return 0; }
+    return psu_do_query("ISET1?", buf, buflen);
 }
 
 bool psu_read_status(uint8_t *status_out) {

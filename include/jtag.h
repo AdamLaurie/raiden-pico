@@ -57,6 +57,11 @@ void jtag_init(void);
 // Deinitialize JTAG (pins to high-Z)
 void jtag_deinit(void);
 
+// Re-assert the shared debug GPIOs (GP15/17/18/19/20) to JTAG idle levels, in
+// case SWD (which shares SWCLK/SWDIO/nRST) left them high-Z. Call at the start
+// of every JTAG command. Idempotent; does not clock the TAP.
+void jtag_ensure_pins(void);
+
 // Reset TAP state machine (5 TCK with TMS high)
 void jtag_reset(void);
 
@@ -97,6 +102,9 @@ bool jtag_dp_write(uint8_t ir, uint32_t reg, uint32_t val);
 bool jtag_dp_read(uint8_t ir, uint32_t reg, uint32_t *out);
 // Reset TAP, read TAP IDCODE + DP IDR, request debug power domains.
 bool jtag_adiv6_dp_init(uint32_t *tap_idcode, uint32_t *dp_idr, uint32_t *ctrlstat);
+// DP BASEPTR (root CoreSight ROM-table base) + VALID bit; DPIDR1 (DP addr size).
+bool jtag_adiv6_dp_baseptr(uint64_t *base_out, bool *valid_out);
+bool jtag_adiv6_dpidr1(uint32_t *out);
 // AP register access by full ADIv6 address (ap_base + reg offset).
 bool jtag_adiv6_ap_read(uint32_t ap_base, uint32_t reg, uint32_t *out);
 bool jtag_adiv6_ap_write(uint32_t ap_base, uint32_t reg, uint32_t val);
