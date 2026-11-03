@@ -1,3 +1,34 @@
+## [0.22] — 2026-11-03 — Interactive target console (TARGET TERM + settable line params)
+
+### Added
+- **`TARGET TERM` — a persistent, interactive UART console.** `TARGET SEND` was a
+  one-shot bridge that forwarded target→host RX only for the 50 ms bridge window
+  (resetting per byte) before returning, so a console banner/prompt that arrived
+  late was clipped and you could never *type* at the target. `TARGET TERM` opens
+  a continuous bidirectional raw bridge over the USB-CDC link that stays up until
+  you press **Ctrl-]** (0x1D) on the host. It suspends the RX trigger IRQ for the
+  session (polling the FIFO directly) and restores it on exit. Raw passthrough: no
+  local echo (the target echoes), no CR/LF translation. New `target_uart_terminal()`.
+- **Settable console line parameters, independent of the bootloader paths:**
+  - `TARGET BAUD [<rate>]` — show/set the console baud (300..3000000, default
+    115200); applied live if UART1 is on the target pins.
+  - `TARGET FORMAT [<fmt>]` — show/set `<data><parity><stop>`, e.g. `8N1`, `8E1`,
+    `7O2` (data 5-8, parity N/E/O, stop 1-2; default 8N1).
+  - Both are re-applied on `TARGET TERM` entry, so a prior bootloader op that
+    forced EVEN parity does not leak into the console session. Bootloader flows
+    (`SEND`/`SYNC`/ISP) keep their own format via `target_uart_init()`. New driver
+    helpers `target_uart_{get,set}_console_baud()` / `..._console_format()`.
+- Verified on hardware against a live echoing target: a byte string sent inside a
+  `TARGET TERM` session returned byte-for-byte at the matched baud (9600), while a
+  mismatched 115200 produced the expected garbage — confirming both the raw
+  bidirectional forwarding and that `TARGET BAUD` takes effect for the session.
+- **`TARGET TERM` now accepts optional `[<baud>] [AUTO]` args.** `<baud>` sets the
+  console baud for the session before entering; `AUTO` sends a single `0x7F`
+  autobaud sync byte on connect (STM32/AN3155), so an autobaud-capable target locks
+  *its* rate to the baud we are sending at. Chosen as a per-session `TERM` arg
+  rather than a persistent `TARGET BAUD AUTO` mode because the `0x7F` handshake is a
+  one-shot connect action, not a stored rate.
+
 ## [0.21] — 2026-10-17 — PSU set-points, GRBL Z axis, JTAG PROBE + pin-reclaim fix
 
 ### Added

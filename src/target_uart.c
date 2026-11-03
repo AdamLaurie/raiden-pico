@@ -301,6 +301,19 @@ static bool debug_mode = false;
 // Transparent bridge timeout (milliseconds)
 static uint32_t bridge_timeout_ms = 50;
 
+// Interactive-console line settings (TARGET TERM / BAUD / FORMAT).
+// Independent of the bootloader paths: SEND/SYNC/ISP reconfigure UART1 via
+// target_uart_init() with their own (possibly EVEN-parity) format. The console
+// settings below are (re)applied on TARGET TERM entry so a prior bootloader op
+// does not leak its parity into the console session.
+static uint32_t      console_baud   = 115200;
+static uint          console_bits   = 8;
+static uint          console_stop   = 1;
+static uart_parity_t console_parity = UART_PARITY_NONE;
+// Escape key that leaves TARGET TERM (Ctrl-], telnet-style). Everything else is
+// passed through to the target raw.
+#define TARGET_TERM_ESCAPE 0x1D
+
 // Forward declarations (implemented below)
 void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud);
 void target_uart_send_byte(uint8_t byte);
@@ -1202,6 +1215,124 @@ void target_uart_send_hex(const char *hex_str) {
 
     // Re-enable UART RX interrupt for trigger detection
     uart_set_irq_enables(TARGET_UART_ID, true, false);
+}
+
+// ---------------------------------------------------------------------------
+// Interactive console: settable line params + persistent terminal bridge
+// ---------------------------------------------------------------------------
+
+uint32_t target_uart_get_console_baud(void) {
+    return console_baud;
+}
+
+// Validate + store the console baud. Applies live if UART1 is currently on the
+// target pins so TARGET SEND and an open TERM session see it immediately.
+bool target_uart_set_console_baud(uint32_t baud) {
+    if (baud < 300 || baud > 3000000) {
+        return false;
+    }
+    console_baud = baud;
+    extern bool grbl_is_active(void);
+    if (target_initialized && !grbl_is_active()) {
+        uart_set_baudrate(TARGET_UART_ID, console_baud);
+    }
+    return true;
+}
+
+// Returns the console format as a static string like "8N1".
+const char *target_uart_get_console_format(void) {
+    static char buf[8];
+    char p = (console_parity == UART_PARITY_EVEN) ? 'E'
+           : (console_parity == UART_PARITY_ODD)  ? 'O'
+           : 'N';
+    snprintf(buf, sizeof(buf), "%u%c%u", console_bits, p, console_stop);
+    return buf;
+}
+
+// Parse + store a "<data><parity><stop>" format spec, e.g. "8N1", "8E1", "7O2".
+// data bits 5-8, parity N/E/O (case-insensitive), stop bits 1-2. Applies live
+// if UART1 is currently on the target pins.
+bool target_uart_set_console_format(const char *spec) {
+    if (!spec || spec[0] == '\0' || spec[1] == '\0' || spec[2] == '\0' || spec[3] != '\0') {
+        return false;
+    }
+    uint bits = (uint)(spec[0] - '0');
+    if (bits < 5 || bits > 8) {
+        return false;
+    }
+    uart_parity_t par;
+    switch (spec[1]) {
+        case 'N': case 'n': par = UART_PARITY_NONE; break;
+        case 'E': case 'e': par = UART_PARITY_EVEN; break;
+        case 'O': case 'o': par = UART_PARITY_ODD;  break;
+        default: return false;
+    }
+    uint stop = (uint)(spec[2] - '0');
+    if (stop < 1 || stop > 2) {
+        return false;
+    }
+    console_bits   = bits;
+    console_parity = par;
+    console_stop   = stop;
+    extern bool grbl_is_active(void);
+    if (target_initialized && !grbl_is_active()) {
+        uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+    }
+    return true;
+}
+
+// Persistent interactive terminal: forward host<->target raw, continuously,
+// until the escape key (Ctrl-]) is pressed on the host. Unlike TARGET SEND this
+// has no turnaround window, so a banner/prompt that arrives late is not clipped
+// and you can type at the target's console. The RX trigger IRQ is disabled for
+// the duration (we poll the FIFO directly) and restored on exit.
+//
+// send_autobaud: if true, transmit a single 0x7F before the session begins. This
+// is the STM32/AN3155 autobaud byte — an autobaud-capable target measures its
+// bit-timing and locks ITS rate to the console_baud we are sending it at. It does
+// not change our rate; pick the baud first (TARGET BAUD / the TERM baud arg), then
+// AUTO makes the target match us.
+void target_uart_terminal(bool send_autobaud) {
+    // Claim UART1 for the target pins (re-inits from GRBL if needed).
+    target_uart_ensure_active();
+
+    // Apply the console line settings (overriding any bootloader-left parity).
+    uart_set_baudrate(TARGET_UART_ID, console_baud);
+    uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+
+    uart_cli_printf("OK: TARGET TERM @ %u %s on GP%u/GP%u. Press Ctrl-] to exit.\r\n",
+                    console_baud, target_uart_get_console_format(),
+                    TARGET_UART_TX_PIN, TARGET_UART_RX_PIN);
+
+    // Poll the RX FIFO directly for the session; silence the trigger IRQ.
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+
+    // Autobaud handshake: send 0x7F so an autobaud target locks to our rate.
+    if (send_autobaud) {
+        uart_putc_raw(TARGET_UART_ID, 0x7F);
+        uart_tx_wait_blocking(TARGET_UART_ID);
+        uart_cli_printf("OK: sent 0x7F autobaud sync at %u baud\r\n", console_baud);
+    }
+
+    for (;;) {
+        // target -> host (drain everything available this pass)
+        while (uart_is_readable(TARGET_UART_ID)) {
+            putchar_raw((char)uart_getc(TARGET_UART_ID));
+        }
+
+        // host -> target (one char per pass; escape leaves the session)
+        int c = getchar_timeout_us(0);
+        if (c != PICO_ERROR_TIMEOUT) {
+            if (c == TARGET_TERM_ESCAPE) {
+                break;
+            }
+            uart_putc_raw(TARGET_UART_ID, (uint8_t)c);
+        }
+    }
+
+    // Restore the RX trigger IRQ for normal operation.
+    uart_set_irq_enables(TARGET_UART_ID, true, false);
+    uart_cli_send("\r\nOK: exited TARGET TERM\r\n");
 }
 
 void target_uart_process(void) {

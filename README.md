@@ -376,6 +376,62 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 - Shows data received from target UART
 - Useful after sending bootloader commands
 
+**`TARGET TERM [<baud>] [AUTO]`** - Persistent interactive console (raw UART bridge)
+- Forwards bytes both ways continuously between the host and the target over the
+  USB-CDC link, with no turnaround window — a banner or prompt that arrives late
+  is not clipped, and you can type at the target's console interactively.
+- Unlike `TARGET SEND` (a one-shot that forwards RX only for the bridge timeout),
+  the session stays open until you press **Ctrl-]** on the host to return to the
+  raiden CLI. The RX trigger IRQ is suspended for the session and restored on exit.
+- Raw passthrough: no local echo (the target echoes), no CR/LF translation.
+- Uses the console baud + format set by `TARGET BAUD` / `TARGET FORMAT`, applied
+  on entry (so a prior bootloader op that forced EVEN parity does not leak in).
+- **Optional `<baud>`** sets the console baud for the session before entering
+  (equivalent to `TARGET BAUD <baud>` then `TARGET TERM`), e.g. `TARGET TERM 9600`.
+- **Optional `AUTO`** sends a single `0x7F` autobaud sync byte on connect. This is
+  the STM32/AN3155 autobaud character: an autobaud-capable target measures its
+  bit-timing and locks *its* rate to the baud we are sending at. It does not change
+  our rate — pick the baud (via `TARGET BAUD` or the `<baud>` arg), then `AUTO`
+  makes the target match us. Example: `TARGET TERM 115200 AUTO`.
+
+**`TARGET BAUD [<rate>]`** - Get/set the interactive console baud (default: 115200)
+- No arg shows the current rate; with an arg validates (300..3000000) and sets it.
+- Applies live if UART1 is currently on the target pins (GP4/5), else on next use.
+
+**`TARGET FORMAT [<fmt>]`** - Get/set the console line format (default: 8N1)
+- Format is `<data><parity><stop>`: data bits 5-8, parity N/E/O, stop bits 1-2.
+- Examples: `TARGET FORMAT 8N1`, `TARGET FORMAT 8E1`, `TARGET FORMAT 7O2`.
+- Independent of the bootloader paths (`SEND`/`SYNC`/ISP set their own parity).
+
+*Worked example* — attach to a target console on GP4(TX)/GP5(RX), set the line
+rate, open the terminal, type, and exit with Ctrl-]:
+```
+> TARGET BAUD 9600
+OK: TARGET console baud set to 9600
+> TARGET FORMAT 8N1
+OK: TARGET console format set to 8N1
+> TARGET TERM
+OK: TARGET TERM @ 9600 8N1 on GP4/GP5. Press Ctrl-] to exit.
+<everything you type now goes to the target; its output streams back>
+^]                         (Ctrl-] returns to the raiden CLI)
+OK: exited TARGET TERM
+>
+```
+This was verified against a live echoing target: a byte string sent in the
+session came back intact. **Tip:** if the echo/output is garbled (e.g. you sent
+`RAIDEN-TX-RX` and got back `@AIDEN-PX-@X`), the console baud does not match the
+target — exit, set the right `TARGET BAUD`, and re-enter. A clean byte-for-byte
+echo confirms the rate.
+
+For an autobaud target (e.g. an STM32 USART bootloader), set your rate and let the
+target lock onto it with the `0x7F` sync byte in one command:
+```
+> TARGET TERM 115200 AUTO
+OK: TARGET TERM @ 115200 8N1 on GP4/GP5. Press Ctrl-] to exit.
+OK: sent 0x7F autobaud sync at 115200 baud
+<target has now locked to 115200; its ACK/banner streams back>
+```
+
 **`TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH]`** - Reset target
 - Pulses reset pin to restart target
 - Defaults: 300ms pulse, GPIO 15, active low

@@ -4,6 +4,7 @@ Wiring: None. Only USB connection to Raiden Pico required.
 """
 
 import re
+import time
 
 import pytest
 
@@ -268,6 +269,75 @@ class TestTargetType:
         raiden.cmd("TARGET TIMEOUT 100")
         r = raiden.cmd("TARGET TIMEOUT")
         assert "100" in r
+
+    def test_target_baud_roundtrip(self, raiden):
+        raiden.cmd("TARGET BAUD 9600")
+        r = raiden.cmd("TARGET BAUD")
+        assert "9600" in r
+        raiden.cmd("TARGET BAUD 115200")  # restore default
+
+    def test_target_baud_out_of_range(self, raiden):
+        r = raiden.cmd("TARGET BAUD 99")
+        assert "ERROR" in r
+
+    def test_target_format_roundtrip(self, raiden):
+        raiden.cmd("TARGET FORMAT 8E1")
+        r = raiden.cmd("TARGET FORMAT")
+        assert "8E1" in r
+        raiden.cmd("TARGET FORMAT 8N1")  # restore default
+
+    def test_target_format_bad_spec(self, raiden):
+        r = raiden.cmd("TARGET FORMAT 9Z9")
+        assert "ERROR" in r
+
+    def test_target_term_enter_exit(self, raiden):
+        """TARGET TERM opens the raw console and Ctrl-] (0x1D) returns to the CLI."""
+        raiden.ser.reset_input_buffer()
+        raiden.ser.write(b"TARGET TERM\r\n")
+        raiden.ser.flush()
+        time.sleep(0.6)
+        banner = raiden.ser.read(raiden.ser.in_waiting or 1).decode("utf-8", "replace")
+        assert "TERM" in banner and "Ctrl-]" in banner
+        raiden.ser.write(bytes([0x1D]))  # escape
+        raiden.ser.flush()
+        time.sleep(0.5)
+        out = raiden.ser.read(raiden.ser.in_waiting or 1).decode("utf-8", "replace")
+        assert "exited TARGET TERM" in out
+        # confirm we are back at the CLI
+        r = raiden.cmd("TARGET BAUD")
+        assert "console baud" in r
+
+    def test_target_term_auto_sends_sync(self, raiden):
+        """TARGET TERM AUTO sends a 0x7F autobaud byte on connect."""
+        raiden.ser.reset_input_buffer()
+        raiden.ser.write(b"TARGET TERM AUTO\r\n")
+        raiden.ser.flush()
+        time.sleep(0.6)
+        out = raiden.ser.read(raiden.ser.in_waiting or 1).decode("utf-8", "replace")
+        assert "TERM" in out and "0x7F autobaud" in out
+        raiden.ser.write(bytes([0x1D]))  # escape
+        raiden.ser.flush()
+        time.sleep(0.5)
+        assert "exited TARGET TERM" in raiden.ser.read(
+            raiden.ser.in_waiting or 1).decode("utf-8", "replace")
+
+    def test_target_term_baud_and_auto_args(self, raiden):
+        """TARGET TERM <baud> AUTO sets the rate and sends the sync byte."""
+        raiden.ser.reset_input_buffer()
+        raiden.ser.write(b"TARGET TERM 9600 AUTO\r\n")
+        raiden.ser.flush()
+        time.sleep(0.6)
+        out = raiden.ser.read(raiden.ser.in_waiting or 1).decode("utf-8", "replace")
+        assert "9600" in out and "0x7F" in out
+        raiden.ser.write(bytes([0x1D]))
+        raiden.ser.flush()
+        time.sleep(0.4)
+        raiden.ser.read(raiden.ser.in_waiting or 1)
+        raiden.cmd("TARGET BAUD 115200")  # restore default
+
+    def test_target_term_bad_baud_arg(self, raiden):
+        r = raiden.cmd("TARGET TERM 99")
+        assert "ERROR" in r
 
     def test_target_reset_no_target(self, raiden):
         """TARGET RESET toggles GP15, safe without target."""

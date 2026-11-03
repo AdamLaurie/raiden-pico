@@ -1,5 +1,70 @@
 # Target UART Integration
 
+> **Status note:** Sections 1–9 below describe an older PIO-based design
+> (GP16/GP17, `TARGET INIT/PINS/READ/READLINE/CMD/FLUSH`) and are **out of date**.
+> The current firmware uses hardware **UART1 on GP4(TX)/GP5(RX)**, a transparent
+> `TARGET SEND` bridge, and the interactive console documented in
+> **[Interactive console (TARGET TERM)](#interactive-console-target-term)** just
+> below. Trust the `README.md` command reference and the live `PINS` command for
+> actual wiring and commands.
+
+## Interactive console (TARGET TERM)
+
+For talking to a target's serial console (banner, prompt, typing commands), use
+the persistent interactive terminal rather than one-shot `TARGET SEND`. `SEND`
+forwards target→host RX only for the bridge timeout window (default 50 ms), so a
+prompt that arrives late is clipped and you cannot type interactively. `TARGET
+TERM` opens a continuous raw bridge over the USB-CDC link that stays up until you
+press **Ctrl-]** (0x1D) on the host.
+
+**Commands**
+- `TARGET TERM [<baud>] [AUTO]` — enter the interactive console; Ctrl-] exits.
+  - Optional `<baud>` sets the console baud for the session before entering.
+  - Optional `AUTO` sends a `0x7F` autobaud sync byte on connect (STM32/AN3155):
+    an autobaud target measures its bit-timing and locks *its* rate to the baud we
+    are sending at. It does not change our rate — choose the baud, then `AUTO`
+    makes the target match us. E.g. `TARGET TERM 115200 AUTO`.
+- `TARGET BAUD [<rate>]` — show/set console baud (300..3000000, default 115200).
+- `TARGET FORMAT [<fmt>]` — show/set `<data><parity><stop>`, e.g. `8N1`, `8E1`,
+  `7O2` (data 5-8, parity N/E/O, stop 1-2; default 8N1).
+
+The console baud/format are independent of the bootloader paths (`SEND`/`SYNC`/
+ISP reconfigure UART1 with their own, possibly EVEN-parity, format) and are
+re-applied on `TARGET TERM` entry, so a prior bootloader op does not leak its
+parity into the console session. The RX trigger IRQ is suspended for the duration
+of the session and restored on exit. Passthrough is raw: no local echo (the
+target echoes), no CR/LF translation.
+
+**Worked example** — wire the target console to GP4(TX)/GP5(RX)/GND, set the
+rate, open the terminal, and exit with Ctrl-]:
+```
+> TARGET BAUD 9600
+OK: TARGET console baud set to 9600
+> TARGET FORMAT 8N1
+OK: TARGET console format set to 8N1
+> TARGET TERM
+OK: TARGET TERM @ 9600 8N1 on GP4/GP5. Press Ctrl-] to exit.
+<keystrokes go to the target; its output streams back live>
+^]
+OK: exited TARGET TERM
+>
+```
+
+**Verified on hardware:** against a live echoing target, a byte string sent inside
+the session returned byte-for-byte (`RAIDEN-TX-RX-0123456789` → `RAIDEN-TX-RX-0123456789`).
+
+**Baud-mismatch tip:** if the output is garbled — e.g. you send `RAIDEN-TX-RX`
+and receive `@AIDEN-PX-@X` — the console baud does not match the target. Exit
+with Ctrl-], set the correct `TARGET BAUD`, and re-enter. A clean byte-for-byte
+echo confirms the rate. (In the verified test, 115200 produced garbage and 9600
+produced a perfect echo.)
+
+**Driving it from a script (pyserial):** `TARGET TERM` is modal and blocking —
+while it is open, send a raw `0x1D` byte to return to the raiden CLI; ordinary
+line commands are not parsed during the session.
+
+---
+
 ## Overview
 
 The Raiden Pico includes a third UART interface specifically for communicating with target device bootloaders and firmware. This PIO-based UART provides flexible pin assignment and configurable baud rates, enabling you to send commands, read responses, and interact with target devices during glitching campaigns.
@@ -94,6 +159,10 @@ OK: Target UART initialized on GP16/GP17 @ 115200 baud
 
 ### 3. Configure Baud Rate
 **Command**: `TARGET BAUD <rate>`
+
+> **Out of date:** `TARGET BAUD` now sets the interactive-console baud and replies
+> `OK: TARGET console baud set to <rate>`. See
+> [Interactive console (TARGET TERM)](#interactive-console-target-term).
 
 **Purpose**: Set UART baud rate (300-1000000)
 

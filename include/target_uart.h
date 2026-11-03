@@ -64,6 +64,16 @@ bool target_get_debug(void);
 void target_set_timeout(uint32_t timeout_ms);
 uint32_t target_get_timeout(void);
 
+// Interactive console: settable line params + persistent terminal bridge.
+// TERM forwards host<->target raw until Ctrl-] (0x1D) is pressed on the host.
+uint32_t target_uart_get_console_baud(void);
+bool target_uart_set_console_baud(uint32_t baud);        // 300..3000000
+const char *target_uart_get_console_format(void);        // e.g. "8N1"
+bool target_uart_set_console_format(const char *spec);   // "8N1","8E1","7O2",...
+// send_autobaud: emit a 0x7F autobaud sync byte on entry (STM32/AN3155) so an
+// autobaud target locks to the current console baud.
+void target_uart_terminal(bool send_autobaud);
+
 // Target power control
 void target_power_on(void);
 void target_power_off(void);

@@ -484,8 +484,9 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
-                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL", "I2C"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 19, "TARGET sub-command")) {
+                                              "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL", "I2C",
+                                              "TERM", "BAUD", "FORMAT"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 22, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
@@ -625,6 +626,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET SYNC [baud] [crystal_khz] [reset_delay_ms] [retries] - Reset + bootloader\r\n");
         uart_cli_send("                   (defaults: 115200, 12000, 500ms, 5 retries)\r\n");
         uart_cli_send("TARGET TIMEOUT [<ms>]  - Get/set transparent bridge timeout (default: 50ms)\r\n");
+        uart_cli_send("TARGET TERM [<baud>] [AUTO] - Interactive console (raw host<->target); Ctrl-] to exit\r\n");
+        uart_cli_send("                   (AUTO sends 0x7F autobaud sync on connect; optional baud sets rate)\r\n");
+        uart_cli_send("TARGET BAUD [<rate>]   - Get/set console baud (default: 115200)\r\n");
+        uart_cli_send("TARGET FORMAT [<fmt>]  - Get/set console line format, e.g. 8N1 8E1 7O2 (default: 8N1)\r\n");
         uart_cli_send("TARGET BL GET          - Bootloader version + supported commands\r\n");
         uart_cli_send("TARGET BL GV           - Get version + option bytes\r\n");
         uart_cli_send("TARGET BL GID          - Chip product ID\r\n");
@@ -727,7 +732,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.21\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.22\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1288,7 +1293,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER|I2C>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|TERM|BAUD|FORMAT|POWER|I2C>\r\n");
             goto api_response;
         }
 
@@ -1450,6 +1455,51 @@ void command_parser_execute(cmd_parts_t *parts) {
                 char msg[64];
                 snprintf(msg, sizeof(msg), "Target bridge timeout: %lu ms\r\n", timeout_ms);
                 uart_cli_send(msg);
+            }
+        } else if (strcmp(parts->parts[1], "TERM") == 0) {
+            // Persistent interactive terminal: raw host<->target until Ctrl-].
+            // Optional args: TARGET TERM [<baud>] [AUTO]
+            //   <baud> sets the console baud for this session (else current),
+            //   AUTO sends a 0x7F autobaud sync byte on connect.
+            extern void target_uart_terminal(bool);
+            extern bool target_uart_set_console_baud(uint32_t);
+            bool auto_baud = false;
+            for (int i = 2; i < parts->count; i++) {
+                if (strcasecmp(parts->parts[i], "AUTO") == 0) {
+                    auto_baud = true;
+                } else {
+                    uint32_t baud = (uint32_t)strtoul(parts->parts[i], NULL, 0);
+                    if (baud == 0 || !target_uart_set_console_baud(baud)) {
+                        api_error("ERROR: Usage: TARGET TERM [<baud 300..3000000>] [AUTO]\r\n");
+                        goto api_response;
+                    }
+                }
+            }
+            target_uart_terminal(auto_baud);
+        } else if (strcmp(parts->parts[1], "BAUD") == 0) {
+            extern uint32_t target_uart_get_console_baud(void);
+            extern bool target_uart_set_console_baud(uint32_t);
+            if (parts->count >= 3) {
+                uint32_t baud = (uint32_t)strtoul(parts->parts[2], NULL, 0);
+                if (!target_uart_set_console_baud(baud)) {
+                    api_error("ERROR: baud out of range (300..3000000)\r\n");
+                    goto api_response;
+                }
+                uart_cli_printf("OK: TARGET console baud set to %u\r\n", baud);
+            } else {
+                uart_cli_printf("TARGET console baud: %u\r\n", target_uart_get_console_baud());
+            }
+        } else if (strcmp(parts->parts[1], "FORMAT") == 0) {
+            extern const char *target_uart_get_console_format(void);
+            extern bool target_uart_set_console_format(const char *);
+            if (parts->count >= 3) {
+                if (!target_uart_set_console_format(parts->parts[2])) {
+                    api_error("ERROR: Usage: TARGET FORMAT <data><parity><stop>, e.g. 8N1 8E1 7O2 (data 5-8, parity N/E/O, stop 1-2)\r\n");
+                    goto api_response;
+                }
+                uart_cli_printf("OK: TARGET console format set to %s\r\n", target_uart_get_console_format());
+            } else {
+                uart_cli_printf("TARGET console format: %s\r\n", target_uart_get_console_format());
             }
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
             extern bool psu_is_active(void);

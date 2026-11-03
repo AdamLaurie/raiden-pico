@@ -10,7 +10,7 @@ Raiden Pico supports **non-ambiguous command shortcuts** for both primary comman
 
 The shortcut system uses prefix matching for:
 - **Primary commands** (e.g., STATUS, GLITCH, TARGET)
-- **Sub-commands** (e.g., CHIPSHOT ARM, TARGET INIT, SWEEP START)
+- **Sub-commands** (e.g., CHIPSHOT ARM, TARGET SEND, SWEEP START)
 - **Arguments** (e.g., trigger types, variable names)
 
 Matching rules:
@@ -44,15 +44,15 @@ CHIP U         → CHIPSHOT UARTPINS
 CHIP C         → CHIPSHOT CMD
 CHIP S         → CHIPSHOT SYNC
 
-TARG I         → TARGET INIT
-TARG B         → TARGET BAUD
-TARG P         → TARGET PINS
-TARG S         → TARGET SEND
-TARG REA       → TARGET READ
-TARG READL     → TARGET READLINE
-TARG C         → TARGET CMD
-TARG F         → TARGET FLUSH
-TARG RES       → TARGET RESET
+TARG SE        → TARGET SEND
+TARG SY        → TARGET SYNC
+TARG BA        → TARGET BAUD      (console baud; "B" alone is ambiguous with BOOT*/BL)
+TARG F         → TARGET FORMAT    (console line format, e.g. 8N1)
+TARG TE        → TARGET TERM      (interactive console; Ctrl-] to exit; opt [<baud>] [AUTO] 0x7F sync)
+TARG TI        → TARGET TIMEOUT
+TARG RESP      → TARGET RESPONSE
+TARG RESE      → TARGET RESET
+TARG P         → TARGET POWER
 
 SW STA         → SWEEP START
 SW N           → SWEEP NEXT
