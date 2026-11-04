@@ -14,7 +14,7 @@ The inspiration for the project came from discussions here: [Prompt||GTFO](https
 
 Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.com/watch?v=_tqqnkemYsg).
 
-\* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope. I have not read a single line of code produced, only ran and tested it, so I cannot speak for the quality of the coding! YMMV!
+\* Claude had full control of the Pico and a ChipShouter and was able to flash it and run against a real target. The only manual intervention required was validating timings etc. against an oscilloscope. _Update: Claude now performs its own validations by connecting to my Rigol MSO7014, configuring it and capturing and analysing traces. Now the only intervention is wiring up the target... working on it!_ I have not read a single line of code produced, only ran and tested it, so I cannot speak for the quality of the coding! YMMV!
 
 ### Key Features
 
