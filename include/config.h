@@ -47,8 +47,20 @@ typedef enum {
 typedef enum {
     TRIGGER_NONE = 0,
     TRIGGER_GPIO,
-    TRIGGER_UART
+    TRIGGER_UART,
+    TRIGGER_I2C
 } trigger_type_t;
+
+// I2C trigger anchor: which point of the bit-banged bootloader command frame
+// fires the glitch. The CPU raises IRQ0 from the matching hook phase in
+// i2c_bootloader.c; the standard pulse_generator then runs GP2/GP7. PAUSE
+// provides the fine offset within the chosen anchor's window.
+typedef enum {
+    I2C_ANCHOR_CMD_ACK = 0,   // CMD-byte ACK-slot, pre-SCL-rise (t=0, default)
+    I2C_ANCHOR_CMD_POSTACK,   // post-CMD-ACK, SCL held high (sampling phase)
+    I2C_ANCHOR_CHECKSUM_ACK,  // ~CMD (checksum) byte ACK-slot (one byte later)
+    I2C_ANCHOR_STOP           // inline right after STOP (post-command window)
+} i2c_anchor_t;
 
 // Edge Types
 typedef enum {
@@ -126,6 +138,8 @@ typedef struct {
     edge_type_t trigger_edge;
     uint8_t trigger_byte;
     uint8_t trigger_uart_pin;  // GPIO pin for UART trigger snooping (GP4=TX, GP5=RX)
+    uint8_t trigger_i2c_cmd;      // I2C trigger: command-byte filter (0 = fire on any command)
+    i2c_anchor_t trigger_i2c_anchor; // I2C trigger: frame anchor (default I2C_ANCHOR_CMD_ACK)
     // Output pins are hardwired: PIN_GLITCH_OUT (GP2) and PIN_GLITCH_OUT_INV (GP7)
 } glitch_config_t;
 

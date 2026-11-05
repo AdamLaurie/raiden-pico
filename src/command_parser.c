@@ -515,8 +515,8 @@ void command_parser_execute(cmd_parts_t *parts) {
 
     // Match arguments
     if (strcmp(parts->parts[0], "TRIGGER") == 0 && parts->count == 2) {
-        const char *trigger_types[] = {"NONE", "UART", "GPIO"};
-        if (!match_and_replace(&parts->parts[1], trigger_types, 3, "trigger type")) {
+        const char *trigger_types[] = {"NONE", "UART", "GPIO", "I2C"};
+        if (!match_and_replace(&parts->parts[1], trigger_types, 4, "trigger type")) {
             goto api_response;
         }
     } else if (strcmp(parts->parts[0], "ARM") == 0 && parts->count == 2) {
@@ -618,6 +618,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH RESETTEST           - Reset/low-power disruption test\r\n");
         uart_cli_send("TARGET GLITCH TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
         uart_cli_send("                                   - DWT cycle count + ADC shunt timing\r\n");
+        uart_cli_send("TARGET GLITCH I2CGATE [attempts] [mv] - Glitch boot-ROM RDP check during I2C cmd stretch [STM32F401]\r\n");
+        uart_cli_send("TARGET GLITCH I2CPROBE [samples] [us] - SWD-halt mid-stretch, read PC to map RDP-check timing [STM32F401]\r\n");
+        uart_cli_send("TARGET GLITCH I2CPULSE [n] [lo] [hi] [step] [w] - PIO ns-resolution rail-pulse sweep (ticks) [STM32F401]\r\n");
         uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
@@ -641,12 +644,27 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BL RP CONFIRM   - Readout protect (set RDP1) [STM32]\r\n");
         uart_cli_send("TARGET BL UNLOCK       - Unlock destructive commands [LPC]\r\n");
         uart_cli_send("TARGET BL CRP          - Read+decode CRP word at 0x1FC [LPC]\r\n");
+        uart_cli_send("TARGET I2C SCAN        - Scan I2C bus for bootloader (GP4=SCL/GP5=SDA) [STM32]\r\n");
+        uart_cli_send("TARGET I2C SYNC [addr7] - Scan then GET on found address [STM32]\r\n");
+        uart_cli_send("TARGET I2C GET [addr7] - Bootloader version + supported commands [STM32]\r\n");
+        uart_cli_send("TARGET I2C GV          - Get version + read-protect status [STM32]\r\n");
+        uart_cli_send("TARGET I2C GID [addr7] - Chip product ID [STM32]\r\n");
+        uart_cli_send("TARGET I2C READ <addr> <len> [addr7] - Read memory (len 1..256) [STM32]\r\n");
+        uart_cli_send("TARGET I2C WRITE <addr> <hex>        - Write memory (hex bytes, max 256) [STM32]\r\n");
+        uart_cli_send("TARGET I2C GO <addr>   - Jump to address [STM32]\r\n");
+        uart_cli_send("TARGET I2C PROBE <cmd_hex> - Send arbitrary bootloader command byte [STM32]\r\n");
+        uart_cli_send("TARGET I2C ERASE ALL WIPE - Mass erase flash (destructive) [STM32]\r\n");
+        uart_cli_send("TARGET I2C RU WIPE     - Readout unprotect (mass erase + remove RDP) [STM32]\r\n");
+        uart_cli_send("TARGET I2C RP CONFIRM  - Readout protect (set RDP1) [STM32]\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Trigger Configuration ==\r\n");
-        uart_cli_send("TRIGGER [NONE|GPIO|UART] - Configure/show trigger\r\n");
+        uart_cli_send("TRIGGER [NONE|GPIO|UART|I2C] - Configure/show trigger\r\n");
         uart_cli_send("TRIGGER GPIO <RISING|FALLING> - GPIO trigger on GP3\r\n");
         uart_cli_send("TRIGGER NONE           - Disable trigger\r\n");
         uart_cli_send("TRIGGER UART <byte> [TX|RX] - UART byte trigger (TX=Raiden TX, RX=Raiden RX)\r\n");
+        uart_cli_send("TRIGGER I2C [cmd_hex] [CMDACK|POSTACK|CSACK|STOP] - Fire std glitch (GP2/GP7) on a\r\n");
+        uart_cli_send("                         bit-banged I2C bootloader command (cmd 0/omit=any); anchor on the\r\n");
+        uart_cli_send("                         cmd-byte ACK (default), post-ACK, checksum ACK, or after STOP [STM32]\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ADC ==\r\n");
         uart_cli_send("ADC                    - Read both: ADC0/GP26 (target VDD) + ADC1/GP27 (shunt)\r\n");
@@ -732,7 +750,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.22\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.23\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -1225,6 +1243,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (cfg->trigger == TRIGGER_UART) {
                 uart_cli_printf("UART (Byte: 0x%02X, %s)\r\n", cfg->trigger_byte,
                                cfg->trigger_uart_pin == 4 ? "TX" : "RX");
+            } else if (cfg->trigger == TRIGGER_I2C) {
+                const char *an = cfg->trigger_i2c_anchor == I2C_ANCHOR_CMD_POSTACK ? "POSTACK" :
+                                 cfg->trigger_i2c_anchor == I2C_ANCHOR_CHECKSUM_ACK ? "CSACK" :
+                                 cfg->trigger_i2c_anchor == I2C_ANCHOR_STOP ? "STOP" : "CMDACK";
+                if (cfg->trigger_i2c_cmd == 0)
+                    uart_cli_printf("I2C (any command, anchor %s)\r\n", an);
+                else
+                    uart_cli_printf("I2C (command 0x%02X, anchor %s)\r\n", cfg->trigger_i2c_cmd, an);
             }
         } else if (strcmp(parts->parts[1], "NONE") == 0) {
             glitch_set_trigger_type(TRIGGER_NONE);
@@ -1278,8 +1304,40 @@ void command_parser_execute(cmd_parts_t *parts) {
             glitch_set_trigger_type(TRIGGER_UART);
             glitch_get_config()->trigger_uart_pin = uart_pin;
             uart_cli_printf("OK: UART trigger on %s byte 0x%02X (%u)\r\n", pin_name, byte, byte);
+        } else if (strcmp(parts->parts[1], "I2C") == 0) {
+            // TRIGGER I2C [cmd_hex] [CMDACK|POSTACK|CSACK|STOP]
+            // CPU-sourced: fires the standard glitch (GP2/GP7) at the chosen
+            // frame anchor of the next armed TARGET I2C bootloader command.
+            uint8_t cmd = 0;   // 0 = fire on any command
+            if (parts->count >= 3) {
+                uint32_t v;
+                if (!parse_u32(parts->parts[2], 16, &v) || v > 0xFF) {
+                    api_error("ERROR: Invalid cmd byte. Usage: TRIGGER I2C [cmd_hex] [CMDACK|POSTACK|CSACK|STOP]\r\n");
+                    goto api_response;
+                }
+                cmd = (uint8_t)v;
+            }
+            i2c_anchor_t anchor = I2C_ANCHOR_CMD_ACK;
+            const char *aname = "CMDACK";
+            if (parts->count >= 4) {
+                const char *anchors[] = {"CMDACK", "POSTACK", "CSACK", "STOP"};
+                if (!match_and_replace(&parts->parts[3], anchors, 4, "I2C anchor")) {
+                    goto api_response;  // match_and_replace emitted the error
+                }
+                if (strcmp(parts->parts[3], "POSTACK") == 0)      { anchor = I2C_ANCHOR_CMD_POSTACK;  aname = "POSTACK"; }
+                else if (strcmp(parts->parts[3], "CSACK") == 0)   { anchor = I2C_ANCHOR_CHECKSUM_ACK; aname = "CSACK"; }
+                else if (strcmp(parts->parts[3], "STOP") == 0)    { anchor = I2C_ANCHOR_STOP;         aname = "STOP"; }
+                else                                              { anchor = I2C_ANCHOR_CMD_ACK;      aname = "CMDACK"; }
+            }
+            cfg->trigger_i2c_cmd = cmd;
+            cfg->trigger_i2c_anchor = anchor;
+            glitch_set_trigger_type(TRIGGER_I2C);
+            if (cmd == 0)
+                uart_cli_printf("OK: I2C trigger on any command, anchor %s (fires standard glitch GP2/GP7)\r\n", aname);
+            else
+                uart_cli_printf("OK: I2C trigger on command 0x%02X, anchor %s (fires standard glitch GP2/GP7)\r\n", cmd, aname);
         } else {
-            api_error_printf("ERROR: Unknown trigger type '%s' (use NONE/GPIO/UART)\r\n", parts->parts[1]);
+            api_error_printf("ERROR: Unknown trigger type '%s' (use NONE/GPIO/UART/I2C)\r\n", parts->parts[1]);
         }
 
     } else if (strcmp(parts->parts[0], "TARGET") == 0) {

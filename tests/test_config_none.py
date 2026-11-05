@@ -145,6 +145,43 @@ class TestTrigger:
         r = raiden.cmd("TRIGGER")
         assert "RX" in r
 
+    # ── I2C trigger (generic, CPU-sourced) ───────────────────────
+    # Parse/config paths only: no hardware driven until an armed TARGET I2C
+    # command runs, so these are safe under config_none.
+
+    def test_trigger_i2c_any(self, raiden):
+        raiden.cmd("TRIGGER I2C")
+        r = raiden.cmd("TRIGGER")
+        assert "I2C" in r and "any command" in r
+        assert "CMDACK" in r.upper()   # default anchor
+
+    def test_trigger_i2c_cmd_filter(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11")
+        r = raiden.cmd("TRIGGER")
+        assert "I2C" in r and "11" in r.upper()
+
+    def test_trigger_i2c_anchor_stop(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11 STOP")
+        r = raiden.cmd("TRIGGER")
+        assert "STOP" in r.upper()
+
+    def test_trigger_i2c_anchor_csack(self, raiden):
+        raiden.cmd("TRIGGER I2C 11 CSACK")
+        r = raiden.cmd("TRIGGER")
+        assert "CSACK" in r.upper()
+
+    def test_trigger_i2c_bad_cmd_errors(self, raiden):
+        r = raiden.cmd("TRIGGER I2C 0x1FF")   # > 0xFF
+        assert "ERROR" in r
+
+    def test_trigger_i2c_bad_anchor_errors(self, raiden):
+        r = raiden.cmd("TRIGGER I2C 0x11 BOGUS")
+        assert "ERROR" in r
+
+    def test_trigger_unknown_type_errors(self, raiden):
+        r = raiden.cmd("TRIGGER WIBBLE")
+        assert "ERROR" in r
+
     def test_trigger_cleanup(self, raiden):
         raiden.cmd("TRIGGER NONE")
 
