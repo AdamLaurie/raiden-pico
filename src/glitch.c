@@ -8,6 +8,7 @@
 #include "hardware/structs/padsbank0.h"  // For direct PADS register access (ISO bit)
 #include "pico/stdlib.h"
 #include "glitch.pio.h"
+#include "i2c_bootloader.h"   // i2c_bl_set_fire_hook (generic I2C trigger)
 #include <string.h>
 #include <stdio.h>
 
@@ -337,6 +338,19 @@ static void crowbar_pulse_stop(void) {
     target_crowbar_gate_idle();  // de-assert via SIO before next arm
 }
 
+// CPU-sourced fire for the generic I2C trigger (TRIGGER_I2C). Called from the
+// bit-banged I2C bootloader command hook at the configured frame anchor. Raises
+// GLITCH_FIRED (GP22) as a marker (clock-boost / TRACE / external scope) and
+// forces IRQ0 — the exact flag the pulse generator and EXT crowbar idle on
+// ('wait 1 irq 0'), so they fire identically to the PIO decoders' 'irq set 0',
+// but sourced from the CPU (the I2C bus is bit-banged, there is no line for a
+// PIO decoder to watch). Single register write: ~a few ns, fixed latency is
+// absorbed by the PAUSE pre-compensation like every other trigger.
+static void i2c_trigger_fire(void) {
+    gpio_put(PIN_GLITCH_FIRED, 1);
+    glitch_pio->irq_force = (1u << GLITCH_IRQ_NUM);
+}
+
 bool glitch_arm(void) {
     if (flags.armed) {
         return false;  // Already armed
@@ -356,6 +370,10 @@ bool glitch_arm(void) {
     // Clear their FIFOs
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
+
+    // Clear any previously-registered I2C fire hook; the TRIGGER_I2C branch below
+    // re-registers it. Prevents a stale hook firing when switching away from I2C.
+    i2c_bl_set_fire_hook(NULL, 0, 0);
 
     // Remove only the trigger programs that were actually loaded
     if (edge_rising_loaded) {
@@ -542,6 +560,20 @@ bool glitch_arm(void) {
         pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
     }
 
+    // Generic I2C trigger: no PIO decoder / extra SM needed. The pulse generator
+    // (and EXT crowbar) are already armed on IRQ0 above; the bit-banged I2C
+    // bootloader command path calls i2c_trigger_fire() at the configured anchor,
+    // which forces IRQ0. Drive GLITCH_FIRED (GP22) as a plain SIO output so the
+    // CPU hook can raise it (the PIO decoders own it in the other trigger modes).
+    if (config.trigger == TRIGGER_I2C) {
+        gpio_init(PIN_GLITCH_FIRED);
+        gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
+        gpio_put(PIN_GLITCH_FIRED, 0);
+        i2c_bl_set_fire_hook(i2c_trigger_fire,
+                             config.trigger_i2c_cmd,
+                             config.trigger_i2c_anchor);
+    }
+
     // Load clock boost FIFO parameters during ARM transition (DISARM→ARM)
     // This prevents boost from triggering immediately on clock enable
     if (clock_boost_enabled && clock_config.enabled) {
@@ -586,6 +618,9 @@ bool glitch_arm_trace(void) {
     // Clear FIFOs
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
     pio_sm_clear_fifos(glitch_pio, sm_uart_trigger);
+
+    // Clear any previously-registered I2C fire hook; re-registered below for I2C.
+    i2c_bl_set_fire_hook(NULL, 0, 0);
 
     // Remove only the trigger programs that were actually loaded
     if (edge_rising_loaded) {
@@ -675,6 +710,17 @@ bool glitch_arm_trace(void) {
         pio_interrupt_clear(glitch_pio, GLITCH_IRQ_NUM);
         pio_sm_set_enabled(glitch_pio, sm_uart_trigger, true);
 
+    } else if (config.trigger == TRIGGER_I2C) {
+        // I2C-triggered TRACE: no pulse generator (removed above); the CPU hook
+        // just raises GLITCH_FIRED (GP22) at the anchor so the ADC trace can
+        // timestamp the I2C command. Drive GP22 as a plain SIO output.
+        gpio_init(PIN_GLITCH_FIRED);
+        gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
+        gpio_put(PIN_GLITCH_FIRED, 0);
+        i2c_bl_set_fire_hook(i2c_trigger_fire,
+                             config.trigger_i2c_cmd,
+                             config.trigger_i2c_anchor);
+
     } else {
         printf("ERROR: No trigger configured\n");
         return false;
@@ -698,6 +744,9 @@ void glitch_disarm(void) {
 
     // Stop the crowbar pulse SM (if running) and return GP11 to safe idle
     crowbar_pulse_stop();
+
+    // Disarm the generic I2C trigger fire hook (no-op if never armed)
+    i2c_bl_set_fire_hook(NULL, 0, 0);
 
     // Disable PIO state machines
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);

@@ -261,8 +261,67 @@ bool i2c_bl_wait_status(uint8_t a, int retries, bool *status_ack) {
     return false;
 }
 
+// --- Generic I2C glitch trigger hook (set by glitch_arm) -----------------
+static void       (*g_i2c_fire_hook)(void) = NULL;  // NULL = disarmed
+static uint8_t      g_i2c_fire_cmd    = 0;          // 0 = any command
+static i2c_anchor_t g_i2c_fire_anchor = I2C_ANCHOR_CMD_ACK;
+
+void i2c_bl_set_fire_hook(void (*fn)(void), uint8_t cmd_filter, i2c_anchor_t anchor) {
+    g_i2c_fire_hook   = fn;
+    g_i2c_fire_cmd    = cmd_filter;
+    g_i2c_fire_anchor = anchor;
+}
+
+// Command frame firing the hook at the ~CMD (checksum) byte's ACK-slot.
+static bool send_cmd_cshook(uint8_t a, uint8_t cmd, void (*hook)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(cmd);
+    sleep_us(200);
+    i2c_wr_ack_hook((uint8_t)(cmd ^ 0xFF), hook);  // fire at checksum ACK slot
+    i2c_stop();
+    return addr_ok;
+}
+
+// Command frame firing the hook inline immediately after STOP.
+static bool send_cmd_stophook(uint8_t a, uint8_t cmd, void (*hook)(void)) {
+    i2c_start();
+    bool addr_ok = i2c_wr(ADDR_W(a));
+    sleep_us(1000);
+    i2c_wr(cmd);
+    sleep_us(200);
+    i2c_wr((uint8_t)(cmd ^ 0xFF));
+    i2c_stop();
+    if (hook) hook();                              // fire right after STOP
+    return addr_ok;
+}
+
+// Send the armed-trigger command frame at the configured anchor. Returns the
+// address-ACK status; caller still does bl_wait_ack() for the verdict.
+static bool bl_cmd_fire(uint8_t a, uint8_t cmd) {
+    switch (g_i2c_fire_anchor) {
+        case I2C_ANCHOR_CMD_POSTACK:
+            return i2c_bl_send_cmd_postackhook(a, cmd, g_i2c_fire_hook);
+        case I2C_ANCHOR_CHECKSUM_ACK:
+            return send_cmd_cshook(a, cmd, g_i2c_fire_hook);
+        case I2C_ANCHOR_STOP:
+            return send_cmd_stophook(a, cmd, g_i2c_fire_hook);
+        case I2C_ANCHOR_CMD_ACK:
+        default:
+            return i2c_bl_send_cmd_ackhook(a, cmd, g_i2c_fire_hook);
+    }
+}
+
 // Send a command frame: START, W-addr, cmd, ~cmd, STOP; then wait for ACK.
+// When an armed TRIGGER_I2C glitch is active and this command byte matches the
+// filter, the frame is sent via the anchored fire path so the glitch overlaps
+// the ROM's post-command processing.
 static bool bl_cmd(uint8_t a, uint8_t cmd) {
+    if (g_i2c_fire_hook && (g_i2c_fire_cmd == 0 || cmd == g_i2c_fire_cmd)) {
+        if (!bl_cmd_fire(a, cmd)) return false;    // address NACKed
+        return bl_wait_ack(a, 400);
+    }
     i2c_start();
     bool a1 = i2c_wr(ADDR_W(a));
     sleep_us(1000);                    // let the STM32 slave clear ADDR after the match

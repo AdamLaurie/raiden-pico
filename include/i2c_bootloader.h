@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "config.h"   // i2c_anchor_t
 
 // STM32 system bootloader over I2C (protocol per AN4221).
 //
@@ -54,5 +55,14 @@ bool i2c_bl_go(uint8_t addr7, uint32_t addr);                    // 0x21 Go
 bool i2c_bl_write(uint8_t addr7, uint32_t addr, const uint8_t *data, uint32_t len); // 0x31 Write Memory
 bool i2c_bl_erase_mass(uint8_t addr7);                           // 0x45 Extended Erase (mass) — destructive
 bool i2c_bl_rp(uint8_t addr7);                                   // 0x83 Readout Protect (re-lock RDP1) — destructive-ish
+
+// --- Generic I2C glitch trigger ------------------------------------------
+// Register a fire hook that bl_cmd() calls mid-frame when an armed TRIGGER_I2C
+// glitch is active. The ordinary TARGET I2C commands (GET/READ/WRITE/...) then
+// fire the glitch at the configured anchor on the command byte that matches
+// cmd_filter (0 = any command). fn()==NULL disarms. Set by glitch_arm().
+//   cmd_filter : only fire when the command byte == this value (0 = any)
+//   anchor     : which frame point fires (see i2c_anchor_t in config.h)
+void i2c_bl_set_fire_hook(void (*fn)(void), uint8_t cmd_filter, i2c_anchor_t anchor);
 
 #endif // I2C_BOOTLOADER_H

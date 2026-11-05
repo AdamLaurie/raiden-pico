@@ -193,7 +193,7 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 
 #### Trigger Configuration
 
-**`TRIGGER [NONE|GPIO|UART]`** - Configure/show trigger
+**`TRIGGER [NONE|GPIO|UART|I2C]`** - Configure/show trigger
 
 **`TRIGGER NONE`** - Disable all triggers
 - Glitches can only be manually fired with `GLITCH` command
@@ -211,6 +211,32 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - Example: `TRIGGER UART 0D` (trigger on '\r' from target)
 - Example: `TRIGGER UART EE TX` (trigger on 0xEE sent to target)
 - PIO-based decoder works with 8N1, 8E1, or any parity mode
+
+**`TRIGGER I2C [cmd_hex] [CMDACK|POSTACK|CSACK|STOP]`** - Fire the standard glitch (GP2/GP7) off a bit-banged STM32 I2C bootloader command — the I2C analogue of `TRIGGER UART` for doing a bootloader-command-timed glitch over I2C instead of UART. [STM32 only]
+- Unlike UART/GPIO (passive PIO decoders that watch a line), the I2C bus is CPU bit-banged and the Pico *is* the master, so this trigger is **CPU-sourced**: when armed, the next `TARGET I2C` bootloader command (`READ`/`GET`/…) forces `IRQ0` from a bit-bang hook at the chosen frame anchor, firing the normal pulse generator (GP2 + inverted GP7, EXT crowbar if enabled). `GLITCH_FIRED` (GP22) is raised as a scope/trace marker.
+- `cmd_hex` = fire only when the command byte matches (omit or `0` = any command). e.g. `0x11` = READ.
+- Anchor (which frame point fires; `PAUSE` provides the fine offset within it):
+  - `CMDACK` *(default)* — command-byte ACK-slot, pre-SCL-rise. The proven t=0: the STM32 ROM ACKs the command *before* it runs the RDP check, then clock-stretches; the pulse lands inside that stretch.
+  - `POSTACK` — just after the command-byte ACK rise (SCL held high; sampling phase).
+  - `CSACK` — the `~cmd` (checksum) byte's ACK-slot (one byte later).
+  - `STOP` — inline immediately after the frame's STOP (post-command window).
+- Example workflow:
+  ```
+  TARGET STM32F4
+  SET PAUSE 1000 ; SET WIDTH 40 ; SET GAP 10 ; SET COUNT 1
+  TRIGGER I2C 0x11 CMDACK      # fire on the READ command byte's ACK slot
+  ARM
+  TARGET I2C READ 0x08000000 16   # bit-bang runs; glitch fires at cmd-byte ACK
+  ```
+- The dedicated `TARGET GLITCH I2CGATE`/`I2CPULSE` experiments remain separate — those drive the target rail on GP10; `TRIGGER I2C` fires the general-purpose GP2/GP7 output.
+
+**Why I2C over UART — jitter and determinism.** The jitter that hurts a UART-triggered glitch mostly comes from the *signal chain*, not the bit decoder:
+- **USB-UART converters in the loop.** In most benches a USB-UART bridge (FTDI/CP210x/CH340) carries the bootloader traffic. USB schedules transfers on fixed host micro-frame boundaries (~1 ms) and the converter adds its own buffering / latency-timer flush, so the instant a byte actually appears relative to the target's processing wanders by *microseconds* and is not repeatable shot to shot — orders of magnitude worse than the fault window you are trying to hit.
+- **Internal wait states, even driven directly.** Remove the converter and drive the UART straight from an MCU and the problem does not go away: RX FIFO handling, interrupt entry, bus arbitration and wait states quantise the "byte received → commit to processing" transition into coarse multi-cycle windows. At the **nanosecond scale** a voltage/EM glitch needs, that window is large enough to dramatically shift where the pulse lands from one attempt to the next.
+
+In both cases you are triggering on a *proxy* — a byte somewhere in a buffered, quantised path — not on the target's actual commit point.
+
+`TRIGGER I2C` sidesteps this because **the Pico is the bus master driving a bit-banged line directly** — no USB-UART converter anywhere in the path, and the trigger point is a **clock-stretched, hardware-synchronous ACK handshake the Pico itself clocks**: the master physically waits for the slave to release SCL, so the fire is phase-locked to the slave's genuine readiness rather than to a buffered estimate of when a byte went by. The anchor is a point the firmware *produces* (t=0 is known to the instruction, not inferred from sampling an async line). The result is a far tighter, repeatable glitch window and a correspondingly higher hit rate on timing-sensitive faults.
 
 #### Glitch Execution
 
