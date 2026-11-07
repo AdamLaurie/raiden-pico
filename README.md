@@ -458,10 +458,14 @@ OK: sent 0x7F autobaud sync at 115200 baud
 <target has now locked to 115200; its ACK/banner streams back>
 ```
 
-**`TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH]`** - Reset target
-- Pulses reset pin to restart target
-- Defaults: 300ms pulse, GPIO 15, active low
-- Example: `TARGET RESET PERIOD 500 PIN 16 HIGH`
+**`TARGET RESET`** (bare) - Pulse the reset pin now (execute)
+**`TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW]`** - Configure only (does NOT pulse)
+- Bare `TARGET RESET` executes a pulse with the current config; any parameter switches
+  to configure-only — follow with a bare `TARGET RESET` to actually pulse.
+- Defaults: 300ms pulse, GPIO 15, active low.
+- Unknown or malformed options are rejected with an error (e.g. `TARGET RESET 400`
+  errors — use `TARGET RESET PERIOD 400`). Never silently ignored.
+- Example: `TARGET RESET PERIOD 500 PIN 16 HIGH` then `TARGET RESET`
 
 **`TARGET POWER [ON|OFF|CYCLE] [ms]`** - Control/show target power on GP10/11/12
 - `ON` - Enable power
@@ -1203,6 +1207,12 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 4** - Target UART TX (bootloader/bypass)
 - **GPIO 5** - Target UART RX (bootloader/bypass, also PIO monitored for UART triggers)
 - **GPIO 15** - Target reset / nRST (active low)
+- **GPIO 22** - `GLITCH_FIRED` — a **LOGIC marker that asserts at the trigger instant,
+  *before* the PAUSE** (not the glitch itself). The glitch output (GP2/GP7) follows one
+  `PAUSE` later, so **scoping GP22 → the glitch edge measures the actual PAUSE delay**.
+  It is a latched level for the CPU-sourced I2C trigger and a ~667 ns pulse for the
+  PIO GPIO/UART triggers. (The real fault injection is GP2/GP7 / the crowbar; GP22 is a
+  monitor/trace signal.)
 
 ### Status LED (board-aware)
 
@@ -1343,10 +1353,30 @@ Then rebuild and reflash the firmware.
 - **Timing Resolution**: 6.67 ns (1 clock cycle)
 - **UART Baud Rates**: Up to 921600 (configurable)
 - **Glitch Width Range**: 1 cycle to 2^32 cycles (6.67ns to 28.6 seconds)
-- **Trigger Latency**: ~18 ticks (~120ns) from trigger detection to glitch output
-  - This latency is automatically compensated in the PAUSE command
-  - For PAUSE values >= 18, 18 ticks are subtracted to account for trigger processing
-  - Example: `SET PAUSE 100` results in actual delay of 82 ticks after trigger
+- **Trigger→glitch pipeline offset**: per-trigger-path, bench-calibrated so the glitch
+  fires exactly `PAUSE` cycles after the GLITCH_FIRED (GP22) marker on every path.
+  - Offsets (cycles, signed): I2C `+14`, GPIO `+10`, UART `-152`. A positive offset is
+    subtracted from PAUSE (compensates pipeline lag); a negative offset is added (the
+    PIO-decoder GP22 marker lags the countdown start on that path).
+  - All three bench-verified on a Rigol MSO7014 (RAW samples + interpolated 1.5V crossing)
+    against an F401: GP22→first-edge lands within ~1 cycle of `PAUSE` on every path —
+    I2C +0.6ns, GPIO +0.8ns, UART +2.0ns (flat across PAUSE 300/600/900).
+  - **`PAUSE 0` = no pause**: fires at minimum latency; the offset is not applied.
+  - **A non-zero `PAUSE` below a positive offset is rejected** (ERROR) at `SET PAUSE` and
+    at `ARM ON` — it could not be compensated and would silently clamp to minimum latency.
+    Use `PAUSE 0` or `PAUSE >=` the offset (e.g. for the I2C path, `PAUSE >= 14`).
+  - Example (I2C, offset 14): `SET PAUSE 300` → glitch at 300 cycles (2.00µs) after GP22.
+
+> ⚠️ **PAUSE TIMING CHANGED vs v0.23 — existing scripts may be affected.** v0.23 (and
+> earlier) applied a single flat 18-cycle compensation (`PAUSE − 18`) to **every** trigger
+> path, so the glitch did **not** land exactly `PAUSE` cycles after GP22. This release
+> calibrates each path individually. **For the same `SET PAUSE` value, the glitch now fires
+> LATER by:** I2C **+4 cyc (+27ns)**, GPIO **+8 cyc (+53ns)**, UART **+170 cyc (+1134ns)**.
+> To reproduce your old v0.23 timing exactly, **reduce `PAUSE`** by `18 − offset`: subtract
+> **4** (I2C), **8** (GPIO), or **170** (UART) cycles. New scripts need no adjustment — just
+> set `PAUSE` to the delay you actually want after GP22. (Also note the new lower-bound
+> rejection above: UART is unaffected — its negative offset has no lower bound — but a tiny
+> non-zero I2C/GPIO `PAUSE` below the offset now errors instead of silently clamping.)
 
 ## Safety Considerations
 

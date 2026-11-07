@@ -14,6 +14,9 @@ glitch_config_t* glitch_get_config(void);
 // Get current system flags
 system_flags_t* glitch_get_flags(void);
 
+// Signed pause-compensation offset (cycles) for the current trigger path (0 = none).
+int32_t glitch_get_pause_offset(void);
+
 // Set glitch parameters
 void glitch_set_pause(uint32_t pause_us);
 void glitch_set_width(uint32_t width_us);

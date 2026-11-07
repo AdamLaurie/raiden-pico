@@ -575,6 +575,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== Glitch Configuration ==\r\n");
         uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT|VMIN] - Get current glitch parameter(s)\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
+        uart_cli_send("       PAUSE 0 = no pause (min latency); non-zero PAUSE must be >= trigger offset\r\n");
         uart_cli_send("SET VMIN <mV>             - 0 = WIDTH-only PIO pulse, !=0 = ADC-gated drop\r\n");
         uart_cli_send("                            (CPU-side, drops GP10/11/12 until ADC<VMIN,\r\n");
         uart_cli_send("                             WIDTH cycles act as minimum dwell)\r\n");
@@ -584,8 +585,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
         uart_cli_send("== Glitch Control ==\r\n");
         uart_cli_send("ARM [ON|OFF|TRACE]     - Arm/disarm/show (TRACE = trigger only, no glitch)\r\n");
+        uart_cli_send("       (ARM ON warns if trigger is NONE or target power is OFF)\r\n");
         uart_cli_send("DEBUG [ON|OFF]         - Toggle/show target UART debug display\r\n");
         uart_cli_send("GLITCH                 - Execute single glitch\r\n");
+        uart_cli_send("  GP22 (GLITCH_FIRED) = LOGIC marker, asserts at trigger BEFORE pause;\r\n");
+        uart_cli_send("       scope GP22->glitch edge to measure the actual PAUSE\r\n");
         uart_cli_send("PINS                   - Show pin configuration\r\n");
         uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
         uart_cli_send("RESET                  - Reset system\r\n");
@@ -621,7 +625,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH I2CGATE [attempts] [mv] - Glitch boot-ROM RDP check during I2C cmd stretch [STM32F401]\r\n");
         uart_cli_send("TARGET GLITCH I2CPROBE [samples] [us] - SWD-halt mid-stretch, read PC to map RDP-check timing [STM32F401]\r\n");
         uart_cli_send("TARGET GLITCH I2CPULSE [n] [lo] [hi] [step] [w] - PIO ns-resolution rail-pulse sweep (ticks) [STM32F401]\r\n");
-        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH] - Reset target\r\n");
+        uart_cli_send("TARGET RESET           - Pulse reset now (bare = execute, default GP15 300ms active-low)\r\n");
+        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW] - Configure only (then bare RESET to pulse)\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
         uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
@@ -963,8 +968,19 @@ void command_parser_execute(cmd_parts_t *parts) {
             uint32_t value = atoi(parts->parts[2]);
 
             if (strcmp(parts->parts[1], "PAUSE") == 0) {
-                glitch_set_pause(value);
-                uart_cli_printf("OK: PAUSE set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                // A non-zero PAUSE below a positive trigger-pipeline offset cannot be
+                // compensated (it would clamp to minimum latency and silently fire
+                // early). Reject it. PAUSE 0 (= no pause) is always allowed; negative
+                // offsets (e.g. UART) have no lower bound.
+                int32_t off = glitch_get_pause_offset();
+                if (value != 0 && off > 0 && value < (uint32_t)off) {
+                    api_error_printf("ERROR: PAUSE %u below the current trigger's pipeline offset "
+                                     "(%d cycles). Use PAUSE 0 (no pause) or PAUSE >= %d.\r\n",
+                                     value, off, off);
+                } else {
+                    glitch_set_pause(value);
+                    uart_cli_printf("OK: PAUSE set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                }
             } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
                 glitch_set_width(value);
                 uart_cli_printf("OK: WIDTH set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
@@ -1034,7 +1050,24 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (parts->count == 2) {
             if (strcmp(parts->parts[1], "ON") == 0) {
-                if (glitch_arm()) {
+                // Authoritative PAUSE-vs-offset guard (also catches PAUSE set before the
+                // trigger type). A non-zero PAUSE below a positive offset can't be
+                // compensated; refuse to arm rather than glitch at the wrong time.
+                glitch_config_t *gc = glitch_get_config();
+                int32_t off = glitch_get_pause_offset();
+                if (gc->pause_cycles != 0 && off > 0 && gc->pause_cycles < (uint32_t)off) {
+                    api_error_printf("ERROR: PAUSE %u below the trigger's pipeline offset (%d cycles) "
+                                     "— set PAUSE 0 or >= %d before arming.\r\n",
+                                     gc->pause_cycles, off, off);
+                } else if (glitch_arm()) {
+                    // Advisory warnings — armed either way, but these usually mean the
+                    // glitch won't do what the user expects.
+                    if (gc->trigger == TRIGGER_NONE) {
+                        uart_cli_send("WARNING: no trigger set (TRIGGER NONE) — only a manual GLITCH will fire\r\n");
+                    }
+                    if (!target_power_get_state()) {
+                        uart_cli_send("WARNING: target power is OFF — glitch will not affect the target\r\n");
+                    }
                     uart_cli_send("OK: System armed\r\n");
                 } else {
                     uart_cli_send("ERROR: Failed to arm system\r\n");
@@ -1177,7 +1210,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("GP%u  - Trigger Input\r\n", cfg->trigger_pin);
         uart_cli_printf("GP%u  - Clock Output\r\n", PIN_CLOCK);
         uart_cli_printf("GP%u  - Armed Status\r\n", PIN_ARMED);
-        uart_cli_printf("GP%u  - Glitch Fired\r\n", PIN_GLITCH_FIRED);
+        uart_cli_printf("GP%u  - Glitch Fired (LOGIC marker, asserts at trigger BEFORE pause; GP22->glitch = PAUSE)\r\n", PIN_GLITCH_FIRED);
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GP8  - Grbl UART TX (UART1 alternate)\r\n");
@@ -1471,29 +1504,51 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "RESPONSE") == 0) {
             target_uart_print_response_hex();
         } else if (strcmp(parts->parts[1], "RESET") == 0) {
-            // Parse configuration parameters with defaults
+            // Parse configuration parameters with defaults. Every token must be a
+            // recognized option (PIN <n> / PERIOD <ms> / HIGH / LOW) — an unknown or
+            // malformed token is an ERROR, never silently ignored (a dropped arg here
+            // leaves the reset mis-timed and the user unaware).
             uint8_t pin = 15;           // Default pin
             uint32_t period = 300;      // Default 300ms
             bool active_high = false;   // Default active low
             bool has_params = (parts->count > 2);
+            bool parse_ok = true;
 
             for (uint8_t i = 2; i < parts->count; i++) {
-                if (strcmp(parts->parts[i], "PIN") == 0 && i + 1 < parts->count) {
-                    pin = atoi(parts->parts[i + 1]);
-                    i++;  // Skip next part
-                } else if (strcmp(parts->parts[i], "PERIOD") == 0 && i + 1 < parts->count) {
-                    period = atoi(parts->parts[i + 1]);
-                    i++;  // Skip next part
+                if (strcmp(parts->parts[i], "PIN") == 0) {
+                    if (i + 1 >= parts->count) {
+                        api_error("ERROR: TARGET RESET PIN requires a GPIO number\r\n");
+                        parse_ok = false; break;
+                    }
+                    pin = atoi(parts->parts[++i]);
+                } else if (strcmp(parts->parts[i], "PERIOD") == 0) {
+                    if (i + 1 >= parts->count) {
+                        api_error("ERROR: TARGET RESET PERIOD requires a value in ms\r\n");
+                        parse_ok = false; break;
+                    }
+                    period = atoi(parts->parts[++i]);
                 } else if (strcmp(parts->parts[i], "HIGH") == 0) {
                     active_high = true;
+                } else if (strcmp(parts->parts[i], "LOW") == 0) {
+                    active_high = false;
+                } else {
+                    api_error_printf("ERROR: Unknown TARGET RESET option '%s' "
+                                     "(use PIN <n>, PERIOD <ms>, HIGH, or LOW; bare TARGET RESET pulses)\r\n",
+                                     parts->parts[i]);
+                    parse_ok = false; break;
                 }
+            }
+
+            if (!parse_ok) {
+                goto api_response;
             }
 
             // Always configure the pin (with defaults or specified values)
             target_reset_config(pin, period, active_high);
 
             if (has_params) {
-                uart_cli_printf("OK: Reset configured: GP%u, %u ms, active %s\r\n",
+                // Params = configure only (bare TARGET RESET is what pulses).
+                uart_cli_printf("OK: Reset configured: GP%u, %u ms, active %s (use bare 'TARGET RESET' to pulse)\r\n",
                                 pin, period, active_high ? "HIGH" : "LOW");
             } else {
                 // No parameters given — also execute the reset
