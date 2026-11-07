@@ -20,7 +20,7 @@ Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.co
 
 - **Precise timing control**: PIO-based glitch generation with 6.67ns resolution (150 MHz system clock)
 - **8 x Hardware UART**: Alternate configs are leveraged to share UART0/1 across multiple pinouts
-- **Multiple trigger modes**: GPIO, UART byte matching, or software triggers
+- **Multiple trigger modes**: GPIO edge, UART byte matching, I2C bootloader-command anchors, or manual (software) triggers — all bench-calibrated so the glitch lands exactly `PAUSE` cycles after the GP22 marker
 - **Glitch outputs**: Manual pulse output (GP2/GP7), ChipSHOUTER EMFI control (`CS` commands), and crowbar voltage glitching (EXTERNAL power mode, GP11)
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
@@ -185,8 +185,8 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 - VMIN's depth control applies to commands that route through the
   CPU-side ADC primitive — currently `TARGET GLITCH LPCBYPASS` (and the
   STM32 sweep/test routines that already use ADC gating). PIO-driven
-  triggers (UART/GPIO) still use WIDTH-only timed pulses until VMIN is
-  wired into that path.
+  triggers (UART/GPIO) and the CPU-sourced I2C trigger still use
+  WIDTH-only timed pulses until VMIN is wired into that path.
 - See [VMIN.md](VMIN.md) for the math (RC time constants vs decoupling
   caps) and the cap-strip experimental procedure used to reach µs-scale
   transients from the GP10/11/12 sink path.
