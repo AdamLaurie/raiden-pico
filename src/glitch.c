@@ -25,9 +25,43 @@ static uint sm_crowbar = 3;      // Crowbar gate pulse: PIO0 SM3 (2nd pulse_gene
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
 
-// Trigger latency compensation (~18 ticks / ~120ns from trigger detection to glitch output)
-// This is automatically subtracted from PAUSE values to account for trigger processing overhead
-#define TRIGGER_LATENCY_TICKS 18
+// Per-trigger-path PAUSE offset (SIGNED ticks @ 150MHz, 6.67ns each), SUBTRACTED
+// from PAUSE so the first glitch edge lands PAUSE ticks after the GLITCH_FIRED (GP22)
+// marker — identical glitch-vs-marker timing on every trigger path. A positive value
+// advances the pulse (compensates pipeline lag); a NEGATIVE value delays it (when the
+// marker itself lags the countdown start). All values bench-measured on a Rigol
+// MSO7014 vs an F401 so GP22->first-edge == PAUSE:
+//   I2C  (+14): CPU-forced hook (gpio_put(GP22)+irq_force) — GP22 marks the trigger
+//               instant. The old +64 was picked in NORMAL scope mode (100us/div), where
+//               a sub-pixel error hid a real -332.7ns (-49.9 cyc) offset. Re-measured
+//               2026-11-07 with Rigol RAW 0.8ns samples + interpolation (F401 I2C BL
+//               READ, TRIGGER I2C CMDACK): at comp 64, GP22->GP2 = PAUSE - 332.7ns, dead
+//               flat across PAUSE 300/600/900 (std 0.1ns, n=10) => true overhead ~14.1
+//               cyc, so comp 14 lands GP22->GP2 = PAUSE + ~0.7ns.
+//   UART (-152): PIO decoder path. Bench 2026-11-07 (F401 BL GID, unique 0x33 byte):
+//               at old comp 18, GP22->GP2 = PAUSE - 1140ns, perfectly slope-1 across
+//               PAUSE 150/300/600/900 (the GP22 pulse rises ~171 cyc AFTER the pulse-
+//               gen countdown start). Fine-tuned with RAW 0.4ns samples + interpolated
+//               crossing: -150 gave PAUSE-11.7ns (mean, std 3ns, n=10), so -152 lands
+//               within ~2ns of nominal.
+//   GPIO (10):  PIO edge-detect. Bench-measured (Rigol RAW + interpolation, GP3 jumpered
+//               to RESET, FALLING edge): at the old legacy comp 18, GP22->GP2 = PAUSE
+//               - 52.5ns, flat across PAUSE 150/300/600 (std 0.1ns, n=8) => hardware
+//               overhead ~10.1 cyc after the edge-detect debounce, so comp 10 lands
+//               GP22->GP2 = PAUSE + ~0.8ns. (GP3-fall -> GP22 debounce ~42ns, informational.)
+#define TRIGGER_LATENCY_TICKS_UART (-152)
+#define TRIGGER_LATENCY_TICKS_GPIO (10)
+#define TRIGGER_LATENCY_TICKS_I2C  (14)
+
+// Pick the signed PAUSE offset for the armed trigger path.
+static inline int32_t trigger_latency_ticks(trigger_type_t t) {
+    switch (t) {
+        case TRIGGER_I2C:  return TRIGGER_LATENCY_TICKS_I2C;
+        case TRIGGER_GPIO: return TRIGGER_LATENCY_TICKS_GPIO;
+        case TRIGGER_UART: return TRIGGER_LATENCY_TICKS_UART;
+        default:           return 0;  // TRIGGER_NONE: no path selected, no offset
+    }
+}
 
 // Configuration and state
 static glitch_config_t config;
@@ -245,6 +279,14 @@ void glitch_set_pause(uint32_t pause_cycles) {
     config.pause_cycles = pause_cycles;
 }
 
+// Signed pause-compensation offset (cycles) for the current trigger path. The CLI uses
+// this to reject an explicit non-zero PAUSE below a positive offset — where it could not
+// be compensated and would silently clamp to minimum latency. 0 for TRIGGER_NONE and for
+// negative-offset paths there is no lower bound (the offset only ADDS to PAUSE).
+int32_t glitch_get_pause_offset(void) {
+    return trigger_latency_ticks(config.trigger);
+}
+
 void glitch_set_width(uint32_t width_cycles) {
     config.width_cycles = width_cycles;
 }
@@ -451,6 +493,14 @@ bool glitch_arm(void) {
         pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
         pio_sm_restart(glitch_pio, sm_edge_detect);
         pio_sm_init(glitch_pio, sm_edge_detect, program_offset, &c_edge);
+        // Force GLITCH_FIRED (GP22) LOW before enabling. The RISING/FALLING edge-detect
+        // program only drives GP22 HIGH on fire and never back LOW, so a previous fire
+        // leaves the PIO output latch HIGH. pio_sm_init does not clear that latch, and
+        // the SIO gpio_put(…,0) at arm-start is a no-op while the pin is PIO-mapped — so
+        // without this, GP22 reads HIGH while armed-but-not-fired (and the scope sees no
+        // fresh rising edge on the next trigger). Exec a SET pins,0 through the SM's
+        // GP22 set-mapping to clear it.
+        pio_sm_exec(glitch_pio, sm_edge_detect, pio_encode_set(pio_pins, 0));
         pio_sm_set_enabled(glitch_pio, sm_edge_detect, true);
 
         // Save offset for disarm cleanup
@@ -490,11 +540,19 @@ bool glitch_arm(void) {
 
     // Use cycle values directly - no conversion needed
     // System runs at 150MHz, so 1 cycle = 6.67ns
-    // Compensate PAUSE for trigger latency (~18 ticks / ~120ns)
-    if (config.pause_cycles >= TRIGGER_LATENCY_TICKS) {
-        precalc_pause_cycles = config.pause_cycles - TRIGGER_LATENCY_TICKS;
-    } else {
+    // Offset PAUSE by this trigger path's fixed GP22-marker->first-edge delta so the
+    // glitch lands PAUSE ticks after GP22 on every path (signed: negative ADDS to
+    // PAUSE — see trigger_latency_ticks / the TRIGGER_LATENCY_TICKS_* table above).
+    int32_t latency_ticks = trigger_latency_ticks(config.trigger);
+    if (config.pause_cycles == 0) {
+        // PAUSE 0 = "no pause": fire at minimum latency and DO NOT apply the path
+        // offset — otherwise a negative offset (e.g. UART's -152) would inject a
+        // bogus pause. A too-small non-zero PAUSE is rejected at SET PAUSE / ARM.
         precalc_pause_cycles = 0;
+    } else {
+        int64_t adj_pause = (int64_t)config.pause_cycles - latency_ticks;
+        // Guard: precalc can never be negative (would underflow the uint32 FIFO load).
+        precalc_pause_cycles = (adj_pause > 0) ? (uint32_t)adj_pause : 0;
     }
     precalc_width_cycles = config.width_cycles;
     precalc_gap_cycles = config.gap_cycles;

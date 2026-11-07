@@ -104,6 +104,61 @@ class TestGlitchParams:
         assert "ERROR" in r
 
 
+class TestPauseOffset:
+    """A non-zero PAUSE below the current trigger's pipeline offset must be rejected
+    (it can't be compensated and would silently clamp to minimum latency). PAUSE 0
+    (= no pause) and PAUSE >= offset are allowed. I2C offset = +14 cyc; UART is
+    negative so it has no lower bound. Each test restores PAUSE 0 / TRIGGER NONE."""
+
+    def teardown_pause(self, raiden):
+        raiden.cmd("SET PAUSE 0")
+        raiden.cmd("TRIGGER NONE")
+
+    def test_pause_zero_allowed_with_i2c(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11")
+        r = raiden.cmd("SET PAUSE 0")
+        assert "OK" in r
+        self.teardown_pause(raiden)
+
+    def test_pause_below_i2c_offset_rejected(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11")          # offset +14
+        r = raiden.cmd("SET PAUSE 10")
+        assert "ERROR" in r
+        self.teardown_pause(raiden)
+
+    def test_pause_at_i2c_offset_allowed(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11")
+        r = raiden.cmd("SET PAUSE 14")
+        assert "OK" in r
+        self.teardown_pause(raiden)
+
+    def test_pause_above_i2c_offset_allowed(self, raiden):
+        raiden.cmd("TRIGGER I2C 0x11")
+        r = raiden.cmd("SET PAUSE 300")
+        assert "OK" in r
+        self.teardown_pause(raiden)
+
+    def test_small_pause_allowed_on_uart(self, raiden):
+        # UART offset is negative (-152) -> adds to PAUSE, no lower bound.
+        raiden.cmd("TRIGGER UART 79 RX")
+        r = raiden.cmd("SET PAUSE 30")
+        assert "OK" in r
+        self.teardown_pause(raiden)
+
+    def test_arm_rejects_pause_below_offset(self, raiden):
+        # PAUSE set before the trigger (allowed then), invalid once I2C is selected:
+        # the ARM-time guard must catch it.
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("SET PAUSE 10")              # no trigger yet -> allowed
+        raiden.cmd("TRIGGER I2C 0x11")
+        r = raiden.cmd("ARM ON")
+        # Clean up BEFORE asserting so a failed assert can never leak armed state
+        # into the next test (that was masking this failure as "already armed").
+        raiden.cmd("ARM OFF")
+        self.teardown_pause(raiden)
+        assert "ERROR" in r
+
+
 # ── Trigger configuration ────────────────────────────────────
 
 class TestTrigger:
@@ -220,6 +275,22 @@ class TestArm:
         r = raiden.cmd("ARM FOOBAR")
         assert "ERROR" in r
 
+    def test_arm_warns_no_trigger(self, raiden):
+        # ARM ON with no trigger still arms (manual GLITCH works) but warns.
+        raiden.cmd("TRIGGER NONE")
+        r = raiden.cmd("ARM ON")
+        assert "WARNING" in r and "trigger" in r.lower()
+        assert "OK" in r          # still armed
+        raiden.cmd("ARM OFF")
+
+    def test_arm_no_trigger_warning_when_set(self, raiden):
+        # With a trigger configured, the no-trigger warning must NOT appear.
+        raiden.cmd("TRIGGER GPIO RISING")
+        r = raiden.cmd("ARM ON")
+        assert "no trigger" not in r.lower()
+        raiden.cmd("ARM OFF")
+        raiden.cmd("TRIGGER NONE")
+
 
 # ── Clock generator ──────────────────────────────────────────
 
@@ -301,6 +372,36 @@ class TestTargetType:
         raiden.cmd("TARGET STM32F1")
         r = raiden.cmd("STATUS", wait=2)
         assert "STM32F1" in r
+
+
+class TestTargetReset:
+    """TARGET RESET must reject unknown/malformed options rather than silently
+    ignoring them (a dropped arg leaves the reset mis-timed and the user unaware).
+    Bare TARGET RESET pulses; any param configures only. These tests only exercise
+    the error paths and the (harmless, high-Z) configure path — not a bare pulse."""
+
+    def test_bare_number_rejected(self, raiden):
+        # 'TARGET RESET 400' used to silently keep 300ms; now it must error.
+        r = raiden.cmd("TARGET RESET 400")
+        assert "ERROR" in r and "400" in r
+
+    def test_unknown_option_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET WIBBLE")
+        assert "ERROR" in r and "WIBBLE" in r
+
+    def test_pin_missing_value_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET PIN")
+        assert "ERROR" in r
+
+    def test_period_missing_value_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET PERIOD")
+        assert "ERROR" in r
+
+    def test_period_configures(self, raiden):
+        # Valid configure (no pulse): echoes the period, restores default after.
+        r = raiden.cmd("TARGET RESET PERIOD 400")
+        assert "OK" in r and "400" in r
+        raiden.cmd("TARGET RESET PERIOD 300")   # restore default
 
     def test_target_timeout_roundtrip(self, raiden):
         raiden.cmd("TARGET TIMEOUT 100")
