@@ -17,7 +17,8 @@
 // GP4/GP5 used for Target UART1
 // GP8/GP9 used for Grbl UART1 (alternate)
 // GP10/GP11 used for external PSU UART1 (alternate, RP2350 funcsel 0x0b) —
-//   mutually exclusive with the GP10/11/12 target power group (see psu.h).
+//   mutually exclusive with GP10/11 of the target power group (see psu.h). The
+//   EXTERNAL-mode crowbar gate (GP12) is outside that pair, so it coexists.
 //   Requires an RS-232 level shifter (e.g. MAX3232) between the PSU DB9 and
 //   these 3.3V TTL pins.
 #define PSU_UART_ID      uart1
@@ -34,13 +35,14 @@
 
 // Power group GP10/11/12 is mode-multiplexed (see power_mode_t):
 //   INTERNAL: GP10/11/12 are the ganged target power source/sink (POWER_MASK).
-//   EXTERNAL: GP10 = supply ON/OFF, GP11 = crowbar gate, GP12 = reserved spare.
-#define PIN_CROWBAR_GATE 11    // GP11 — crowbar MOSFET gate in EXTERNAL power mode (= POWER_PIN2)
+//   EXTERNAL: GP10 = supply ON/OFF, GP11 = reserved spare, GP12 = crowbar gate.
+// The gate is on GP12 (not GP11) so it stays usable while the PSU UART holds GP10/11.
+#define PIN_CROWBAR_GATE 12    // GP12 — crowbar MOSFET gate in EXTERNAL power mode (= POWER_PIN3)
 
 // Target power mode: how the GP10/11/12 group is driven (mutually exclusive by physics)
 typedef enum {
     POWER_MODE_INTERNAL = 0,   // GP10/11/12 ganged as the target power source (default)
-    POWER_MODE_EXTERNAL        // GP10 supply enable, GP11 crowbar gate, GP12 spare
+    POWER_MODE_EXTERNAL        // GP10 supply enable, GP11 spare, GP12 crowbar gate
 } power_mode_t;
 
 // Trigger Types

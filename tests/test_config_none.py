@@ -495,6 +495,21 @@ class TestTargetReset:
         r = raiden.cmd("TARGET POWER CYCLE 100", wait=1.5)
         assert "ERROR" not in r
 
+    @pytest.mark.parametrize("cmd", ["TARGET REBOOT", "TARGET REBOOT 100",
+                                     "TARGET POWER REBOOT 100", "TARGET REB 100"])
+    def test_target_reboot_alias(self, raiden, cmd):
+        """TARGET REBOOT / TARGET POWER REBOOT are aliases for TARGET POWER CYCLE."""
+        r = raiden.cmd(cmd, wait=1.5)
+        assert "ERROR" not in r
+        assert "OK: Target power cycling" in r
+
+    @pytest.mark.parametrize("cmd", ["TARGET REBOOT WIBBLE", "TARGET REBOOT 100 200",
+                                     "TARGET POWER REBOOT WIBBLE", "TARGET POWER CYCLE 100 200"])
+    def test_target_reboot_bad_args(self, raiden, cmd):
+        r = raiden.cmd(cmd, wait=1.5)
+        assert "ERROR" in r
+        assert "cycling" not in r
+
     def test_target_bad_subcommand(self, raiden):
         r = raiden.cmd("TARGET FOOBAR")
         assert "ERROR" in r
@@ -633,6 +648,13 @@ class TestPsu:
             assert "power is ON" in r or "TARGET POWER OFF" in r
         finally:
             raiden.cmd("TARGET POWER OFF")
+
+    def test_help_documents_gp12_crowbar_coexistence(self, raiden):
+        """The crowbar gate is GP12 (moved off GP11 so it coexists with the PSU
+        UART on GP10/11); HELP must say so. Text-only — no pin is driven."""
+        r = raiden.cmd("HELP", wait=5)
+        assert "EXT = GP10 supply, GP11 spare, GP12 crowbar gate" in r
+        assert "GP12 crowbar gate stay usable alongside the PSU" in r
 
 
 # ── Glitch execution ─────────────────────────────────────────

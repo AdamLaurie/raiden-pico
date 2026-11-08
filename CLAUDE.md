@@ -32,6 +32,7 @@ pytest tests/ -v --config=trace    # requires shunt resistor + ADC1 wiring
 pytest tests/ -v --config=swd-rdp --destructive   # DESTRUCTIVE: mass-erases target flash
 pytest tests/ -v --config=power-int   # drives GP10/11/12 in INTERNAL mode — confirm ganged wiring / no target
 pytest tests/ -v --config=power-ext   # EXTERNAL mode + FIRES the crowbar gate — confirm crowbar wiring / no target
+pytest tests/ -v --config=psu         # claims the PSU UART (GP10 TX idles HIGH) — GP10/11 to PSU MAX3232 or unconnected
 pytest tests/test_config_swd.py::test_name -v      # single test
 ```
 
@@ -61,7 +62,7 @@ Raiden Pico is RP2350 firmware that turns a Pico 2 into a fault-injection / glit
 
 ### Pin assignments
 
-Authoritative source is `include/config.h` (and `swd.h` for debug pins); the live `PINS` CLI command prints current wiring. Key fixed pins: glitch out GP2 (inverted GP7), clock GP6, ChipShouter UART0 GP0/GP1, ARMED GP16, GLITCH_FIRED GP22, SWD SWCLK/SWDIO GP17/GP18, target nRST GP15. ADC trace uses a shunt on GP27/ADC1.
+Authoritative source is `include/config.h` (and `swd.h` for debug pins); the live `PINS` CLI command prints current wiring. Key fixed pins: glitch out GP2 (inverted GP7), EXTERNAL-mode crowbar gate GP12 (coexists with the PSU UART on GP10/11), clock GP6, ChipShouter UART0 GP0/GP1, ARMED GP16, GLITCH_FIRED GP22, SWD SWCLK/SWDIO GP17/GP18, target nRST GP15. ADC trace uses a shunt on GP27/ADC1.
 
 > Note: `PIO_ARCHITECTURE.md` describes the intended SM allocation but predates some pin moves — trust `config.h` and `PINS` for actual pins.
 

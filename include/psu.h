@@ -8,9 +8,11 @@
 // External programmable PSU control (TENMA 72-2540 / Korad ASCII protocol).
 //
 // The PSU is driven over UART1 routed to GP10/GP11 (RP2350 alternate funcsel),
-// which are ALSO the target power group (GP10/11/12). The two uses are mutually
-// exclusive: claiming the PSU UART releases the power group, and the power-group
-// commands refuse while the PSU holds the pins. A MAX3232 (or equivalent) RS-232
+// which are ALSO GP10/11 of the target power group (GP10/11/12). Claiming the PSU
+// UART releases those two pins; while it holds them the PSU becomes the target
+// supply: TARGET POWER ON/OFF/CYCLE and the auto power-on are routed to the PSU
+// output (psu_supply_* below), TARGET POWER INT refuses, and TARGET POWER EXT
+// works (it only touches the GP12 crowbar gate). A MAX3232 (or equivalent) RS-232
 // transceiver sits between the PSU DB9 and these 3.3V pins.
 //
 // Protocol notes (Korad/TENMA): commands are ASCII with no terminator; queries
@@ -58,5 +60,18 @@ int psu_read_setpoint_current(char *buf, size_t buflen);  // ISET1?
 //   bit5 = key lock (1)           bit6 = output ON(1)/OFF(0)
 // (bit1 reads 1 on this single-channel unit; bits 2,3,7 unused.)
 bool psu_read_status(uint8_t *status_out);
+
+// Target-supply helpers used by the TARGET POWER routing (target_uart.c).
+// psu_supply_state: output on/off from the cached state (last OUT sent / STATUS?
+//   read), querying STATUS? only when unknown. False = no response.
+// psu_supply_set: OUT1/OUT0, then confirm via STATUS? bit6. False = no response
+//   or the PSU did not report the requested state.
+// psu_setpoint_mv: VSET1? in mV, -1 on no response.
+// psu_wait_vout: poll VOUT1? until it is >= (rising) or <= (falling) threshold_mv
+//   or timeout_ms passes; returns the last reading in mV (-1 = never answered).
+bool psu_supply_state(bool *on);
+bool psu_supply_set(bool on);
+int32_t psu_setpoint_mv(void);
+int32_t psu_wait_vout(bool rising, int32_t threshold_mv, uint32_t timeout_ms);
 
 #endif // PSU_H

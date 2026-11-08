@@ -11,6 +11,7 @@ Usage:
     pytest tests/ -v --config=swd-rdp       # + destructive RDP tests
     pytest tests/ -v --config=power-int     # + INTERNAL-mode power tests
     pytest tests/ -v --config=power-ext     # + EXTERNAL/crowbar power tests
+    pytest tests/ -v --config=psu           # + PSU UART claim (retasks GP10/11)
 
 SAFETY — power-int / power-ext: these drive the GP10/11/12 power group
 (power on/off/cycle, mode switching, and the crowbar gate fires in EXTERNAL).
@@ -19,6 +20,11 @@ disconnected: on the wrong wiring they can damage a connected target or short
 GP10 against GP11/12 (the ganged-harness gotcha) and report false failures.
 That's why they never run under the default config_none. Dual-mode tests carry
 BOTH markers and require both flags.
+
+SAFETY — psu: claims the PSU UART, which retasks GP10 as UART TX (idles HIGH)
+and GP11 as RX. Run only with GP10/11 wired to the PSU's MAX3232 or left
+unconnected — never to a target power harness or a load-switch enable, which
+the idle-HIGH TX would energise. No PSU needs to be attached.
 """
 
 import os
@@ -38,6 +44,7 @@ _CONFIG_MARKERS = {
     "config_swd_rdp": "swd-rdp",
     "config_power_int": "power-int",
     "config_power_ext": "power-ext",
+    "config_psu": "psu",
 }
 
 
@@ -46,7 +53,7 @@ def pytest_addoption(parser):
         "--config",
         action="append",
         default=[],
-        help="Enable a wiring config: swd, sweep, trace, swd-rdp, power-int, power-ext. Repeat for multiple.",
+        help="Enable a wiring config: swd, sweep, trace, swd-rdp, power-int, power-ext, psu. Repeat for multiple.",
     )
     parser.addoption(
         "--destructive",

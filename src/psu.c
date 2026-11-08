@@ -28,6 +28,11 @@
 #define PSU_READ_TOTAL_MS 400    // hard cap on a single query read
 
 static bool psu_active = false;
+// Last known output state: -1 unknown, 0 off, 1 on. Set by every OUT we send and
+// every STATUS? we read, so the TARGET POWER routing (repeated auto power-on per
+// SYNC) does not pay a STATUS? round trip each time. A front-panel toggle is not
+// seen until the next STATUS? read (PSU STATUS / an OUT confirmation).
+static int8_t psu_out_cached = -1;
 
 // Runtime-tunable UART baud (default from config.h). TENMA/Korad units vary and
 // some menus can be set to a non-default rate, so `PSU BAUD <rate>` lets the
@@ -82,6 +87,7 @@ bool psu_begin(void) {
     gpio_set_function(PSU_UART_RX_PIN, UART_FUNCSEL_NUM(PSU_UART_ID, PSU_UART_RX_PIN));
 
     psu_active = true;
+    psu_out_cached = -1;
     uart_cli_printf("PSU UART claimed: UART1 on GP%d(TX)/GP%d(RX) @ %lu 8N1 "
                     "(power group released)\r\n",
                     PSU_UART_TX_PIN, PSU_UART_RX_PIN, (unsigned long)psu_baud);
@@ -95,6 +101,7 @@ void psu_release(void) {
     gpio_deinit(PSU_UART_TX_PIN);
     gpio_deinit(PSU_UART_RX_PIN);
     psu_active = false;
+    psu_out_cached = -1;
     // Power-group pins are re-initialised lazily by the next TARGET POWER command.
     uart_cli_send("PSU UART released: GP10/11 returned to the target power group\r\n");
 }
@@ -162,6 +169,7 @@ bool psu_set_current_ma(uint32_t ma) {
 bool psu_output(bool on) {
     if (!psu_begin()) return false;
     psu_send(on ? "OUT1" : "OUT0");
+    psu_out_cached = on ? 1 : 0;
     return true;
 }
 
@@ -195,6 +203,59 @@ bool psu_read_status(uint8_t *status_out) {
     char b[4];
     int n = psu_do_query("STATUS?", b, sizeof(b));
     if (n < 1) return false;
+    psu_out_cached = (b[0] & 0x40) ? 1 : 0;   // bit6 = output on
     if (status_out) *status_out = (uint8_t)b[0];
     return true;
+}
+
+// ---- Target-supply helpers (TARGET POWER routing while the PSU is claimed) ----
+
+// Parse a Korad fixed-point reply ("03.30", "0.125") into thousandths
+// (mV / mA). Returns -1 if there are no digits.
+static int32_t psu_parse_milli(const char *s) {
+    int32_t whole = 0, frac = 0, fdigits = 0;
+    bool any = false, dot = false;
+    for (; *s; s++) {
+        if (*s >= '0' && *s <= '9') {
+            any = true;
+            if (!dot) whole = whole * 10 + (*s - '0');
+            else if (fdigits < 3) { frac = frac * 10 + (*s - '0'); fdigits++; }
+        } else if (*s == '.' && !dot) {
+            dot = true;
+        } else if (any) {
+            break;
+        }
+    }
+    if (!any) return -1;
+    while (fdigits < 3) { frac *= 10; fdigits++; }
+    return whole * 1000 + frac;
+}
+
+bool psu_supply_state(bool *on) {
+    if (psu_out_cached < 0 && !psu_read_status(NULL)) return false;
+    *on = psu_out_cached == 1;
+    return true;
+}
+
+bool psu_supply_set(bool on) {
+    if (!psu_output(on)) return false;
+    if (!psu_read_status(NULL)) { psu_out_cached = -1; return false; }
+    return psu_out_cached == (on ? 1 : 0);
+}
+
+int32_t psu_setpoint_mv(void) {
+    char b[16];
+    if (psu_read_setpoint_voltage(b, sizeof(b)) <= 0) return -1;
+    return psu_parse_milli(b);
+}
+
+int32_t psu_wait_vout(bool rising, int32_t threshold_mv, uint32_t timeout_ms) {
+    char b[16];
+    int32_t mv = -1;
+    absolute_time_t end = make_timeout_time_ms(timeout_ms);
+    do {
+        if (psu_read_voltage(b, sizeof(b)) > 0) mv = psu_parse_milli(b);
+        if (mv >= 0 && (rising ? mv >= threshold_mv : mv <= threshold_mv)) break;
+    } while (!time_reached(end));
+    return mv;
 }

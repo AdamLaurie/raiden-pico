@@ -21,7 +21,7 @@ Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.co
 - **Precise timing control**: PIO-based glitch generation with 6.67ns resolution (150 MHz system clock)
 - **8 x Hardware UART**: Alternate configs are leveraged to share UART0/1 across multiple pinouts
 - **Multiple trigger modes**: GPIO edge, UART byte matching, I2C bootloader-command anchors, or manual (software) triggers — all bench-calibrated so the glitch lands exactly `PAUSE` cycles after the GP22 marker
-- **Glitch outputs**: Manual pulse output (GP2/GP7), ChipSHOUTER EMFI control (`CS` commands), and crowbar voltage glitching (EXTERNAL power mode, GP11)
+- **Glitch outputs**: Manual pulse output (GP2/GP7), ChipSHOUTER EMFI control (`CS` commands), and crowbar voltage glitching (EXTERNAL power mode, GP12)
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
 - **GRBL XYZ support**: Direct UART control of GRBL CNC platform
@@ -471,16 +471,43 @@ OK: sent 0x7F autobaud sync at 115200 baud
 - `ON` - Enable power
 - `OFF` - Disable power
 - `CYCLE` - Power cycle with optional duration (default: 300ms)
+- `TARGET REBOOT [ms]` and `TARGET POWER REBOOT [ms]` are aliases for `TARGET POWER CYCLE [ms]`
+  (same path, so the PSU routing below applies too). `REBOOT` alone reboots the **Pico**, not the target.
 - In `EXTERNAL` mode these drive **GP10 only** (the supply enable); GP11/GP12 are not touched.
+- While the PSU UART holds GP10/11 (after any `PSU` command), `ON`/`OFF`/`CYCLE` and the
+  auto power-on drive the **PSU output** instead. `CYCLE` waits (up to 5 s) for the
+  measured output to fall to ≤300 mV before starting the OFF time, because the PSU's
+  output capacitance can hold the rail up long after `OUT0`; it warns if it never gets
+  there. `ON` waits for the output to reach 90 % of Vset. A PSU that doesn't answer gives
+  `ERROR: PSU did not confirm output ...` — never a false OK.
 - **Boot default is OFF** (de-energized) in both modes. The target is powered on demand
   by `TARGET POWER ON`, or automatically by the auto-power-on at the `TARGET SYNC` /
   `SWD CONNECT` choke points. Scripts that drive the target without going through a choke
   point (e.g. `TARGET RESET`-only or JTAG flows) must issue `TARGET POWER ON` first.
 
+#### Power modes
+
+The GP10/11/12 group has four modes. The power mode (`INT`/`EXT`) and whether the PSU
+UART is claimed are independent, which gives the two PSU rows.
+
+| Mode | How to enter | GP10 | GP11 | GP12 | Target supply (`TARGET POWER ON/OFF/CYCLE` + auto power-on) | Glitching available |
+|---|---|---|---|---|---|---|
+| **INTERNAL** (boot default) | `TARGET POWER INT` | Power out | Power out | Power out | GP10/11/12 ganged, 3 × 12 mA, feed the target directly | CPU-side ADC-gated sink: `TARGET GLITCH SWEEP/TEST/PAYLOAD/BYPASS`, LPC bypass, VMIN, I2CPULSE. Slow (RC-limited) — brown-out, not ns faults |
+| **EXTERNAL** | `TARGET POWER EXT [AHIGH\|ALOW]` | Supply enable (HIGH = on) → external load switch | Spare (LOW) | **Crowbar gate** | GP10 switches an external load switch | **PIO crowbar on GP12**, fired by any trigger with PAUSE/WIDTH/GAP/COUNT. CPU-side power glitches refused |
+| **EXTERNAL + PSU** (combo) | Any `PSU` command, plus `TARGET POWER EXT` (either order) | PSU UART TX | PSU UART RX | **Crowbar gate** | PSU output (OUT1/OUT0), confirmed via STATUS | **PIO crowbar on GP12**. CPU-side power glitches refused |
+| **INTERNAL + PSU** (PSU only) | Any `PSU` command while `INT` | PSU UART TX | PSU UART RX | Released (unused) | PSU output | None from the power group (CPU-side glitches refused; no crowbar). GP2/ChipSHOUTER still work |
+
+- `PSU RELEASE` leaves a PSU row and returns GP10/11 to the power group (the supply is then
+  GP10 again, and is OFF until `TARGET POWER ON`).
+- `TARGET POWER INT` is refused while the PSU is claimed (it needs GP10/11); `EXT` is allowed.
+- Mode changes are refused while armed (`ARM OFF` first).
+- GP2/GP7 (glitch output) and the ChipSHOUTER trigger work in every mode.
+
 **`TARGET POWER [INT|EXT [AHIGH|ALOW]]`** - Select how the GP10/11/12 group is driven
 - `INT` (default) - GP10/11/12 ganged as the target power source/sink (current behaviour).
-- `EXT` - GP10 = supply enable, **GP11 = crowbar gate** (PIO-driven, emits the same glitch
-  waveform as GP2 for any trigger type), GP12 = reserved spare.
+- `EXT` - GP10 = supply enable, GP11 = reserved spare, **GP12 = crowbar gate** (PIO-driven,
+  emits the same glitch waveform as GP2 for any trigger type). The gate is on GP12 so it
+  keeps working while the external PSU holds GP10/11.
 - `AHIGH` (default) - crowbar gate asserts HIGH, idle LOW (low-side N-FET).
 - `ALOW` - crowbar gate asserts LOW, idle HIGH (high-side P-FET / active-low driver).
 - Bare `TARGET POWER` prints the power on/off state, the current mode, and gate polarity. Disarm (`ARM OFF`)
@@ -835,10 +862,14 @@ campaigns — beyond what the onboard GP10/11/12 switching can do.
 - **Wiring:** the 72-2540's DB9 is true RS-232 (±12 V), so a **MAX3232** (or
   equivalent) transceiver is required between the DB9 and GP10/11. Alternatively
   use the unit's USB port via a USB-serial adapter.
-- **Mutually exclusive with `TARGET POWER`:** GP10/11 are shared with the target
-  power group. A PSU command releases the power group and claims the pins; while
-  the PSU holds them, `TARGET POWER ON/OFF/CYCLE/INT/EXT` returns an error until
-  you run `PSU RELEASE`. Ensure `TARGET POWER OFF` before the first PSU command.
+- **Becomes the target supply when claimed:** a PSU command releases GP10/11 from the
+  target power group and claims them. While the PSU holds them, `TARGET POWER
+  ON/OFF/CYCLE` and the auto power-on at SYNC/CONNECT drive the PSU output, and
+  `TARGET POWER INT` is refused until `PSU RELEASE`. Ensure `TARGET POWER OFF` before
+  the first PSU command. See the power-modes table under `TARGET POWER`.
+- **Coexists with the crowbar:** `TARGET POWER EXT` still works while the PSU is
+  claimed — it only touches the GP12 crowbar gate — so the PSU can supply the target
+  while the PIO crowbar glitches it.
 - **Verified end-to-end on real hardware** (Pico → YL-97/MAX3232 → RS-232 DB9 →
   72-2540): `PSU ID` returns the unit identity, `VOLT`/`CURR` set and read back,
   `ON`/`OFF` drive the output with the correct STATUS decode, and the mutual-
@@ -1248,7 +1279,7 @@ Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
 ### STM32 Attack / RDP Bypass
 
 - **GPIO 10/11/12** - Target Power (ganged, **boot default OFF**, 12mA drive each) — *INTERNAL power mode*
-  - GP10/11 double as the **external PSU UART1** (via `PSU` commands, needs a MAX3232); mutually exclusive with the power group
+  - GP10/11 double as the **external PSU UART1** (via `PSU` commands, needs a MAX3232); exclusive with the power group, but the EXTERNAL-mode GP12 crowbar gate coexists
 - **GPIO 13** - BOOT0 control
 - **GPIO 14** - BOOT1 control
 - **GPIO 15** - nRST (shared with Target Reset)
@@ -1261,14 +1292,46 @@ Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
 When the GP10/11/12 group is switched to EXTERNAL mode (`TARGET POWER EXT`), the
 three pins are re-tasked (they are mutually exclusive with INTERNAL power-source use):
 
-- **GPIO 10** - Supply enable (driven by `TARGET POWER ON/OFF/CYCLE`)
-- **GPIO 11** - **Crowbar gate** — PIO-driven, emits the same glitch waveform as GP2 (same
+- **GPIO 10** - Supply enable (driven by `TARGET POWER ON/OFF/CYCLE`; active HIGH)
+- **GPIO 11** - Reserved spare (driven LOW)
+- **GPIO 12** - **Crowbar gate** — PIO-driven, emits the same glitch waveform as GP2 (same
   WIDTH/GAP/COUNT timing) for any trigger type, generated by a second pulse-generator state
   machine fired from the same trigger as GP2.
   Polarity is selectable: `AHIGH` = assert HIGH / idle LOW (low-side N-FET, default);
   `ALOW` = assert LOW / idle HIGH (high-side P-FET). The gate sits at its de-asserted idle
   level at boot, while disarmed, and on disarm — so a wrong/floating idle can't clamp the rail.
-- **GPIO 12** - Reserved spare (claimed, no function yet)
+  Driven at 12mA with fast slew for clean ns-scale edges into the gate driver.
+
+With the external PSU in use, GP10/11 carry its UART instead (the PSU is then the
+supply, switched with `PSU ON/OFF`); the GP12 crowbar gate is unaffected.
+
+#### Crowbar switch (recommended starting circuit — not yet bench-verified)
+
+A GPIO cannot charge a power-MOSFET gate fast enough for the ~25–35 ns pulses that
+core-rail crowbar glitching uses (an AO3400-class FET needs ~6 nC; a pin gives
+>100 ns edges). Put a gate driver between GP12 and the FET:
+
+```
+             +5V (Pico VBUS, pin 40)
+                │
+             1µF + 100nF to GND (at the driver)
+                │
+GP12 ──100Ω──┬──IN+ ┌───────────┐
+(pin 16)     │      │ UCC27517A │ OUT ──4.7Ω──┬── G ┐
+            10k  ┌─ IN−         │             │     │ Q1 AO3400A / IRLML6344 (N-FET)
+             │   │  └─────┬─────┘            10k    D ── target rail (e.g. VCAP)  ≤1 cm
+            GND GND      GND                  │     S ── target GND               ≤1 cm
+                                             GND
+Pico GND ══════ target GND   (short, heavy — crowbar current return path)
+```
+
+- Non-inverting driver → use `TARGET POWER EXT AHIGH`.
+- The 10k on the driver input holds the FET off while the Pico resets (GP12 floats);
+  the 10k on the gate holds it off if the driver is unpowered. 4.7Ω (0–10Ω) damps ringing.
+- Mount driver + FET on the target, at the rail pin and its ground pad. Only the GP12
+  signal wire may be long. No breadboard in the drain/source loop.
+- Verify on a scope with the drain disconnected first (`scripts/crowbar_scope_test.py`),
+  then with the rail connected — see the probe plan in the script header.
 
 GP2 stays the polarity-aware glitch/trigger output throughout, so an external glitcher
 (e.g. ChipSHOUTER) and the crowbar gate can be driven from the same trigger.
@@ -1293,7 +1356,7 @@ Raiden Pico uses the RP2350's PIO for precise timing-critical operations only:
 - **PIO0 SM0** - GPIO edge detection for trigger input
 - **PIO0 SM1** - Glitch pulse generation (GP2 normal / GP7 inverted), cycle-accurate
 - **PIO0 SM2** - UART RX decoder for byte-matching triggers (GP5); also the IRQ-trigger helper for manual `GLITCH`
-- **PIO0 SM3** - Crowbar gate pulse generator (EXTERNAL mode, GP11) — a second copy of the glitch pulse program, fired from the same trigger as GP2
+- **PIO0 SM3** - Crowbar gate pulse generator (EXTERNAL mode, GP12) — a second copy of the glitch pulse program, fired from the same trigger as GP2
 - **PIO1 SM0** - Clock generator (manual clock output / clock-boost)
 
 ### Hardware Peripherals

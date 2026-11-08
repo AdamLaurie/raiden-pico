@@ -17,12 +17,12 @@ shots against scope events.
 
 SCOPE PROBES
   CH1 = GP2  (normal glitch output)
-  CH2 = GP11 (crowbar gate, EXTERNAL mode only)   GND -> Pico GND
-  Trigger: GP2 rising (AHIGH scenarios) or GP11 — normal mode, ~200 ns/div.
+  CH2 = GP12 (crowbar gate, EXTERNAL mode only)   GND -> Pico GND
+  Trigger: GP2 rising (AHIGH scenarios) or GP12 — normal mode, ~200 ns/div.
 
 WIRING NOTE
-  For the EXTERNAL scenarios, GP11 must be on its own line (NOT strapped to the
-  GP10/12 ganged power harness) or driving GP11 fights GP10. Firmware-side checks
+  For the EXTERNAL scenarios, GP12 must be on its own line (NOT strapped to the
+  GP10/11 ganged power harness) or driving GP12 fights GP10. Firmware-side checks
   (count / disarm) work regardless of wiring.
 
 USAGE
@@ -76,31 +76,31 @@ SCENARIOS = [
     dict(name="INTERNAL baseline (no crowbar)", mode="INT", pol=None,
          pause=0, width=75, gap=75, count=1,
          scope="GP2: one ~500ns HIGH pulse. GP7 (if probed): inverted. "
-               "GP11 is a static power output here (no crowbar)."),
+               "GP12 is a static power output here (no crowbar)."),
     dict(name="EXTERNAL AHIGH, single pulse", mode="EXT", pol="AHIGH",
          pause=0, width=75, gap=75, count=1,
-         scope="GP11 idles LOW, one ~500ns HIGH pulse coincident with GP2."),
+         scope="GP12 idles LOW, one ~500ns HIGH pulse coincident with GP2."),
     dict(name="EXTERNAL ALOW, single pulse (inverted gate)", mode="EXT", pol="ALOW",
          pause=0, width=75, gap=75, count=1,
-         scope="GP11 idles HIGH, one ~500ns LOW pulse (inverse of GP2). No trailing dip."),
+         scope="GP12 idles HIGH, one ~500ns LOW pulse (inverse of GP2). No trailing dip."),
     dict(name="EXTERNAL AHIGH, COUNT=3 burst", mode="EXT", pol="AHIGH",
          pause=0, width=75, gap=75, count=3,
-         scope="GP11: 3 HIGH pulses (~500ns) with ~500ns gaps, matching GP2. All 3 present."),
+         scope="GP12: 3 HIGH pulses (~500ns) with ~500ns gaps, matching GP2. All 3 present."),
     dict(name="EXTERNAL ALOW, COUNT=3 burst (inverted)", mode="EXT", pol="ALOW",
          pause=0, width=75, gap=75, count=3,
-         scope="GP11: 3 LOW pulses with ~500ns gaps (inverse of GP2). All 3 present, no extra edges."),
+         scope="GP12: 3 LOW pulses with ~500ns gaps (inverse of GP2). All 3 present, no extra edges."),
     dict(name="EXTERNAL AHIGH, narrow pulse (WIDTH=15 ~100ns)", mode="EXT", pol="AHIGH",
          pause=0, width=15, gap=30, count=1,
-         scope="GP11: one narrow ~100ns HIGH pulse == GP2 width. Zoom to ~50ns/div."),
+         scope="GP12: one narrow ~100ns HIGH pulse == GP2 width. Zoom to ~50ns/div."),
     dict(name="EXTERNAL AHIGH, wide pulse (WIDTH=300 ~2us)", mode="EXT", pol="AHIGH",
          pause=0, width=300, gap=75, count=1,
-         scope="GP11: one wide ~2us HIGH pulse == GP2, NOT truncated (soft-disarm lets the train finish)."),
+         scope="GP12: one wide ~2us HIGH pulse == GP2, NOT truncated (soft-disarm lets the train finish)."),
     dict(name="EXTERNAL AHIGH, PAUSE delay (PAUSE=1500 ~10us)", mode="EXT", pol="AHIGH",
          pause=1500, width=75, gap=75, count=1,
-         scope="~10us flat after the GLITCH trigger, THEN the GP11+GP2 pulse. Trigger on GP11 rising."),
+         scope="~10us flat after the GLITCH trigger, THEN the GP12+GP2 pulse. Trigger on GP12 rising."),
     dict(name="EXTERNAL AHIGH, COUNT=5 long-ish train", mode="EXT", pol="AHIGH",
          pause=0, width=150, gap=150, count=5,
-         scope="GP11: 5 full ~1us pulses with ~1us gaps (≈10us train). None truncated, no stuck pin."),
+         scope="GP12: 5 full ~1us pulses with ~1us gaps (≈10us train). None truncated, no stuck pin."),
 ]
 
 

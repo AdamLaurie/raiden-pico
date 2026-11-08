@@ -9,8 +9,8 @@ wiring config and never run under the default `pytest tests/`:
     (dual-mode tests carry both markers and need both flags)
 
 SAFETY: run only with the bench wired for the matching mode, or the target
-disconnected. On the wrong wiring EXTERNAL drives GP10 high while GP11/12 idle
-low — a ganged 3-wire harness shorts them, collapsing the rail (false OFF
+disconnected. On the wrong wiring EXTERNAL drives GP10 high while GP11 (spare)
+and GP12 (crowbar gate) idle low — a ganged 3-wire harness shorts them, collapsing the rail (false OFF
 readings), and firing the crowbar into a real target can damage it.
 
 Covers the feat/crowbar-power-mode additions:
@@ -20,6 +20,8 @@ Covers the feat/crowbar-power-mode additions:
   * CLI error handling on malformed power sub-commands, incl. the now-removed
     MODE keyword (cli-errors rule)
   * crowbar gate arm/fire/soft-disarm in EXTERNAL (both polarities)
+  * crowbar gate on GP12 (moved from GP11) so it coexists with the PSU UART on
+    GP10/11 — TestPsuCrowbarCombo (needs --config=psu)
 
 Each test leaves the device de-energized, INTERNAL and disarmed (autouse
 fixture below), so it can't strand a later test or clamp a rail.
@@ -31,9 +33,13 @@ import pytest
 @pytest.fixture(autouse=True)
 def _restore_internal(raiden):
     """Return to a safe state after each test: disarmed, de-energized, INTERNAL.
-    Power OFF first so re-ganging GP11/12 in INTERNAL can't drive a live rail."""
+    Power OFF first so re-ganging GP11/12 in INTERNAL can't drive a live rail.
+    PSU RELEASE first (a silent no-op when unclaimed) so a PSU test can't leave
+    GP10/11 held and make the power commands below refuse."""
     yield
     raiden.cmd("ARM OFF")
+    raiden.cmd("TARGET POWER OFF", wait=1)   # PSU output OFF if a PSU test left it claimed
+    raiden.cmd("PSU RELEASE")
     raiden.cmd("TRIGGER NONE")
     raiden.cmd("TARGET POWER OFF")
     raiden.cmd("TARGET POWER INT")
@@ -123,7 +129,7 @@ class TestPowerModeStatus:
     def test_status_external_power_line(self, raiden):
         raiden.cmd("TARGET POWER EXT AHIGH")
         r = raiden.cmd("STATUS", wait=2)
-        assert "Power mode:   EXTERNAL (GP10 supply enable, GP11 crowbar gate active-HIGH/idle-LOW, GP12 spare)" in r
+        assert "Power mode:   EXTERNAL (GP10 supply enable, GP11 spare, GP12 crowbar gate active-HIGH/idle-LOW)" in r
         assert "Supply (GP10):" in r
 
     @pytest.mark.config_power_int
@@ -144,7 +150,8 @@ class TestPowerModeStatus:
         raiden.cmd("TARGET POWER EXT")
         r = raiden.cmd("PINS", wait=2)
         assert "GP10 - Target Power supply enable (EXTERNAL mode)" in r
-        assert "Crowbar gate" in r
+        assert "GP11 - Reserved spare" in r
+        assert "GP12 - Crowbar gate" in r
 
     @pytest.mark.config_power_int
     def test_pins_reflects_internal_mode(self, raiden):
@@ -185,16 +192,16 @@ class TestPowerModeErrors:
 
 # ── Crowbar gate firing path (EXTERNAL mode) ─────────────────
 # Exercises the crowbar code path — crowbar_pulse_start/stop and the 2nd PIO0
-# pulse SM that drives GP11 — over USB. The GP11 waveform itself (polarity,
+# pulse SM that drives GP12 — over USB. The GP12 waveform itself (polarity,
 # pulse count, width) is validated separately with a scope by
 # scripts/crowbar_scope_test.py. Here we only assert the firmware-observable
 # side effects: arming + firing in EXTERNAL succeeds, the glitch count bumps,
 # and the system soft-disarms afterwards, for both gate polarities.
 #
-# WIRING (config_power_ext): the crowbar gate (GP11) fires here. Run only with
-# the bench wired for EXTERNAL/crowbar (GP11 broken out to the MOSFET gate) or
+# WIRING (config_power_ext): the crowbar gate (GP12) fires here. Run only with
+# the bench wired for EXTERNAL/crowbar (GP12 broken out to the gate driver) or
 # the target disconnected. With the ganged 3-wire power harness still connected,
-# driving GP11 fights GP10 (shorted rail, false readings) — free GP11 first.
+# driving GP12 fights GP10 (shorted rail, false readings) — free GP12 first.
 
 def _glitch_count(raiden):
     import re
@@ -217,7 +224,7 @@ class TestCrowbarFire:
         before = _glitch_count(raiden)
         assert "armed" in raiden.cmd("ARM ON").lower()      # crowbar_pulse_start ran
         assert _is_armed(raiden.cmd("ARM"))
-        assert "Glitch executed" in raiden.cmd("GLITCH")    # GP2 + GP11 SMs fired
+        assert "Glitch executed" in raiden.cmd("GLITCH")    # GP2 + GP12 SMs fired
         assert _glitch_count(raiden) == before + 1
         assert "DISARMED" in raiden.cmd("ARM")              # soft-disarm in EXTERNAL
 
@@ -238,6 +245,88 @@ class TestCrowbarFire:
         assert _glitch_count(raiden) == before + 1
         assert "DISARMED" in raiden.cmd("ARM")
         raiden.cmd("SET COUNT 1")
+
+
+# ── PSU + crowbar combo ──────────────────────────────────────
+# The crowbar gate moved GP11 -> GP12 so the EXTERNAL crowbar works while the PSU
+# UART holds GP10/11, and the PSU then IS the target supply: TARGET POWER
+# ON/OFF/CYCLE route to its output, INT refuses (needs GP10/11), EXT touches GP12
+# alone, and STATUS / bare TARGET POWER report the PSU output without re-grabbing
+# GP10/11. Claiming needs no PSU attached (`PSU ID` claims, then reports no
+# response); the routed verbs then must ERROR rather than claim success. With a
+# PSU attached they must succeed — the tests accept whichever is wired.
+#
+# WIRING (config_psu): GP10/11 to the PSU MAX3232 or unconnected (GP10 TX idles
+# HIGH once claimed). With a PSU attached its output WILL switch — leave the
+# target disconnected from it. The firing test also needs config_power_ext.
+
+def _claim_psu(raiden):
+    """Claim the PSU UART; return True if a PSU actually answered."""
+    raiden.cmd("ARM OFF")
+    raiden.cmd("TARGET POWER OFF")      # PSU claim refuses while the supply is ON
+    r = raiden.cmd("PSU ID", wait=2)
+    assert "PSU UART claimed" in r, r
+    return "PSU ID:" in r
+
+
+def _psu_active(raiden):
+    return "Active: yes" in raiden.cmd("PSU")
+
+
+@pytest.mark.config_psu
+class TestPsuCrowbarCombo:
+
+    def test_ext_allowed_while_psu_claimed(self, raiden):
+        _claim_psu(raiden)
+        r = raiden.cmd("TARGET POWER EXT AHIGH")
+        assert "OK: Power mode EXTERNAL" in r
+        assert "GP12 crowbar gate active-HIGH/idle-LOW" in r
+        assert _psu_active(raiden)                # GP10/11 not taken back
+
+    def test_int_refused_while_psu_claimed(self, raiden):
+        _claim_psu(raiden)
+        r = raiden.cmd("TARGET POWER INT")
+        assert "ERROR" in r
+        assert "held by the PSU" in r
+        assert _psu_active(raiden)
+
+    @pytest.mark.parametrize("sub,ok", [("ON", "OK: Target power ON (PSU output)"),
+                                        ("OFF", "OK: Target power OFF (PSU output)"),
+                                        ("CYCLE 100", "OK: Target power ON (PSU output)")])
+    def test_supply_verbs_route_to_psu(self, raiden, sub, ok):
+        present = _claim_psu(raiden)
+        r = raiden.cmd(f"TARGET POWER {sub}", wait=12 if present else 3)
+        if present:
+            assert ok in r, r
+        else:
+            assert "ERROR: PSU did not confirm output" in r, r
+        assert "held by the PSU" not in r
+        assert _psu_active(raiden)                # routing never re-grabs GP10/11
+
+    def test_unknown_subcommand_still_unknown_while_psu_claimed(self, raiden):
+        _claim_psu(raiden)
+        r = raiden.cmd("TARGET POWER WIBBLE")
+        assert "ERROR" in r and "Unknown" in r
+
+    def test_query_and_status_leave_psu_claimed(self, raiden):
+        _claim_psu(raiden)
+        raiden.cmd("TARGET POWER EXT")
+        assert "Target power (PSU output):" in raiden.cmd("TARGET POWER", wait=1)
+        assert "Supply (PSU):" in raiden.cmd("STATUS", wait=3)
+        assert _psu_active(raiden)
+
+    @pytest.mark.config_power_ext
+    def test_crowbar_fires_while_psu_claimed(self, raiden):
+        _claim_psu(raiden)
+        raiden.cmd("TARGET POWER EXT AHIGH")
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("SET COUNT 1")
+        before = _glitch_count(raiden)
+        r = raiden.cmd("ARM ON", wait=1)
+        assert "OK: System armed" in r
+        assert "Glitch executed" in raiden.cmd("GLITCH")
+        assert _glitch_count(raiden) == before + 1
+        assert _psu_active(raiden)
 
 
 # ── Boot power-state default (power-on-reset) ────────────────

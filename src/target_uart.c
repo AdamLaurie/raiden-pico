@@ -268,15 +268,17 @@ static uint32_t power_cycle_time_ms = 300;  // Default 300ms cycle time
 static bool power_pin_initialized = false;
 
 // Power mode: how the GP10/11/12 group is driven (see power_mode_t in config.h).
-// INTERNAL (default) = ganged power source; EXTERNAL = GP10 supply, GP11 crowbar, GP12 spare.
+// INTERNAL (default) = ganged power source; EXTERNAL = GP10 supply, GP11 spare, GP12 crowbar.
 static power_mode_t power_mode = POWER_MODE_INTERNAL;
+// The PSU UART (psu.c) can own GP10/11. While it does, nothing here may touch them.
+extern bool psu_is_active(void);
 // Crowbar gate polarity in EXTERNAL mode: true = assert HIGH / idle LOW (low-side N-FET),
 // false = assert LOW / idle HIGH (high-side P-FET / active-low gate driver).
 static bool crowbar_gate_active_high = true;
 
 // GPIO mask that target_power_on/off/cycle actually drive:
 //   INTERNAL = the whole ganged group; EXTERNAL = GP10 (supply enable) only,
-//   so we never re-grab GP11 (crowbar gate) / GP12 (spare) as power outputs.
+//   so we never re-grab GP11 (spare) / GP12 (crowbar gate) as power outputs.
 static inline uint32_t power_active_mask(void) {
     return (power_mode == POWER_MODE_EXTERNAL) ? (1u << POWER_PIN1) : POWER_MASK;
 }
@@ -1476,36 +1478,82 @@ uint32_t target_get_timeout(void) {
 }
 
 static void power_ensure_init(void) {
+    // GP10/11 belong to the PSU UART while it is claimed — never re-grab them.
+    if (psu_is_active()) return;
     if (!power_pin_initialized) {
+        // In EXTERNAL mode GP12 is the crowbar gate, owned by
+        // target_crowbar_gate_idle() / the crowbar SM. Re-initialising it here
+        // (e.g. after PSU RELEASE) would drive it LOW = asserted in ALOW polarity.
         const uint8_t pins[] = {POWER_PIN1, POWER_PIN2, POWER_PIN3};
-        for (int i = 0; i < 3; i++) {
+        int n = (power_mode == POWER_MODE_EXTERNAL) ? 2 : 3;
+        for (int i = 0; i < n; i++) {
             gpio_init(pins[i]);
             gpio_set_dir(pins[i], GPIO_OUT);
             gpio_set_drive_strength(pins[i], GPIO_DRIVE_STRENGTH_12MA);
+            gpio_put(pins[i], 0);   // boot default OFF (matches target_init); EXT spare LOW
         }
-        gpio_clr_mask(POWER_MASK);  // boot default OFF (matches target_init)
         power_pin_initialized = true;
     }
 }
 
-// Release the GP10/11/12 power-group GPIOs so another owner (the external PSU
-// UART on GP10/11) can retask them. Pins are re-initialised lazily by the next
-// power command via power_ensure_init(). Caller must ensure the supply is OFF.
+// Release the power-group GPIOs so another owner (the external PSU UART on
+// GP10/11) can retask them. Pins are re-initialised lazily by the next power
+// command via power_ensure_init(). Caller must ensure the supply is OFF.
+// In EXTERNAL mode only GP10/11 are released: GP12 stays the crowbar gate (it
+// may be PIO-driven by an armed crowbar SM), so the PSU and crowbar coexist.
 void power_group_release(void) {
     if (power_pin_initialized) {
         gpio_deinit(POWER_PIN1);
         gpio_deinit(POWER_PIN2);
-        gpio_deinit(POWER_PIN3);
+        if (power_mode != POWER_MODE_EXTERNAL) {
+            gpio_deinit(POWER_PIN3);
+        }
         power_pin_initialized = false;
     }
+}
+
+// ---- PSU as the target supply ----
+// While the PSU UART holds GP10/11 the PSU output IS the target supply, so the
+// TARGET POWER verbs and the auto power-on drive it instead of GP10. Typical use
+// is the combo of PSU supply + EXTERNAL-mode crowbar gate on GP12.
+#define PSU_OFF_THRESHOLD_MV  300    // output counts as discharged at/below this
+#define PSU_OFF_TIMEOUT_MS    5000   // max wait for the output to discharge (CYCLE)
+#define PSU_ON_TIMEOUT_MS     3000   // max wait for the output to reach 90% of Vset
+
+extern bool psu_supply_state(bool *on);
+extern bool psu_supply_set(bool on);
+extern int32_t psu_setpoint_mv(void);
+extern int32_t psu_wait_vout(bool rising, int32_t threshold_mv, uint32_t timeout_ms);
+
+// Turn the PSU output on (if not already) and wait for the rail plus target POR.
+// Already-on returns immediately, so repeated SYNCs per shot cost nothing.
+static bool psu_power_on_quiet(void) {
+    bool on;
+    if (psu_supply_state(&on) && on) return true;
+    if (!psu_supply_set(true)) return false;
+    int32_t set = psu_setpoint_mv();
+    if (set > 0) psu_wait_vout(true, set * 9 / 10, PSU_ON_TIMEOUT_MS);
+    sleep_ms(POWER_ON_SETTLE_MS);
+    return true;
+}
+
+static void psu_power_error(const char *what) {
+    uart_cli_printf("ERROR: PSU did not confirm output %s (check PSU wiring / MAX3232 / baud)\r\n", what);
 }
 
 // Power the target on WITHOUT emitting a CLI line. Used by the auto-power-on at
 // the connect/sync choke points (TARGET SYNC, SWD CONNECT) so a target that boots
 // unpowered (power-off boot default) is energised before we reset/connect — no
 // host script needs its own POWER ON. Respects the mode: drives GP10 only in
-// EXTERNAL, the full GP10/11/12 group in INTERNAL.
+// EXTERNAL, the full GP10/11/12 group in INTERNAL, the PSU output while claimed
+// (only a failure is reported there, as a WARNING, since the caller carries on).
 void target_power_ensure_on(void) {
+    if (psu_is_active()) {
+        if (!psu_power_on_quiet()) {
+            uart_cli_send("WARNING: PSU did not confirm output ON — target may be unpowered\r\n");
+        }
+        return;
+    }
     power_ensure_init();
     // Only settle if we actually transition the supply OFF->ON. A cold target
     // (power-off boot default) needs its rail to rise and finish its power-on
@@ -1520,17 +1568,49 @@ void target_power_ensure_on(void) {
 }
 
 void target_power_on(void) {
+    if (psu_is_active()) {
+        if (psu_power_on_quiet()) uart_cli_send("OK: Target power ON (PSU output)\r\n");
+        else psu_power_error("ON");
+        return;
+    }
     target_power_ensure_on();   // silent core: power_ensure_init + power_drive(...on)
     uart_cli_send("OK: Target power ON\r\n");
 }
 
 void target_power_off(void) {
+    if (psu_is_active()) {
+        if (psu_supply_set(false)) uart_cli_send("OK: Target power OFF (PSU output)\r\n");
+        else psu_power_error("OFF");
+        return;
+    }
     power_ensure_init();
     power_drive(power_active_mask(), false);
     uart_cli_send("OK: Target power OFF\r\n");
 }
 
+// PSU-routed CYCLE: the PSU's output capacitance can hold the rail up long after
+// OUT0 (worse with a light target load), so wait on the measured VOUT reaching
+// PSU_OFF_THRESHOLD_MV before starting the OFF time — otherwise the target might
+// never actually drop below its POR threshold.
+static void psu_power_cycle(uint32_t time_ms) {
+    if (!psu_supply_set(false)) { psu_power_error("OFF"); return; }
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    int32_t mv = psu_wait_vout(false, PSU_OFF_THRESHOLD_MV, PSU_OFF_TIMEOUT_MS);
+    uint32_t waited = to_ms_since_boot(get_absolute_time()) - t0;
+    uart_cli_printf("OK: Target power cycling via PSU (output %ld mV after %lu ms; OFF for %u ms)...\r\n",
+                    (long)mv, (unsigned long)waited, time_ms);
+    if (mv < 0 || mv > PSU_OFF_THRESHOLD_MV) {
+        uart_cli_printf("WARNING: PSU output not below %d mV after %d ms — target may not have reset\r\n",
+                        PSU_OFF_THRESHOLD_MV, PSU_OFF_TIMEOUT_MS);
+    }
+    sleep_ms(time_ms);
+    bootloader_synced = false;
+    if (!psu_power_on_quiet()) { psu_power_error("ON"); return; }
+    uart_cli_send("OK: Target power ON (PSU output)\r\n");
+}
+
 void target_power_cycle(uint32_t time_ms) {
+    if (psu_is_active()) { psu_power_cycle(time_ms); return; }
     power_ensure_init();
     power_drive(power_active_mask(), false);
     uart_cli_printf("OK: Target power cycling (OFF for %u ms)...\r\n", time_ms);
@@ -1544,7 +1624,14 @@ void target_power_cycle(uint32_t time_ms) {
     uart_cli_send("OK: Target power ON\r\n");
 }
 
+// Supply state: GP10, or the PSU output while the PSU UART holds GP10/11 (never
+// touching those pins then). A PSU that does not answer reads as OFF — callers
+// that must tell "off" from "no answer" use psu_supply_state() directly.
 bool target_power_get_state(void) {
+    if (psu_is_active()) {
+        bool on;
+        return psu_supply_state(&on) && on;
+    }
     power_ensure_init();
     return gpio_get(POWER_PIN1);
 }
@@ -1559,23 +1646,31 @@ bool target_crowbar_gate_active_high(void) {
     return crowbar_gate_active_high;
 }
 
-// Drive the crowbar gate (GP11) to its safe, de-asserted idle level as a plain
+// Drive the crowbar gate (GP12) to its safe, de-asserted idle level as a plain
 // GPIO output. Used at mode switch, disarm, and boot so a wrong/floating idle
 // can never clamp the rail. Polarity-aware: idle = LOW when active-high, HIGH
 // when active-low. Clears any PIO outover left over from an armed window.
 void target_crowbar_gate_idle(void) {
+    // Fast edges into the gate driver: 12mA + fast slew (pad default is 4mA/slow,
+    // which rounds off the ~5-cycle pulses crowbar glitching needs). Pad settings
+    // survive the SIO<->PIO function switches.
+    gpio_set_drive_strength(PIN_CROWBAR_GATE, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(PIN_CROWBAR_GATE, GPIO_SLEW_RATE_FAST);
     // Stage the SIO output (de-asserted value + output-enable) while the pin is
     // still PIO-held at its idle level, then switch the function mux to SIO LAST.
-    // GP11 is driven to the de-asserted level the instant SIO takes over — with
+    // GP12 is driven to the de-asserted level the instant SIO takes over — with
     // NO high-Z window and NO driven-assert. gpio_set_function() writes the whole
     // CTRL register, resetting OUTOVER to NORMAL atomically with the mux switch, so
     // the de-asserted value (set directly via gpio_put) needs no inversion.
-    // (The old gpio_init-first order forced the pin to input first, leaving GP11
-    //  briefly floating = a shallow spurious dip in active-low mode; and enabling
+    // (The old gpio_init-first order forced the pin to input first, leaving the
+    //  gate briefly floating = a shallow spurious dip in active-low mode; and enabling
     //  the output before clearing the armed INVERT drove a full spurious assert.)
     gpio_put(PIN_CROWBAR_GATE, crowbar_gate_active_high ? 0 : 1);  // SIO_OUT (staged)
     gpio_set_dir(PIN_CROWBAR_GATE, GPIO_OUT);                      // SIO_OE  (staged)
     gpio_set_function(PIN_CROWBAR_GATE, GPIO_FUNC_SIO);            // mux -> SIO (resets OUTOVER -> NORMAL)
+    // Un-isolate the pad in case it was released (gpio_deinit) by an earlier PSU
+    // claim in INTERNAL mode, so the staged idle level actually reaches the pin.
+    hw_clear_bits(&padsbank0_hw->io[PIN_CROWBAR_GATE], PADS_BANK0_GPIO0_ISO_BITS);
 }
 
 // Set crowbar gate polarity. Re-applies a safe idle immediately when already in
@@ -1588,10 +1683,19 @@ void target_set_crowbar_polarity(bool active_high) {
 }
 
 // Switch the GP10/11/12 group between INTERNAL (ganged power source) and
-// EXTERNAL (GP10 supply enable, GP11 crowbar gate, GP12 reserved spare).
+// EXTERNAL (GP10 supply enable, GP11 reserved spare, GP12 crowbar gate).
 // Both directions honour the current GP10 supply on/off state (boot default is
 // OFF; an explicit POWER ON / choke-point auto-power-on before the switch stays on).
+// While the PSU UART holds GP10/11, only EXTERNAL is reachable (the CLI refuses
+// INTERNAL) and only the GP12 gate is touched — the PSU keeps its UART pins.
 void target_set_power_mode(power_mode_t mode) {
+    if (psu_is_active()) {
+        if (mode == POWER_MODE_EXTERNAL) {
+            power_mode = mode;
+            target_crowbar_gate_idle();
+        }
+        return;
+    }
     power_ensure_init();
     bool supply_on = gpio_get(POWER_PIN1);
 
@@ -1602,15 +1706,15 @@ void target_set_power_mode(power_mode_t mode) {
         gpio_set_dir(POWER_PIN1, GPIO_OUT);
         gpio_set_drive_strength(POWER_PIN1, GPIO_DRIVE_STRENGTH_12MA);
         gpio_put(POWER_PIN1, supply_on);
-        // GP11 = crowbar gate at safe de-asserted idle (plain GPIO until
+        // GP12 = crowbar gate at safe de-asserted idle (plain GPIO until
         // glitch_arm hands it to the crowbar pulse SM).
         target_crowbar_gate_idle();
-        // GP12 = reserved spare: driven LOW (defined safe level). A bare input
+        // GP11 = reserved spare: driven LOW (defined safe level). A bare input
         // floats/reads HIGH on RP2350 (erratum E9 input leakage), so we drive
         // it low rather than leave it high-Z.
-        gpio_init(POWER_PIN3);
-        gpio_set_dir(POWER_PIN3, GPIO_OUT);
-        gpio_put(POWER_PIN3, 0);
+        gpio_init(POWER_PIN2);
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_put(POWER_PIN2, 0);
     } else {
         // Keep GP10 a driven output (no gpio_init -> no low blip) and re-gang
         // GP11/GP12 as 12mA power outputs, all matching the honoured supply state.
@@ -1629,12 +1733,17 @@ void target_set_power_mode(power_mode_t mode) {
 }
 
 // True when a CPU-side power-group glitch routine must not run because the group
-// is in EXTERNAL mode (GP11 belongs to the crowbar gate, GP12 is a spare).
-// Emits a CLI error pointing at the PIO crowbar path.
+// is in EXTERNAL mode (GP12 belongs to the crowbar gate, GP11 is a spare), or the
+// PSU UART holds GP10/11. Emits a CLI error pointing at the right path.
 static bool power_group_glitch_blocked(void) {
+    if (psu_is_active()) {
+        uart_cli_send("ERROR: power-group glitch unavailable while the PSU holds GP10/11 "
+                      "(PSU RELEASE first, or use the PIO crowbar in EXTERNAL mode).\r\n");
+        return true;
+    }
     if (power_mode == POWER_MODE_EXTERNAL) {
         uart_cli_send("ERROR: power-group glitch unavailable in EXTERNAL mode "
-                      "(GP11 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
+                      "(GP12 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
                       "or switch back with 'TARGET POWER INT'.\r\n");
         return true;
     }

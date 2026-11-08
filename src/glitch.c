@@ -20,7 +20,7 @@ static uint sm_pulse_gen = 1;
 static uint sm_flag_output = 2;  // Can reuse for UART trigger since not used simultaneously
 static uint sm_clock_gen = 0;    // Clock uses PIO1 SM0
 static uint sm_uart_trigger = 2;  // Use SM2 instead of invalid SM4!
-static uint sm_crowbar = 3;      // Crowbar gate pulse: PIO0 SM3 (2nd pulse_generator copy driving GP11)
+static uint sm_crowbar = 3;      // Crowbar gate pulse: PIO0 SM3 (2nd pulse_generator copy driving GP12)
 
 // PIO IRQ flag used for triggering (using IRQ 0 - shared between all SMs)
 #define GLITCH_IRQ_NUM 0
@@ -319,7 +319,7 @@ void glitch_set_trigger_byte(uint8_t byte) {
 // Output pins are hardwired - no need for setter function
 
 // ---- Crowbar gate pulse (EXTERNAL power mode) ----
-// Drives the crowbar gate (GP11) with the SAME WIDTH/GAP/COUNT waveform as the
+// Drives the crowbar gate (GP12) with the SAME WIDTH/GAP/COUNT waveform as the
 // GP2 glitch output, using a SECOND copy of the pulse_generator program on a
 // free PIO0 state machine (SM3). Both SMs wait on IRQ0, so they fire together
 // on any trigger (GPIO/UART/manual). This avoids reading GP2 across PIO blocks
@@ -335,14 +335,14 @@ static void crowbar_pulse_start(void) {
     }
 
     // Reuse the existing pulse_generator program (no extra instruction memory).
-    // The program needs both a SET pin and a SIDE-SET pin; point both at GP11 —
-    // they always carry the same value here, so GP11 cleanly follows the pulse.
+    // The program needs both a SET pin and a SIDE-SET pin; point both at GP12 —
+    // they always carry the same value here, so GP12 cleanly follows the pulse.
     pio_sm_config c = pulse_generator_program_get_default_config(offset_pulse_gen);
     sm_config_set_set_pins(&c, PIN_CROWBAR_GATE, 1);
     sm_config_set_sideset_pins(&c, PIN_CROWBAR_GATE);
     sm_config_set_clkdiv(&c, 1.0);
 
-    // Hand GP11 to PIO0 and apply polarity: active-high gate = normal pad (idle
+    // Hand GP12 to PIO0 and apply polarity: active-high gate = normal pad (idle
     // LOW / assert HIGH), active-low = inverted pad (idle HIGH / assert LOW) —
     // the same pad-inversion trick the inverted output (GP7) uses.
     pio_gpio_init(glitch_pio, PIN_CROWBAR_GATE);
@@ -356,7 +356,7 @@ static void crowbar_pulse_start(void) {
     pio_sm_restart(glitch_pio, sm_crowbar);
     pio_sm_init(glitch_pio, sm_crowbar, offset_pulse_gen, &c);
 
-    // Same FIFO params as sm_pulse_gen (PAUSE, COUNT-1, WIDTH, GAP) so the GP11
+    // Same FIFO params as sm_pulse_gen (PAUSE, COUNT-1, WIDTH, GAP) so the GP12
     // pulse is identical to the GP2 pulse. precalc_* were computed in glitch_arm.
     pio_sm_put_blocking(glitch_pio, sm_crowbar, precalc_pause_cycles);
     pio_sm_put_blocking(glitch_pio, sm_crowbar, config.count > 0 ? config.count - 1 : 0);
@@ -368,7 +368,7 @@ static void crowbar_pulse_start(void) {
     crowbar_pulse_active = true;
 }
 
-// Stops the crowbar pulse SM and returns GP11 to a GPIO-driven, polarity-aware
+// Stops the crowbar pulse SM and returns GP12 to a GPIO-driven, polarity-aware
 // safe idle.
 static void crowbar_pulse_stop(void) {
     extern void target_crowbar_gate_idle(void);
@@ -648,7 +648,7 @@ bool glitch_arm(void) {
 
     trigger_programs_loaded = true;
 
-    // In EXTERNAL power mode, start the crowbar gate pulse SM so GP11 emits the
+    // In EXTERNAL power mode, start the crowbar gate pulse SM so GP12 emits the
     // same glitch waveform as GP2. No-op in INTERNAL mode.
     crowbar_pulse_start();
 
@@ -800,7 +800,7 @@ void glitch_disarm(void) {
     // Clear ARMED status LOW (GP16)
     gpio_put(PIN_ARMED, 0);
 
-    // Stop the crowbar pulse SM (if running) and return GP11 to safe idle
+    // Stop the crowbar pulse SM (if running) and return GP12 to safe idle
     crowbar_pulse_stop();
 
     // Disarm the generic I2C trigger fire hook (no-op if never armed)

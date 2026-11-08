@@ -1,3 +1,41 @@
+## [0.25] — 2026-11-08 — Crowbar gate moved to GP12; PSU + crowbar combo mode
+
+### Changed
+- **EXTERNAL-mode crowbar gate moved GP11 → GP12** (GP11 is now the reserved spare,
+  driven LOW). The PSU UART owns GP10/11, so on GP11 the crowbar and PSU could never
+  be used together. **Rewire:** gate driver input from Pico pin 15 (GP11) to pin 16 (GP12).
+- The gate pad is driven at 12mA with fast slew (was the 4mA/slow-slew default), for
+  clean ns-scale edges into a gate driver.
+- **PSU + crowbar combo mode.** `TARGET POWER EXT [AHIGH|ALOW]` now works while the PSU
+  is claimed (it only touches GP12), and the PSU becomes the target supply:
+  `TARGET POWER ON/OFF/CYCLE` and the auto power-on at SYNC/CONNECT/I2C entry drive the
+  PSU output (OUT1/OUT0, confirmed via STATUS? bit6) instead of being refused, so
+  campaign scripts work unchanged. `CYCLE` waits (≤5 s) for VOUT ≤300 mV before the
+  OFF time and warns if it never gets there; `ON` waits for VOUT ≥90 % of Vset. Bare
+  `TARGET POWER` / `STATUS` report the PSU output. Only `TARGET POWER INT` is refused
+  while claimed. An unknown sub-command now reports "Unknown" instead of the PSU error.
+- README: power-modes table (INTERNAL / EXTERNAL / EXTERNAL+PSU / INTERNAL+PSU).
+- New aliases `TARGET REBOOT [ms]` and `TARGET POWER REBOOT [ms]` = `TARGET POWER CYCLE [ms]`
+  (same path, including PSU routing). `TARGET POWER CYCLE` now rejects extra arguments
+  instead of ignoring them.
+
+### Fixed
+- `STATUS`, bare `TARGET POWER`, the `ARM ON` power warning, and the auto power-on
+  at `TARGET SYNC` / `SWD CONNECT` / I2C entry no longer re-initialise GP10/11 while
+  the PSU UART holds them (this silently broke the PSU link). `ARM ON` warns
+  "PSU not responding" instead of a misleading "power is OFF" when the PSU is silent. CPU-side power-group
+  glitch routines refuse while the PSU is claimed.
+- After `PSU RELEASE` in EXTERNAL mode, lazy re-init of the power pins no longer
+  drives the crowbar gate LOW (= asserted in `ALOW` polarity).
+
+### Tests
+- New `--config=psu` wiring marker. `TestPsuCrowbarCombo`: EXT allowed while claimed;
+  INT refused; ON/OFF/CYCLE route to the PSU (OK with a PSU attached, `ERROR: PSU did
+  not confirm` without one — never a false OK); query/STATUS leave the PSU claimed;
+  crowbar fires with the PSU claimed (also needs `--config=power-ext`).
+- PSU-routed power verbs are **not yet bench-tested against a real PSU** (OUT/STATUS
+  confirm timing, VOUT discharge time of the 72-2540 output).
+
 ## [0.22] — 2026-11-03 — Interactive target console (TARGET TERM + settable line params)
 
 ### Added
