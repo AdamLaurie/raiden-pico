@@ -393,13 +393,24 @@ static void i2c_trigger_fire(void) {
     glitch_pio->irq_force = (1u << GLITCH_IRQ_NUM);
 }
 
+// GLITCH_FIRED (GP22) is a "fired" latch: LOW from ARM, HIGH from the fire until
+// the next ARM (the UART decoder instead pulses it ~667ns per match). Whichever
+// PIO0 SM last drove it leaves PIO0's output latch for GP22 HIGH, and that stale
+// HIGH reappears the moment a later arm hands GP22 back to PIO (pio_gpio_init) —
+// a SIO gpio_put() can't reach it. So clear the PIO latch through a STOPPED SM
+// (caller must have disabled sm_flag_output/sm_uart_trigger), then park the pin
+// on SIO LOW. Paths that need PIO re-claim it from a LOW latch.
+static void glitch_fired_reset(void) {
+    pio_sm_set_pins_with_mask(glitch_pio, sm_flag_output, 0, 1u << PIN_GLITCH_FIRED);
+    gpio_init(PIN_GLITCH_FIRED);
+    gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
+    gpio_put(PIN_GLITCH_FIRED, 0);
+}
+
 bool glitch_arm(void) {
     if (flags.armed) {
         return false;  // Already armed
     }
-
-    // Clear GLITCH_FIRED from previous trigger (if any)
-    gpio_put(PIN_GLITCH_FIRED, 0);
 
     // Disable all trigger state machines first to ensure clean state
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
@@ -408,6 +419,9 @@ bool glitch_arm(void) {
     // so a train can never be truncated; stop them now before we re-init them.
     pio_sm_set_enabled(glitch_pio, sm_pulse_gen, false);
     pio_sm_set_enabled(glitch_pio, sm_crowbar, false);
+
+    // Clear GLITCH_FIRED from the previous fire (SMs above are stopped).
+    glitch_fired_reset();
 
     // Clear their FIFOs
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
@@ -554,12 +568,14 @@ bool glitch_arm(void) {
         // Guard: precalc can never be negative (would underflow the uint32 FIFO load).
         precalc_pause_cycles = (adj_pause > 0) ? (uint32_t)adj_pause : 0;
     }
-    precalc_width_cycles = config.width_cycles;
-    precalc_gap_cycles = config.gap_cycles;
-
-    // Account for PIO instruction overhead (optional, can be tuned)
-    if (precalc_width_cycles > 5) precalc_width_cycles -= 5;
-    if (precalc_gap_cycles > 5) precalc_gap_cycles -= 5;
+    // Subtract the pulse_generator's fixed per-pulse/per-gap cost (see glitch.h) so
+    // WIDTH/GAP are the real pin times. Below the minimum, X = 0 (the shortest the
+    // program can emit). The old flat "-5 if > 5" made every pulse WIDTH-2 / gap GAP-1
+    // and was non-monotonic at the bottom (WIDTH 5 -> 8 cycles, WIDTH 6 -> 4).
+    precalc_width_cycles = (config.width_cycles > GLITCH_PULSE_MIN_WIDTH)
+                               ? config.width_cycles - GLITCH_PULSE_MIN_WIDTH : 0;
+    precalc_gap_cycles = (config.gap_cycles > GLITCH_PULSE_MIN_GAP)
+                             ? config.gap_cycles - GLITCH_PULSE_MIN_GAP : 0;
 
     // Pre-load PIO FIFO with timing values so they're ready when IRQ fires
     // For PIO-based UART trigger, this enables hardware-only triggering with no CPU involvement
@@ -577,7 +593,7 @@ bool glitch_arm(void) {
     // It must be started AFTER pulse generator is ready to receive IRQ 5
     if (config.trigger == TRIGGER_UART) {
         // UART decoder (15 words) + pulse_gen (16) = 31, fits in 32.
-        // Remove irq_trigger (6 words, only needed for manual GLITCH cmd) to make room.
+        // Remove irq_trigger (3 words, only needed for manual GLITCH cmd) to make room.
         if (!irq_trigger_removed) {
             pio_remove_program(glitch_pio, &irq_trigger_program, offset_irq_trigger);
             irq_trigger_removed = true;
@@ -666,12 +682,13 @@ bool glitch_arm_trace(void) {
         return false;
     }
 
-    // Clear GLITCH_FIRED
-    gpio_put(PIN_GLITCH_FIRED, 0);
-
     // Disable all trigger state machines
     pio_sm_set_enabled(glitch_pio, sm_edge_detect, false);
     pio_sm_set_enabled(glitch_pio, sm_uart_trigger, false);
+
+    // Clear GLITCH_FIRED from the previous fire (trigger SMs above are stopped)
+    // so the trace ISR sees a fresh rising edge.
+    glitch_fired_reset();
 
     // Clear FIFOs
     pio_sm_clear_fifos(glitch_pio, sm_edge_detect);
@@ -863,13 +880,15 @@ bool glitch_execute(void) {
         return false;
     }
 
-    // Trigger IRQ 0 (glitch) via irq_trigger program, pulse GP22 (GLITCH_FIRED) for clock boost
-    // Use sm_flag_output (SM2) to trigger
+    // Trigger IRQ 0 (glitch) once via the one-shot irq_trigger program, which also
+    // latches GP22 (GLITCH_FIRED) HIGH until the next ARM (marker / clock boost /
+    // TRACE). Use sm_flag_output (SM2) to trigger
     // SM2 is free when TRIGGER_NONE is used (UART trigger uses SM2 only for TRIGGER_UART)
     pio_sm_config c_irq = irq_trigger_program_get_default_config(offset_irq_trigger);
     sm_config_set_set_pins(&c_irq, PIN_GLITCH_FIRED, 1);  // SET pins for GLITCH_FIRED
 
-    // Initialize GLITCH_FIRED as output for PIO0 (will set HIGH when GLITCH command fires)
+    // Initialize GLITCH_FIRED as output for PIO0 (will set HIGH when GLITCH command fires).
+    // ARM cleared PIO0's GP22 latch (glitch_fired_reset), so this hand-over can't blip it HIGH.
     pio_gpio_init(glitch_pio, PIN_GLITCH_FIRED);
     hw_clear_bits(&padsbank0_hw->io[PIN_GLITCH_FIRED], PADS_BANK0_GPIO0_ISO_BITS);
     pio_sm_set_consecutive_pindirs(glitch_pio, sm_flag_output, PIN_GLITCH_FIRED, 1, true);

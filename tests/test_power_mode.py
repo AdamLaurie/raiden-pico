@@ -257,15 +257,23 @@ class TestCrowbarFire:
 # PSU attached they must succeed — the tests accept whichever is wired.
 #
 # WIRING (config_psu): GP10/11 to the PSU MAX3232 or unconnected (GP10 TX idles
-# HIGH once claimed). With a PSU attached its output WILL switch — leave the
-# target disconnected from it. The firing test also needs config_power_ext.
+# HIGH once claimed). With a PSU attached its output WILL switch ON/OFF (at its
+# current Vset — these tests never send PSU VOLT/CURR), so anything on the output
+# gets power-cycled. The firing test also needs config_power_ext.
+#
+# The PSU is claimed once and released once for the whole class, and no power-
+# group command is sent while it is unclaimed: with a MAX3232 on GP10/11 those
+# would drive GP11 LOW against the receiver output (the module-level restore does
+# exactly that, so it is overridden here).
 
 def _claim_psu(raiden):
-    """Claim the PSU UART; return True if a PSU actually answered."""
+    """Claim the PSU UART (idempotent); return True if a PSU actually answered."""
     raiden.cmd("ARM OFF")
-    raiden.cmd("TARGET POWER OFF")      # PSU claim refuses while the supply is ON
+    already = _psu_active(raiden)
     r = raiden.cmd("PSU ID", wait=2)
-    assert "PSU UART claimed" in r, r
+    if not already:
+        assert "PSU UART claimed" in r, r
+    assert _psu_active(raiden), r
     return "PSU ID:" in r
 
 
@@ -275,6 +283,22 @@ def _psu_active(raiden):
 
 @pytest.mark.config_psu
 class TestPsuCrowbarCombo:
+
+    @pytest.fixture(autouse=True)
+    def _restore_internal(self, raiden):
+        """Overrides the module restore: disarm only, keep the PSU claimed."""
+        yield
+        raiden.cmd("ARM OFF")
+        raiden.cmd("TRIGGER NONE")
+        raiden.cmd("SET COUNT 1")
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _release_psu_at_end(self, raiden):
+        """Release once at the end. GP10/11 are then left undriven — deliberately
+        no TARGET POWER INT, which would drive them LOW into the MAX3232."""
+        yield
+        raiden.cmd("ARM OFF")
+        raiden.cmd("PSU RELEASE")
 
     def test_ext_allowed_while_psu_claimed(self, raiden):
         _claim_psu(raiden)

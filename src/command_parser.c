@@ -1,4 +1,5 @@
 #include "command_parser.h"
+#include "uart_mux.h"
 #include "uart_cli.h"
 #include "glitch.h"
 #include "target_uart.h"
@@ -36,6 +37,7 @@ static bool api_mode = false;
 // Returns true on success, false on overflow or empty input
 static bool parse_u32(const char *str, int base, uint32_t *out) {
     if (!str || !*str) return false;
+    if (*str == '-') return false;   // strtoul accepts "-1" and wraps it to 0xFFFFFFFF
     char *end;
     unsigned long val = strtoul(str, &end, base);
     if (end == str || *end != '\0') return false;  // no digits or trailing junk
@@ -594,6 +596,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== Glitch Configuration ==\r\n");
         uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT|VMIN] - Get current glitch parameter(s)\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
+        uart_cli_send("       WIDTH/GAP are exact pin times; PIO minimum WIDTH 3, GAP 4 cycles\r\n");
         uart_cli_send("       PAUSE 0 = no pause (min latency); non-zero PAUSE must be >= trigger offset\r\n");
         uart_cli_send("SET VMIN <mV>             - 0 = WIDTH-only PIO pulse, !=0 = ADC-gated drop\r\n");
         uart_cli_send("                            (CPU-side, drops GP10/11/12 until ADC<VMIN,\r\n");
@@ -612,7 +615,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("PINS                   - Show pin configuration\r\n");
         uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
         uart_cli_send("RESET                  - Reset system\r\n");
-        uart_cli_send("STATUS                 - Show current status\r\n");
+        uart_cli_send("STATUS                 - Show current status (incl. GP22 fired-marker level)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
@@ -838,6 +841,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Gap:          %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
         uart_cli_printf("Count:        %u\r\n", cfg->count);
         uart_cli_printf("Output Pins:  GP%u (normal), GP%u (inverted)\r\n", PIN_GLITCH_OUT, PIN_GLITCH_OUT_INV);
+        // Pad input level — valid whether GP22 is SIO- or PIO-driven. LOW from ARM
+        // until a fire; HIGH after (until the next ARM).
+        uart_cli_printf("Fired (GP%u): %s\r\n", PIN_GLITCH_FIRED, gpio_get(PIN_GLITCH_FIRED) ? "HIGH" : "LOW");
         uart_cli_send("\r\n");
 
         // Trigger configuration
@@ -902,6 +908,20 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Reset (GP15): HIGH, LOW 300ms pulse\r\n");
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
+
+        // Hardware UART ownership (uart_mux): who holds each peripheral right now.
+        uart_cli_send("\r\n== UARTs ==\r\n");
+        for (uint n = 0; n < 2; n++) {
+            uart_owner_t o = uart_mux_owner(n);
+            if (o == UART_OWNER_NONE) {
+                uart_cli_printf("UART%u:        free\r\n", n);
+            } else {
+                uint8_t tx, rx;
+                uart_mux_pins(o, &tx, &rx);
+                uart_cli_printf("UART%u:        %s (GP%u/GP%u) %lu %s\r\n", n, uart_mux_name(o), tx, rx,
+                                (unsigned long)uart_mux_get_baud(o), uart_mux_line_str(o));
+            }
+        }
 
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
@@ -1003,7 +1023,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("       VMIN value is millivolts (0 = disabled)\r\n");
             goto api_response;
         } else {
-            uint32_t value = atoi(parts->parts[2]);
+            uint32_t value;
+            // Strict base-10 parse: atoi() silently turned garbage ("abc", "5us")
+            // into 0/5. Base 10, not 0, so a leading zero isn't read as octal.
+            if (!parse_u32(parts->parts[2], 10, &value)) {
+                api_error_printf("ERROR: Invalid %s value '%s' (expected a non-negative integer)\r\n",
+                                 parts->parts[1], parts->parts[2]);
+                goto api_response;
+            }
 
             if (strcmp(parts->parts[1], "PAUSE") == 0) {
                 // A non-zero PAUSE below a positive trigger-pipeline offset cannot be
@@ -1022,9 +1049,21 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
                 glitch_set_width(value);
                 uart_cli_printf("OK: WIDTH set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                if (value < GLITCH_PULSE_MIN_WIDTH) {
+                    // Accepted (WIDTH 0 is documented for VMIN mode), but say what the
+                    // PIO pulse will actually be rather than let it pass silently.
+                    uart_cli_printf("NOTE: PIO pulse minimum is %u cycles (%.1f ns); GP2/GP12 pulses will be %u cycles\r\n",
+                                    GLITCH_PULSE_MIN_WIDTH, GLITCH_PULSE_MIN_WIDTH * 1000.0f / 150.0f,
+                                    GLITCH_PULSE_MIN_WIDTH);
+                }
             } else if (strcmp(parts->parts[1], "GAP") == 0) {
                 glitch_set_gap(value);
                 uart_cli_printf("OK: GAP set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                if (value < GLITCH_PULSE_MIN_GAP) {
+                    uart_cli_printf("NOTE: PIO gap minimum is %u cycles (%.1f ns); gaps between COUNT>1 pulses will be %u cycles\r\n",
+                                    GLITCH_PULSE_MIN_GAP, GLITCH_PULSE_MIN_GAP * 1000.0f / 150.0f,
+                                    GLITCH_PULSE_MIN_GAP);
+                }
             } else if (strcmp(parts->parts[1], "VMIN") == 0) {
                 glitch_set_vmin(value);
                 if (value == 0) {
@@ -1564,7 +1603,22 @@ void command_parser_execute(cmd_parts_t *parts) {
                         api_error("ERROR: TARGET RESET PIN requires a GPIO number\r\n");
                         parse_ok = false; break;
                     }
-                    pin = atoi(parts->parts[++i]);
+                    uint32_t p;
+                    const char *arg = parts->parts[++i];
+                    if (!parse_u32(arg, 10, &p) || p >= NUM_BANK0_GPIOS) {
+                        api_error_printf("ERROR: Invalid TARGET RESET PIN '%s' (GPIO 0-%u)\r\n",
+                                         arg, NUM_BANK0_GPIOS - 1);
+                        parse_ok = false; break;
+                    }
+                    // Never let the reset line take a UART pin (gpio_init would cut
+                    // that UART off its pins — e.g. PIN 0/1 silences ChipSHOUTER).
+                    uart_owner_t uo = uart_mux_pin_owner(p);
+                    if (uo != UART_OWNER_NONE) {
+                        api_error_printf("ERROR: GP%lu is a %s UART pin — pick another TARGET RESET PIN\r\n",
+                                         (unsigned long)p, uart_mux_name(uo));
+                        parse_ok = false; break;
+                    }
+                    pin = (uint8_t)p;
                 } else if (strcmp(parts->parts[i], "PERIOD") == 0) {
                     if (i + 1 >= parts->count) {
                         api_error("ERROR: TARGET RESET PERIOD requires a value in ms\r\n");

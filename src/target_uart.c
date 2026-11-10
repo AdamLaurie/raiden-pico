@@ -1,3 +1,4 @@
+#include "uart_mux.h"
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
@@ -234,7 +235,12 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 
 // UART configuration
 static uint32_t target_baud = 115200;
-static bool target_initialized = false;
+// UART1 ownership lives in uart_mux (uart_mux_is_owner(UART_OWNER_TARGET)); the
+// old target_initialized flag latched true and went stale whenever GRBL, the PSU
+// or the I2C bootloader took UART1 / GP4-5.
+// Set by target_uart_listen_raw(): UART1 is on GP4/5 but at a diagnostic 115200
+// 8N1 with the RX IRQ off, so the next ensure_active() must fully re-init.
+static bool target_uart_raw_mode = false;
 static bool bootloader_synced = false;
 
 // Target type
@@ -323,6 +329,8 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 void target_uart_clear_response(void);
 void target_uart_print_response_hex(void);
 
+static void target_uart_attach(void);
+
 // UART RX interrupt handler
 void target_uart_irq_handler(void) {
     extern void uart_cli_printf(const char *format, ...);
@@ -368,18 +376,17 @@ void target_init(void) {
     gpio_clr_mask(POWER_MASK);  // boot default OFF (de-energized)
     power_pin_initialized = true;
 
-    // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
+    // Target's UART1 hooks: attach (re)enables the RX trigger IRQ whenever the
+    // target gets UART1 back (including after a PSU borrow); uart_mux disables the
+    // IRQ when anyone else takes it.
+    uart_mux_set_hooks(UART_OWNER_TARGET, target_uart_attach, NULL);
+
+    // Pre-initialize and release UART1 to ensure clean state after Pico boot
     // This works around an issue where first UART TX after boot fails
-    gpio_init(TARGET_UART_TX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    uart_mux_set_line(UART_OWNER_TARGET, 115200, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_TARGET);
     sleep_ms(10);
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_TX_PIN);
-    gpio_deinit(TARGET_UART_RX_PIN);
+    uart_mux_release(UART_OWNER_TARGET);
 }
 
 // Helper function to wait for and read a response with timeout
@@ -579,23 +586,21 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 #define BL_ACK  0x79
 #define BL_NACK 0x1F
 
-// Ensure UART1 is routed to the Target pins (GP4/5). target_uart_init() releases
-// GRBL (GP8/9) via grbl_deinit() and re-points the peripheral. We re-init when
-// the target UART was never set up OR when GRBL currently owns UART1.
-//
-// The grbl_is_active() check is the fix for the Target<->GRBL "TTL bleed":
-// target_initialized latches true and is never cleared when GRBL takes UART1, so
-// without this check a TARGET SEND / bootloader command after any GRBL command
-// would write to UART1 while it is still on GP8/9 — bleeding bootloader traffic
-// onto the GRBL controller (and leaving GRBL's pins live). Auto-switching here
+// Ensure UART1 is routed to the Target pins (GP4/5). target_uart_init() claims
+// UART1 through uart_mux, which detaches whoever had it (GRBL GP8/9, PSU GP10/11)
+// and parks their pins, so target traffic can never bleed onto them (the old
+// Target<->GRBL "TTL bleed" was the first instance of this). Auto-switching here
 // also removes the old "run TARGET SYNC after GRBL first" requirement.
 void target_uart_ensure_active(void) {
-    extern bool grbl_is_active(void);
-    bool was_grbl = grbl_is_active();
-    if (!target_initialized || was_grbl) {
+    // Re-init when UART1 is not ours (never claimed, or GRBL / the PSU / the I2C
+    // bootloader took it), or when a raw diagnostic listener left it at 8N1/no IRQ.
+    // A PSU *borrow* (power verbs mid-session) hands UART1 back to us itself.
+    uart_owner_t prev = uart_mux_owner(1);
+    if (prev != UART_OWNER_TARGET || target_uart_raw_mode) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
-        if (was_grbl)
-            uart_cli_send("OK: UART1 reclaimed from GRBL for Target (GP4/5)\r\n");
+        if (prev != UART_OWNER_TARGET && prev != UART_OWNER_NONE)
+            uart_cli_printf("OK: UART1 reclaimed from %s for Target (GP4/5)\r\n",
+                            uart_mux_name(prev));
     }
 }
 
@@ -981,65 +986,27 @@ void stm32_bl_readout_protect(void) {
     stm32_bl_end();
 }
 
-void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
-    target_baud = baud;
-
-    // If Grbl UART is active, deinitialize it first
-    // Grbl uses UART1 on GP8/GP9, we need UART1 on GP4/GP5
-    extern bool grbl_is_active(void);
-    extern void grbl_deinit(void);
-    if (grbl_is_active()) {
-        grbl_deinit();
-    }
-
-    // Always deinitialize first to ensure clean state
-    // After Pico boot, UART peripheral and GPIO may be in undefined state
-    if (target_initialized) {
-        uart_set_irq_enables(TARGET_UART_ID, false, false);
-        irq_set_enabled(UART1_IRQ, false);
-    }
-    uart_deinit(TARGET_UART_ID);  // Always deinit, even on first use
-
-    // Deinitialize GPIO pins to clear any previous state
-    // Critical for first use after Pico reboot
-    gpio_deinit(tx_pin);
-    gpio_deinit(rx_pin);
-
-    // Initialize GPIO pins before UART (like SDK examples)
-    gpio_init(tx_pin);
-    gpio_init(rx_pin);
-
-    // Initialize UART1
-    uart_init(TARGET_UART_ID, baud);
-
-    // Set UART format: STM32 bootloader requires EVEN parity, others use no parity
-    if (target_is_stm32(current_target_type)) {
-        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_EVEN);
-    } else {
-        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    }
-
-    // Set TX and RX pins for UART1 (GP4/GP5 are default UART1 pins)
-    gpio_set_function(tx_pin, GPIO_FUNC_UART);
-    gpio_set_function(rx_pin, GPIO_FUNC_UART);
-
-    // Clear RP2350 GPIO isolation bit on TX and RX pins so PIO can also read them
-    // gpio_set_function sets ISO, blocking PIO UART trigger from snooping the pin
-    hw_clear_bits(&padsbank0_hw->io[tx_pin], PADS_BANK0_GPIO0_ISO_BITS);
-    hw_clear_bits(&padsbank0_hw->io[rx_pin], PADS_BANK0_GPIO0_ISO_BITS);
-
-    // Enable UART FIFO
-    uart_set_fifo_enabled(TARGET_UART_ID, true);
-
-    // Small delay to allow UART hardware to stabilize after initialization
-    sleep_us(100);
-
-    // Enable UART RX interrupt for minimal trigger latency
+// Attach hook (uart_mux): runs whenever the target gets UART1 — a full init or a
+// hand-back after another owner borrowed it. Restores the RX trigger IRQ.
+static void target_uart_attach(void) {
     irq_set_exclusive_handler(UART1_IRQ, target_uart_irq_handler);
     irq_set_enabled(UART1_IRQ, true);
     uart_set_irq_enables(TARGET_UART_ID, true, false);  // RX interrupt enabled, TX disabled
+}
 
-    target_initialized = true;
+void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
+    target_baud = baud;
+    (void)tx_pin; (void)rx_pin;   // always GP4/GP5 — the pins live in the uart_mux owner table
+
+    // STM32 bootloader requires EVEN parity, others use no parity. Stored in the
+    // mux so a hand-back after a PSU borrow restores exactly this.
+    uart_mux_set_line(UART_OWNER_TARGET, baud, 8,
+                      target_is_stm32(current_target_type) ? UART_PARITY_EVEN : UART_PARITY_NONE, 1);
+    // Fresh init even if we already own UART1: detaches GRBL/PSU (their pins are
+    // parked, never left selected to UART), routes GP4/5, flushes the FIFO,
+    // and the attach hook enables the RX IRQ.
+    uart_mux_reclaim(UART_OWNER_TARGET);
+    target_uart_raw_mode = false;
 
     // Clear response buffer
     memset(target_response, 0, TARGET_RESPONSE_SIZE);
@@ -1047,7 +1014,17 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     target_response_count = 0;
 
     uart_cli_printf("OK: Target UART1 initialized on GP%u (TX), GP%u (RX) at %u baud\r\n",
-                    tx_pin, rx_pin, baud);
+                    TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, baud);
+}
+
+// Diagnostic-payload listener used by the glitch/payload routines: UART1 on GP4/5
+// at 115200 8N1 with the RX IRQ OFF (callers poll the FIFO). Goes through the mux
+// so GRBL/PSU pins are released; it used to re-init UART1 behind every owner's back.
+static void target_uart_listen_raw(void) {
+    uart_mux_set_line(UART_OWNER_TARGET, 115200, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_TARGET);
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+    target_uart_raw_mode = true;   // next ensure_active() re-inits normally
 }
 
 void target_uart_send_byte(uint8_t byte) {
@@ -1234,9 +1211,8 @@ bool target_uart_set_console_baud(uint32_t baud) {
         return false;
     }
     console_baud = baud;
-    extern bool grbl_is_active(void);
-    if (target_initialized && !grbl_is_active()) {
-        uart_set_baudrate(TARGET_UART_ID, console_baud);
+    if (uart_mux_is_owner(UART_OWNER_TARGET)) {
+        uart_mux_set_baud(UART_OWNER_TARGET, console_baud);   // baud only — keep e.g. the STM32 8E1
     }
     return true;
 }
@@ -1276,9 +1252,8 @@ bool target_uart_set_console_format(const char *spec) {
     console_bits   = bits;
     console_parity = par;
     console_stop   = stop;
-    extern bool grbl_is_active(void);
-    if (target_initialized && !grbl_is_active()) {
-        uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+    if (uart_mux_is_owner(UART_OWNER_TARGET)) {
+        uart_mux_set_format(UART_OWNER_TARGET, console_bits, console_parity, console_stop);  // format only
     }
     return true;
 }
@@ -1299,8 +1274,7 @@ void target_uart_terminal(bool send_autobaud) {
     target_uart_ensure_active();
 
     // Apply the console line settings (overriding any bootloader-left parity).
-    uart_set_baudrate(TARGET_UART_ID, console_baud);
-    uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+    uart_mux_set_line(UART_OWNER_TARGET, console_baud, console_bits, console_parity, console_stop);
 
     uart_cli_printf("OK: TARGET TERM @ %u %s on GP%u/GP%u. Press Ctrl-] to exit.\r\n",
                     console_baud, target_uart_get_console_format(),
@@ -1454,7 +1428,7 @@ void target_reset_execute(void) {
 }
 
 bool target_is_initialized(void) {
-    return target_initialized;
+    return uart_mux_is_owner(UART_OWNER_TARGET);
 }
 
 bool target_is_bl_synced(void) {
@@ -1632,7 +1606,10 @@ bool target_power_get_state(void) {
         bool on;
         return psu_supply_state(&on) && on;
     }
-    power_ensure_init();
+    // Released (e.g. just after PSU RELEASE) = undriven = OFF. Don't init here:
+    // psu_begin() asks this before claiming, and initialising would drive GP11
+    // LOW against the MAX3232 receiver output for the duration of the claim.
+    if (!power_pin_initialized) return false;
     return gpio_get(POWER_PIN1);
 }
 
@@ -2984,12 +2961,7 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t gl
     uart_cli_send("[4] Initializing UART RX (GP5, 115200, 8N1)...\r\n");
 
     // Init UART1 for RX at 115200 baud (matches payload USART1 config)
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // === Step 5: Set BOOT0=0, pulse nRST — stage 2 sends flash via UART ===
     // Matches Joe Grand's stm32-fault-injection notebook (cell 30): BOOT0=LOW,
@@ -3215,11 +3187,7 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
     adc_power_init();
 
     // UART RX ready on GP5 @115200 8N1.
-    uart_deinit(TARGET_UART_ID);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t attempt = 0, effects = 0, reuploads = 0;
     uint32_t off = OFF_MIN; int wi = 0;
@@ -4736,12 +4704,7 @@ void target_power_halt(uint32_t dump_bytes) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
     // Init UART before resume so we catch stage 1's diagnostic output
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // BMP cortexm_detach: 3-step DHCSR to clear C_DEBUGEN via DAP
     extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
@@ -5048,12 +5011,7 @@ void target_power_cleanwake(void) {
     uart_cli_send("    Payload uploaded and verified\r\n");
 
     // Listen on target UART1 RX (GP5) before the payload starts talking
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
     while (uart_is_readable(TARGET_UART_ID)) uart_getc(TARGET_UART_ID);
 
     // Set SP + PC to the payload entry and RESUME with debug still enabled
@@ -5460,12 +5418,7 @@ void target_power_literal(void) {
     swd_write_core_reg(15, stage1_addr);
 
     // Init UART before resume
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // BMP cortexm_detach: 3-step DHCSR
     uint32_t dhcsr_val;
@@ -5717,12 +5670,7 @@ void target_power_regdump(void) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
 
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t dhcsr_val;
     dhcsr_val = 0xA05F0003;
@@ -6346,12 +6294,7 @@ void target_power_glitch_regdump(uint32_t max_attempts) {
 
     // === Step 4: Init UART ===
     uart_cli_send("[4] Initializing UART RX...\r\n");
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // === Step 5: Set BOOT0=0, pulse nRST — flash boot with FPB redirect to stage 2 ===
     uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST...\r\n");
@@ -6472,12 +6415,7 @@ void target_power_resettest(void) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
 
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t dhcsr_val;
     dhcsr_val = 0xA05F0003;

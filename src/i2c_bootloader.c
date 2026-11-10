@@ -3,6 +3,7 @@
 
 #include "i2c_bootloader.h"
 #include "config.h"
+#include "uart_mux.h"
 #include "uart_cli.h"
 #include "swd.h"          // swd_nrst_pulse
 #include "target_uart.h"  // target_power_ensure_on
@@ -44,7 +45,12 @@ void i2c_pins_reinit(void) {
     i2c_pins_init();
 }
 
-static void i2c_pins_init(void) {    gpio_deinit(I2C_SCL_PIN);
+static void i2c_pins_init(void) {
+    // GP4/5 are the target UART1 pins. Release UART1 first if the target holds it
+    // (uart_mux parks the pins and drops ownership), so the next TARGET SEND /
+    // bootloader command re-inits UART1 instead of writing to an unrouted UART.
+    uart_mux_release(UART_OWNER_TARGET);
+    gpio_deinit(I2C_SCL_PIN);
     gpio_deinit(I2C_SDA_PIN);
     gpio_init(I2C_SCL_PIN);
     gpio_init(I2C_SDA_PIN);

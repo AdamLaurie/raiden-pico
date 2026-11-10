@@ -1,6 +1,7 @@
 #include "psu.h"
 #include "config.h"
 #include "uart_cli.h"
+#include "uart_mux.h"
 
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
@@ -27,6 +28,10 @@
 #define PSU_READ_IDLE_MS  120    // stop reading after this idle gap
 #define PSU_READ_TOTAL_MS 400    // hard cap on a single query read
 
+// "PSU mode": the PSU is the target supply and GP10/11 are reserved for its UART
+// (the power group never re-grabs them). Independent of who holds UART1 right now:
+// every PSU transaction BORROWS UART1 through uart_mux and hands it back, so the
+// target / GRBL keep working and a PSU query mid-session is invisible to them.
 static bool psu_active = false;
 // Last known output state: -1 unknown, 0 off, 1 on. Set by every OUT we send and
 // every STATUS? we read, so the TARGET POWER routing (repeated auto power-on per
@@ -45,8 +50,7 @@ bool psu_set_baud(uint32_t baud) {
     if (baud < 1200 || baud > 921600)
         return false;
     psu_baud = baud;
-    if (psu_active)
-        uart_set_baudrate(PSU_UART_ID, psu_baud);  // re-apply to the live UART
+    uart_mux_set_line(UART_OWNER_PSU, psu_baud, 8, UART_PARITY_NONE, 1);  // live if PSU holds UART1
     return true;
 }
 
@@ -68,23 +72,12 @@ bool psu_begin(void) {
         return false;
     }
 
-    // Hand the power-group pins back to a clean state, then retask GP10/11 as
-    // UART1. Release the other UART1 alternates (target GP4/5, GRBL GP8/9) so
-    // only GP10/11 route to the peripheral.
+    // Take GP10/11 from the power group and park them for the PSU (TX held at the
+    // idle/mark level into the MAX3232, RX input). UART1 itself is only borrowed
+    // per transaction (psu_send / psu_do_query) — whoever holds it keeps it.
     power_group_release();
-    uart_deinit(PSU_UART_ID);
-    const uint8_t drop[] = {4, 5, 8, 9};
-    for (unsigned i = 0; i < sizeof(drop); i++) {
-        gpio_set_function(drop[i], GPIO_FUNC_SIO);
-        gpio_set_dir(drop[i], GPIO_IN);
-    }
-
-    gpio_init(PSU_UART_TX_PIN);
-    gpio_init(PSU_UART_RX_PIN);
-    uart_init(PSU_UART_ID, psu_baud);
-    uart_set_format(PSU_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(PSU_UART_TX_PIN, UART_FUNCSEL_NUM(PSU_UART_ID, PSU_UART_TX_PIN));
-    gpio_set_function(PSU_UART_RX_PIN, UART_FUNCSEL_NUM(PSU_UART_ID, PSU_UART_RX_PIN));
+    uart_mux_set_line(UART_OWNER_PSU, psu_baud, 8, UART_PARITY_NONE, 1);
+    uart_mux_park(UART_OWNER_PSU);
 
     psu_active = true;
     psu_out_cached = -1;
@@ -97,8 +90,8 @@ bool psu_begin(void) {
 void psu_release(void) {
     if (!psu_active)
         return;
-    uart_deinit(PSU_UART_ID);
-    gpio_deinit(PSU_UART_TX_PIN);
+    uart_mux_release(UART_OWNER_PSU);   // only if the PSU holds UART1 right now
+    gpio_deinit(PSU_UART_TX_PIN);       // GP10/11 back to hi-Z for the power group
     gpio_deinit(PSU_UART_RX_PIN);
     psu_active = false;
     psu_out_cached = -1;
@@ -112,18 +105,23 @@ static void psu_flush_rx(void) {
         (void)uart_getc(PSU_UART_ID);
 }
 
-// Send a raw command (no terminator by default).
+// Send a raw command (no terminator by default). Borrows UART1 for the
+// transaction and hands it back (with the previous owner's settings/IRQ).
 static void psu_send(const char *cmd) {
+    uart_owner_t prev = uart_mux_borrow(UART_OWNER_PSU);
     uart_puts(PSU_UART_ID, cmd);
     if (PSU_CMD_TERM[0])
         uart_puts(PSU_UART_ID, PSU_CMD_TERM);
+    uart_tx_wait_blocking(PSU_UART_ID);   // fully out before UART1 can be handed back
     sleep_ms(PSU_CMD_GAP_MS);
+    uart_mux_restore(prev);
 }
 
 // Send a query, then read the ASCII response into buf (NUL-terminated). Returns
 // the byte count. Reads until an idle gap or the total cap.
 static int psu_do_query(const char *cmd, char *buf, size_t buflen) {
     if (buflen == 0) return 0;
+    uart_owner_t prev = uart_mux_borrow(UART_OWNER_PSU);
     psu_flush_rx();
     uart_puts(PSU_UART_ID, cmd);
     if (PSU_CMD_TERM[0])
@@ -143,6 +141,7 @@ static int psu_do_query(const char *cmd, char *buf, size_t buflen) {
         }
     }
     buf[n] = '\0';
+    uart_mux_restore(prev);
     return (int)n;
 }
 

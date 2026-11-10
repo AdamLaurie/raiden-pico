@@ -18,6 +18,26 @@
 - New aliases `TARGET REBOOT [ms]` and `TARGET POWER REBOOT [ms]` = `TARGET POWER CYCLE [ms]`
   (same path, including PSU routing). `TARGET POWER CYCLE` now rejects extra arguments
   instead of ignoring them.
+- **`WIDTH` / `GAP` are now the exact pin times** (scope-verified on GP2 + GP12, WIDTH
+  3/4/5/6/10/100, GAP 4/10). The pulse program's fixed cost is 3 cycles per pulse and 4
+  per gap, but the firmware subtracted a flat 5 (and nothing at all for values ≤ 5), so
+  every pulse was WIDTH−2 and every gap GAP−1, and the bottom end was non-monotonic.
+  **Recorded campaign values change meaning** — to reproduce an old setting:
+
+  | old `SET WIDTH` | old actual pulse | new `SET WIDTH` for the same pulse |
+  |---|---|---|
+  | 0–5 | WIDTH+3 cycles (0→3 … 5→8) | WIDTH+3 |
+  | ≥ 6 | WIDTH−2 cycles (6→4, 10→8, 100→98) | WIDTH−2 |
+
+  Old GAP g (COUNT > 1): ≥ 6 → g−1; ≤ 5 → g+4. Minimums are WIDTH 3 (20 ns) and GAP 4;
+  smaller values are accepted (`SET WIDTH 0` is documented for VMIN) and the reply notes
+  the minimum. The F401 "33 ns ≈ WIDTH 5, sweep 4–6" recipe really produced 47/53/27 ns
+  before this fix; it is now 27/33/40 ns as intended. I2CPULSE (its own program) and
+  PAUSE timing are unchanged.
+- `SET <param> <value>` rejects non-integers and negatives (`abc`, `5us`, `1.5`, `-1`)
+  with an ERROR; `atoi()` used to turn them silently into 0 or a truncated number.
+  (`parse_u32` now rejects a leading `-`, which `strtoul` wrapped to 0xFFFFFFFF.)
+- `STATUS` shows the GP22 fired-marker level (`Fired (GP22): HIGH|LOW`).
 
 ### Fixed
 - `STATUS`, bare `TARGET POWER`, the `ARM ON` power warning, and the auto power-on
@@ -27,14 +47,57 @@
   glitch routines refuse while the PSU is claimed.
 - After `PSU RELEASE` in EXTERNAL mode, lazy re-init of the power pins no longer
   drives the crowbar gate LOW (= asserted in `ALOW` polarity).
+- **GP22 (GLITCH_FIRED) stuck HIGH.** `ARM` cleared GP22 with a SIO `gpio_put`, which
+  can't touch a PIO-owned pin, and PIO0's latch for GP22 was never cleared. After a
+  manual `GLITCH` GP22 stayed HIGH through the next ARM (no rising edge for a scope or
+  `TRACE`, clock boost active from arm), and a later UART arm or `ARM TRACE` picked up
+  the stale HIGH. Every ARM / ARM TRACE now clears the PIO latch and drives GP22 LOW.
+- Manual `GLITCH` is a one-shot: IRQ0 raised once, GP22 latched HIGH until the next
+  ARM (same as the GPIO and I2C triggers). It used to loop for several µs, re-raising
+  IRQ0 and dipping GP22 every 99 cycles (extra rising edges). Scope-verified: GP2 and
+  GP12 both fire on the single IRQ, and GP22→GP2 is unchanged (PAUSE + 10 cycles on
+  this path).
+- PSU tests no longer drive GP10/11 into the MAX3232: the claim check doesn't
+  initialise the power pins, and `TestPsuCrowbarCombo` claims and releases once.
+
+- **Hardware-UART ownership arbiter (`uart_mux`).** UART1 is one peripheral with three
+  pin alternates (Target GP4/5, GRBL GP8/9, PSU GP10/11), but each subsystem called
+  `uart_init()` on it independently and kept its own "active" flag, and nothing un-routed
+  the previous owner's pins. So `TARGET TERM`/`BAUD`, bootloader commands or GRBL taking
+  UART1 silently killed a claimed PSU link (re-programmed baud, PSU still "claimed") and
+  sent their traffic out of GP10 to the PSU as well; after `PSU ID` the target/STM32/LPC
+  paths talked to the PSU; GRBL could send G-code to the PSU; the I2C bootloader left the
+  target thinking it still owned an unrouted UART; `PSU RELEASE` deinit'd UART1 even when
+  the target held it; eight glitch/payload routines re-initialised UART1 behind everyone's
+  back. Now every user claims/borrows through `uart_mux`: claiming detaches the previous
+  owner and parks its pins (never left selected to UART; PSU TX parked HIGH into the
+  MAX3232), stored line settings are re-applied on every hand-over, and each PSU
+  transaction borrows UART1 and hands it back with the previous owner's settings and IRQ
+  restored. UART0 (ChipSHOUTER) goes through the same arbiter. `STATUS` shows the owner
+  of each UART. Bench-verified with a real PSU: it keeps answering across target
+  `SEND`/`BAUD`/`FORMAT 8E1` and GRBL, and UART1 returns to whoever had it.
+- `TARGET RESET PIN` validates the GPIO (number, range) and refuses UART pins — `PIN 0/1`
+  used to silently cut ChipSHOUTER off UART0.
+
+### Known issues (not fixed here)
+- At boot GP10/11/12 are driven LOW (INTERNAL default), which fights a MAX3232 on GP11
+  until the PSU is claimed. Leaving them undriven needs ~10 CPU-side glitch routines
+  that skip `power_ensure_init()` fixed first.
 
 ### Tests
 - New `--config=psu` wiring marker. `TestPsuCrowbarCombo`: EXT allowed while claimed;
   INT refused; ON/OFF/CYCLE route to the PSU (OK with a PSU attached, `ERROR: PSU did
   not confirm` without one — never a false OK); query/STATUS leave the PSU claimed;
   crowbar fires with the PSU claimed (also needs `--config=power-ext`).
-- PSU-routed power verbs are **not yet bench-tested against a real PSU** (OUT/STATUS
-  confirm timing, VOUT discharge time of the 72-2540 output).
+- PSU-routed power verbs bench-tested against a real Multicomp Pro 72-2540 driving a
+  12.6 V target (combo class + `TARGET POWER ON/CYCLE` / `TARGET REBOOT` via the PSU).
+- `TestGlitchFiredMarker`: GP22 LOW after every ARM and HIGH after every GLITCH (3×), and
+  cleared when re-arming on UART / GPIO / I2C with `ARM ON` and `ARM TRACE`.
+- `SET` garbage/negative values error; WIDTH < 3 / GAP < 4 accepted with a NOTE.
+- `tests/test_uart_mux.py`: UART0/UART1 ownership in STATUS, Target↔GRBL hand-over, STM32
+  8E1 re-init, live `TARGET BAUD`, `TARGET RESET PIN` guards (config_none); PSU borrow /
+  restore across target SEND/BAUD/FORMAT and GRBL, power verbs after a target session
+  (`--config=psu`).
 
 ## [0.22] — 2026-11-03 — Interactive target console (TARGET TERM + settable line params)
 

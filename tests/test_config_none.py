@@ -99,6 +99,29 @@ class TestGlitchParams:
         r = raiden.cmd("SET FOOBAR 100")
         assert "ERROR" in r
 
+    @pytest.mark.parametrize("cmd", ["SET WIDTH abc", "SET WIDTH 5us", "SET GAP -1",
+                                     "SET PAUSE 1.5", "SET COUNT x", "SET VMIN 2V"])
+    def test_set_garbage_value_errors(self, raiden, cmd):
+        """atoi() used to turn garbage into 0 (or a truncated number) silently."""
+        raiden.cmd("SET WIDTH 100")
+        r = raiden.cmd(cmd)
+        assert "ERROR" in r and "Invalid" in r
+        assert "100" in raiden.cmd("GET WIDTH")   # WIDTH unchanged by a rejected SET
+
+    def test_set_width_below_minimum_accepted_with_note(self, raiden):
+        # WIDTH 0 is documented (VMIN mode), so it's accepted — but the reply must
+        # say the PIO pulse is the 3-cycle minimum, not pass silently.
+        r = raiden.cmd("SET WIDTH 0")
+        assert "OK: WIDTH set to 0" in r and "minimum is 3 cycles" in r
+        assert "NOTE" not in raiden.cmd("SET WIDTH 3")
+        raiden.cmd("SET WIDTH 100")
+
+    def test_set_gap_below_minimum_accepted_with_note(self, raiden):
+        r = raiden.cmd("SET GAP 2")
+        assert "OK: GAP set to 2" in r and "minimum is 4 cycles" in r
+        assert "NOTE" not in raiden.cmd("SET GAP 4")
+        raiden.cmd("SET GAP 100")
+
     def test_get_unknown_param(self, raiden):
         r = raiden.cmd("GET FOOBAR")
         assert "ERROR" in r
@@ -693,6 +716,61 @@ class TestGlitch:
     def test_reset_command(self, raiden):
         r = raiden.cmd("RESET")
         assert "ERROR" not in r
+
+
+# ── GLITCH_FIRED (GP22) marker latch ─────────────────────────
+# GP22 is LOW from ARM until a fire and HIGH afterwards (until the next ARM).
+# Regression: PIO0's GP22 output latch was never cleared, so after a manual
+# GLITCH it stayed HIGH through the next ARM (no rising edge for a scope / TRACE,
+# and clock boost started at arm), and any later arm that handed GP22 back to
+# PIO (UART, ARM TRACE) picked the stale HIGH up. STATUS reports the pad level,
+# so this is checkable over USB with nothing wired (only GP2/GP7/GP22 toggle).
+
+def _gp22(raiden):
+    r = raiden.cmd("STATUS", wait=2)
+    m = re.search(r"Fired \(GP22\):\s*(HIGH|LOW)", r)
+    assert m, "STATUS is missing the 'Fired (GP22):' line"
+    return m.group(1)
+
+
+def _manual_fire(raiden):
+    raiden.cmd("ARM OFF")
+    raiden.cmd("TRIGGER NONE")
+    raiden.cmd("SET PAUSE 0")
+    assert "OK: System armed" in raiden.cmd("ARM ON")
+    assert "Glitch executed" in raiden.cmd("GLITCH")
+
+
+class TestGlitchFiredMarker:
+
+    def test_manual_glitch_latches_and_rearm_clears(self, raiden):
+        for _ in range(3):   # repeatable: every ARM clears, every GLITCH sets
+            raiden.cmd("ARM OFF")
+            raiden.cmd("TRIGGER NONE")
+            raiden.cmd("ARM ON")
+            assert _gp22(raiden) == "LOW", "GP22 not cleared by ARM"
+            raiden.cmd("GLITCH")
+            assert _gp22(raiden) == "HIGH", "GP22 not latched by GLITCH"
+        raiden.cmd("ARM OFF")
+
+    @pytest.mark.parametrize("trigger,arm", [
+        ("TRIGGER UART 3F RX", "ARM ON"),      # hands GP22 back to PIO (UART decoder)
+        ("TRIGGER GPIO RISING", "ARM ON"),
+        ("TRIGGER I2C 0x11", "ARM ON"),        # GP22 on SIO
+        ("TRIGGER UART 3F RX", "ARM TRACE"),   # the stale-latch case on the trace path
+        ("TRIGGER GPIO RISING", "ARM TRACE"),
+        ("TRIGGER I2C 0x11", "ARM TRACE"),
+    ])
+    def test_rearm_on_other_trigger_clears_gp22(self, raiden, trigger, arm):
+        _manual_fire(raiden)
+        assert _gp22(raiden) == "HIGH"
+        raiden.cmd(trigger)
+        assert "armed" in raiden.cmd(arm).lower()
+        try:
+            assert _gp22(raiden) == "LOW", f"GP22 still HIGH after {trigger} + {arm}"
+        finally:
+            raiden.cmd("ARM OFF")
+            raiden.cmd("TRIGGER NONE")
 
 
 # ── Auto power-on at the connect/sync choke points ───────────

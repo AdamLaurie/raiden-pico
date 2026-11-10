@@ -1,4 +1,5 @@
 #include "grbl.h"
+#include "uart_mux.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "uart_cli.h"
@@ -23,52 +24,16 @@ static float current_x = 0.0f;
 static float current_y = 0.0f;
 static float current_z = 0.0f;
 
-// UART state
-static bool grbl_uart_active = false;
+// UART state: GRBL holds UART1 (GP8/9) iff uart_mux says so. A plain flag here
+// went stale when the target or PSU took UART1, and G-code then went out on their
+// pins.
+#define grbl_uart_active (uart_mux_is_owner(UART_OWNER_GRBL))
 
 void grbl_init(void) {
-    // If target UART is active, deinitialize it first
-    // Target uses UART1 on GP4/GP5, we need UART1 on GP8/GP9
-    extern bool target_is_initialized(void);
-    if (target_is_initialized()) {
-        // Target UART deinit will be called by target_uart_init when needed
-        // Just deinit the UART1 peripheral and GPIO pins
-        uart_deinit(GRBL_UART_ID);
-        gpio_deinit(4);
-        gpio_deinit(5);
-    } else {
-        // Deinitialize UART1 anyway (may be in unknown state)
-        uart_deinit(GRBL_UART_ID);
-        gpio_deinit(4);
-        gpio_deinit(5);
-    }
-
-    // Deinitialize our GPIO pins
-    gpio_deinit(GRBL_TX_PIN);
-    gpio_deinit(GRBL_RX_PIN);
-
-    // Small delay to let hardware settle
-    sleep_us(100);
-
-    // Initialize pins BEFORE UART (like SDK examples)
-    gpio_init(GRBL_TX_PIN);
-    gpio_init(GRBL_RX_PIN);
-
-    // Initialize UART1
-    uart_init(GRBL_UART_ID, GRBL_BAUD);
-    uart_set_format(GRBL_UART_ID, 8, 1, UART_PARITY_NONE);
-
-    // Use UART_FUNCSEL_NUM macro for RP2350 alternate function (F11)
-    gpio_set_function(GRBL_TX_PIN, UART_FUNCSEL_NUM(GRBL_UART_ID, GRBL_TX_PIN));
-    gpio_set_function(GRBL_RX_PIN, UART_FUNCSEL_NUM(GRBL_UART_ID, GRBL_RX_PIN));
-
-    // Enable UART FIFO
-    uart_set_fifo_enabled(GRBL_UART_ID, true);
-
-    // Small delay for UART to stabilize
-    sleep_us(100);
-
-    grbl_uart_active = true;
+    // Claim UART1 on GP8/GP9. uart_mux detaches the previous owner (target GP4/5
+    // or PSU GP10/11) and parks its pins, so they are never left selected to UART.
+    uart_mux_set_line(UART_OWNER_GRBL, GRBL_BAUD, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_GRBL);
 
     uart_cli_printf("OK: Grbl UART initialized on GP%u (TX), GP%u (RX) at %u baud\r\n",
                     GRBL_TX_PIN, GRBL_RX_PIN, GRBL_BAUD);
@@ -78,12 +43,7 @@ void grbl_init(void) {
 }
 
 void grbl_deinit(void) {
-    if (grbl_uart_active) {
-        uart_deinit(GRBL_UART_ID);
-        gpio_deinit(GRBL_TX_PIN);
-        gpio_deinit(GRBL_RX_PIN);
-        grbl_uart_active = false;
-    }
+    uart_mux_release(UART_OWNER_GRBL);
 }
 
 void grbl_send(const char *gcode) {

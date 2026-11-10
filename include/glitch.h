@@ -17,6 +17,13 @@ system_flags_t* glitch_get_flags(void);
 // Signed pause-compensation offset (cycles) for the current trigger path (0 = none).
 int32_t glitch_get_pause_offset(void);
 
+// pulse_generator fixed cost per pulse/gap (cycles), on top of the jmp-loop count.
+// HIGH = X_width + 3 (mov x,isr | set pins,1 | jmp loop X+1 | mov x,osr) and
+// LOW = X_gap + 4 (set pins,0 | jmp loop X+1 | jmp y-- | mov x,isr), so WIDTH and
+// GAP are exact down to these minimums (X = 0). Scope-verified on GP2 and GP12.
+#define GLITCH_PULSE_MIN_WIDTH 3
+#define GLITCH_PULSE_MIN_GAP   4
+
 // Set glitch parameters
 void glitch_set_pause(uint32_t pause_us);
 void glitch_set_width(uint32_t width_us);

@@ -20,7 +20,7 @@ Full story in my [unprompted con talk "AI Go Beep Boop!"](https://www.youtube.co
 
 - **Precise timing control**: PIO-based glitch generation with 6.67ns resolution (150 MHz system clock)
 - **8 x Hardware UART**: Alternate configs are leveraged to share UART0/1 across multiple pinouts
-- **Multiple trigger modes**: GPIO edge, UART byte matching, I2C bootloader-command anchors, or manual (software) triggers — all bench-calibrated so the glitch lands exactly `PAUSE` cycles after the GP22 marker
+- **Multiple trigger modes**: GPIO edge, UART byte matching, I2C bootloader-command anchors, or manual (software) triggers — the GPIO/UART/I2C paths are bench-calibrated so the glitch lands exactly `PAUSE` cycles after the GP22 marker (manual `GLITCH`: `PAUSE` + 10 cycles)
 - **Glitch outputs**: Manual pulse output (GP2/GP7), ChipSHOUTER EMFI control (`CS` commands), and crowbar voltage glitching (EXTERNAL power mode, GP12)
 - **Target support**: Built-in bootloader entry for LPC and STM32 microcontrollers
 - **Command-line interface**: USB CDC serial interface with command shortcuts
@@ -153,6 +153,12 @@ All commands support non-ambiguous shortcuts (e.g., `STAT` for `STATUS`, `GL` fo
 **`SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>]`** - Set/show glitch parameters
 - Values in system clock cycles @ 150MHz (6.67ns per cycle)
 - Example: `SET WIDTH 150` = 1µs pulse
+- `WIDTH` and `GAP` are the exact pin times (scope-verified on GP2/GP12). The PIO
+  minimum is **WIDTH 3** (20 ns) and **GAP 4** (26.7 ns); smaller values are accepted
+  (e.g. `SET WIDTH 0` for VMIN mode) but the reply notes the pulse/gap will be the minimum.
+- Values must be non-negative integers — `SET WIDTH abc` / `5us` / `-1` is an ERROR.
+- GP2 (default pad) rounds the edges of pulses under ~6 cycles; the GP12 crowbar gate
+  (12 mA, fast slew) stays exact down to the 3-cycle minimum.
 - With no value, shows current settings
 
 **`GET [PAUSE|WIDTH|GAP|COUNT|VMIN]`** - Read current parameter values
@@ -465,6 +471,8 @@ OK: sent 0x7F autobaud sync at 115200 baud
 - Defaults: 300ms pulse, GPIO 15, active low.
 - Unknown or malformed options are rejected with an error (e.g. `TARGET RESET 400`
   errors — use `TARGET RESET PERIOD 400`). Never silently ignored.
+- `PIN` must be a valid GPIO and must not be a UART pin (GP0/1 ChipSHOUTER, GP4/5 Target,
+  GP8/9 GRBL, GP10/11 PSU) — reconfiguring one as the reset line would cut that UART off.
 - Example: `TARGET RESET PERIOD 500 PIN 16 HIGH` then `TARGET RESET`
 
 **`TARGET POWER [ON|OFF|CYCLE] [ms]`** - Control/show target power on GP10/11/12
@@ -1241,9 +1249,10 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 22** - `GLITCH_FIRED` — a **LOGIC marker that asserts at the trigger instant,
   *before* the PAUSE** (not the glitch itself). The glitch output (GP2/GP7) follows one
   `PAUSE` later, so **scoping GP22 → the glitch edge measures the actual PAUSE delay**.
-  It is a latched level for the CPU-sourced I2C trigger and a ~667 ns pulse for the
-  PIO GPIO/UART triggers. (The real fault injection is GP2/GP7 / the crowbar; GP22 is a
-  monitor/trace signal.)
+  Every `ARM ON` / `ARM TRACE` drives it LOW. For the GPIO, I2C and manual (`GLITCH`)
+  triggers it then **latches HIGH at the fire until the next ARM**. For the UART trigger it
+  is a ~667 ns pulse per match. `STATUS` shows its level (`Fired (GP22): HIGH|LOW`).
+  (The real fault injection is GP2/GP7 / the crowbar; GP22 is a monitor/trace signal.)
 
 ### Status LED (board-aware)
 
@@ -1269,7 +1278,36 @@ Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
 - **GPIO 8** - GRBL UART TX (UART1 alternate function)
 - **GPIO 9** - GRBL UART RX (UART1 alternate function)
 
-**Note**: GRBL uses UART1, shared with the Target UART (GP4/GP5). Only one pin-set is live at a time, but commands auto-switch in both directions: a Target/bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 and prints `OK: UART1 reclaimed from GRBL for Target (GP4/5)`. No manual `TARGET SYNC` is needed after GRBL.
+**Note**: GRBL uses UART1, shared with the Target UART (GP4/GP5) and the PSU (GP10/11) — see
+[Hardware UART sharing](#hardware-uart-sharing). Commands auto-switch in both directions: a
+Target/bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 and prints
+`OK: UART1 reclaimed from GRBL for Target (GP4/5)`. No manual `TARGET SYNC` is needed after GRBL.
+
+### Hardware UART sharing
+
+The RP2350 has two UART peripherals; Raiden routes each to several pin pairs:
+
+| UART | Owner | Pins | Line settings | Takes the UART |
+|---|---|---|---|---|
+| UART0 | ChipSHOUTER | GP0/GP1 | 115200 8N1 | always (only owner) |
+| UART1 | Target | GP4/GP5 | SYNC baud, 8E1 (STM32) / 8N1; console via `TARGET BAUD/FORMAT` | any target UART command |
+| UART1 | GRBL | GP8/GP9 | 115200 8N1 | any `GRBL` command |
+| UART1 | PSU | GP10/GP11 | `PSU BAUD` (9600) 8N1 | **borrowed** per PSU transaction, then handed back |
+
+One peripheral has one baud/format/FIFO, so ownership is arbitrated (`src/uart_mux.c`):
+- Claiming a UART detaches the previous owner and **parks its pins** — they are never left
+  selected to the UART (a selected TX keeps transmitting; a selected RX keeps feeding the
+  shared receiver). Target/GRBL pins park as inputs; the PSU TX parks driven HIGH (idle)
+  into the MAX3232.
+- Each owner's line settings are stored and re-applied whenever it gets the UART back.
+- The PSU only **borrows** UART1 for each command/query and hands it back with the previous
+  owner's settings and IRQ restored, so `TARGET POWER` routed to the PSU in the middle of a
+  target session (e.g. the power cycle in `TARGET SYNC`) is invisible to the target link.
+- `STATUS` shows the current owner of each UART (`== UARTs ==`).
+- The I2C bootloader (bit-banged on GP4/5) releases UART1 from the target first.
+- Adding another owner or alternate pair: see `include/uart_mux.h`. Several RP2350 UART
+  alternates collide with pins in use (GP12 crowbar gate, GP13/14 BOOT0/1, GP16 ARMED,
+  GP17 SWCLK).
 
 **CNC3018 Woodpecker controller wiring** (offline controller 8-pin header):
 - Pico GND → controller pin 3 or 4 (GND)
@@ -1415,7 +1453,7 @@ Then rebuild and reflash the firmware.
 - **System Clock**: 150 MHz
 - **Timing Resolution**: 6.67 ns (1 clock cycle)
 - **UART Baud Rates**: Up to 921600 (configurable)
-- **Glitch Width Range**: 1 cycle to 2^32 cycles (6.67ns to 28.6 seconds)
+- **Glitch Width Range**: 3 cycles to 2^32 cycles (20ns to 28.6 seconds); gap minimum 4 cycles
 - **Trigger→glitch pipeline offset**: per-trigger-path, bench-calibrated so the glitch
   fires exactly `PAUSE` cycles after the GLITCH_FIRED (GP22) marker on every path.
   - Offsets (cycles, signed): I2C `+14`, GPIO `+10`, UART `-152`. A positive offset is
@@ -1424,6 +1462,8 @@ Then rebuild and reflash the firmware.
   - All three bench-verified on a Rigol MSO7014 (RAW samples + interpolated 1.5V crossing)
     against an F401: GP22→first-edge lands within ~1 cycle of `PAUSE` on every path —
     I2C +0.6ns, GPIO +0.8ns, UART +2.0ns (flat across PAUSE 300/600/900).
+  - Manual `GLITCH` (TRIGGER NONE) is not offset-compensated: GP22→first edge = `PAUSE` + 10
+    cycles (scope-measured).
   - **`PAUSE 0` = no pause**: fires at minimum latency; the offset is not applied.
   - **A non-zero `PAUSE` below a positive offset is rejected** (ERROR) at `SET PAUSE` and
     at `ARM ON` — it could not be compensated and would silently clamp to minimum latency.

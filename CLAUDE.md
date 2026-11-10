@@ -56,7 +56,7 @@ Raiden Pico is RP2350 firmware that turns a Pico 2 into a fault-injection / glit
 
 ### Two cross-cutting hardware facts
 
-1. **UART1 is shared between Target (GP4/GP5) and GRBL (GP8/GP9)** via pin alternate-functions — only one pin-set can be live at a time. Commands auto-switch in both directions: a target TX / bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 (via `target_uart_ensure_active()`), so a manual `TARGET SYNC` is no longer required. (Full workflow in the section below.)
+1. **UART1 is shared between Target (GP4/GP5), GRBL (GP8/GP9) and the PSU (GP10/11)** via pin alternate-functions, arbitrated by `uart_mux` (UART0/ChipSHOUTER goes through it too). Commands auto-switch; the PSU borrows UART1 per transaction. (Details in the UART ownership section below.)
 
 2. **VMIN = ADC-gated glitching.** `SET VMIN <mV>` (0 = disabled) switches the glitch from a fixed-time PIO pulse to a CPU-side primitive that drops the rail and polls **ADC0 on GP26** until the probed voltage reaches the threshold, then holds for `WIDTH` cycles of minimum dwell. **Requires the target rail wired to GP26.** Currently routes through `TARGET GLITCH LPCBYPASS` and the STM32 sweep/test paths; PIO triggers (UART/GPIO) still use WIDTH-only timed pulses. See `VMIN.md`.
 
@@ -70,31 +70,27 @@ Authoritative source is `include/config.h` (and `swd.h` for debug pins); the liv
 
 Extensive Markdown docs at the repo root document specific workflows and findings: `README.md` (full CLI command reference), `VMIN.md`, `TARGET_UART.md`, `CHIPSHOT_UART.md`, `GLITCHING_GUIDE.md`, `PIO_ARCHITECTURE.md`, `SHORTCUTS.md`, and the various `*_RESULTS.md` / `*_FINDINGS.md` campaign notes.
 
-## UART Switching (Target vs Grbl)
+## UART ownership (uart_mux) — Target / GRBL / PSU / ChipSHOUTER
 
-The system uses UART1 for both Target (GP4/GP5) and Grbl XY platform (GP8/GP9 via alternate function).
-Only one pin-set can be live at a time - switching between them reconfigures UART1. Switching is now
-**automatic in both directions** (previously only Target→GRBL auto-switched; the reverse required a
-manual `TARGET SYNC` and, if skipped, bled bootloader traffic onto the GRBL controller — fixed).
+Both hardware UARTs are arbitrated by `src/uart_mux.c` (`include/uart_mux.h`): UART0 = ChipSHOUTER
+(GP0/1); UART1 = Target (GP4/5), GRBL (GP8/9), PSU (GP10/11). **Never call `uart_init`/`uart_deinit`/
+`gpio_set_function(..UART..)` on these pins directly** — go through the mux.
 
-**Behaviour:**
-- Switching from Target to Grbl (or vice versa) reconfigures UART1 and releases the other pin-set.
-- GRBL commands auto-claim UART1 on GP8/GP9 (grbl_init deinits GP4/5).
-- Target TX / bootloader / ISP commands auto-reclaim UART1 on GP4/5 from GRBL via
-  `target_uart_ensure_active()` — it re-inits when `!target_initialized` OR `grbl_is_active()`, so a
-  `TARGET SEND` / `TARGET BL` / `TARGET SYNC` after a GRBL command switches back automatically and
-  prints `OK: UART1 reclaimed from GRBL for Target (GP4/5)`.
-- `TARGET SYNC` after GRBL is therefore no longer required (still harmless to run).
-
-**The bleed bug (fixed):** `target_initialized` latched true and was never cleared when GRBL took
-UART1, so the old `if (!target_initialized)` guard on the target TX path skipped the switch-back and
-wrote to UART1 while it was still on GP8/9. The `grbl_is_active()` term in `target_uart_ensure_active()`
-is the fix; the same guard is applied at the STM32 (`stm32_bl_begin`) and LPC (`lpc_begin`) ISP entry
-points.
-
-**Workflow (still works, SYNC now optional):**
-1. TARGET SYNC → TARGET SEND (works)
-2. GRBL commands (auto-switch to GP8/9)
-3. TARGET SEND / TARGET BL / TARGET SYNC (auto-reclaims GP4/5 - no manual step needed)
-
-- TRIGGER UART functionality continues to work correctly after auto-switching.
+- `uart_mux_claim(owner)` / `uart_mux_reclaim(owner)`: detach the previous owner (its detach hook,
+  UART IRQ off) and **park its pins** (never left selected to UART — a selected TX keeps
+  transmitting and a selected RX keeps feeding the shared receiver), route the new pins, apply the
+  owner's stored line settings (`uart_mux_set_line`), run its attach hook (the target's re-enables
+  the RX trigger IRQ).
+- `uart_mux_borrow(owner)` / `uart_mux_restore(prev)`: short transactions. Every PSU send/query
+  borrows UART1 and hands it back, so PSU-routed `TARGET POWER` mid-target-session is invisible to
+  the target link. "PSU mode" (`psu_is_active()`, GP10/11 reserved) is separate from owning UART1.
+- Ownership is the single source of truth: `target_is_initialized()` / `grbl_is_active()` ask the
+  mux. `target_uart_ensure_active()` re-inits when UART1 isn't the target's (GRBL, PSU without a
+  pending restore, or the I2C bootloader released it) and prints
+  `OK: UART1 reclaimed from <owner> for Target (GP4/5)`.
+- The I2C bootloader bit-bangs GP4/5, so `i2c_pins_init()` releases the target's UART1 first.
+- `STATUS` → `== UARTs ==` shows each UART's owner, pins and line settings.
+- Adding an owner / alternate pair: owner enum + table row in uart_mux (see the header comment);
+  several RP2350 alternates collide with pins in use (GP12 crowbar, GP13/14 BOOT0/1, GP16, GP17).
+- TRIGGER UART (PIO snoop on GP4/5) reads the pad, so it works regardless of who owns UART1.
+- Tests: `tests/test_uart_mux.py` (config_none ownership + `--config=psu` sharing).
