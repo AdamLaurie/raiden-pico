@@ -380,6 +380,8 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   | `ERASE ALL WIPE` | 0x45 Extended Erase, mass (**destructive**, confirm token) |
   | `RP CONFIRM` | 0x83 Readout Protect → re-lock to RDP1 (**destructive**, confirm token) |
   | `RU WIPE` | 0x93 Readout Unprotect → mass-erase + drop to RDP0 (**destructive**, confirm token) |
+  | `STRETCH [n] [cmd_hex]` | *(experimental)* time the SCL clock-stretch at a command-ACK over N reads — RDP decision-time recon, cycle resolution, no scope (default n=100, cmd=0x11) |
+  | `DLY [us]` | *(experimental)* set/show the bit-bang master half-bit delay to sweep the I2C clock (0–100000 µs; default 100) |
 
 - **Deterministic timing (no UART jitter).** Unlike the USART bootloader path —
   where sync (`0x7F`), command and verdict traffic jitter by milliseconds
@@ -391,8 +393,7 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   edge as the t=0 reference. Use the I2C bootloader in preference to the UART
   bootloader for any timed glitch against bootloader command processing.
 
-- Purpose: test whether the F401's I2C boot interface (present in the ROM but
-  undocumented in AN2606) is reachable, and map which bootloader commands the RDP
+- Purpose: exercise the F401's I2C boot interface and map which bootloader commands the RDP
   level gates. **Bench result (F401):** the interface *is* reachable at 0x39; at
   **RDP1 only Get/GV/GID and the RDP-management pair (RP/RU) are accepted — Read,
   Write, Go, Erase and Write-Protect are all NACK'd**, so there is no command-level
@@ -465,10 +466,13 @@ OK: sent 0x7F autobaud sync at 115200 baud
 ```
 
 **`TARGET RESET`** (bare) - Pulse the reset pin now (execute)
-**`TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW]`** - Configure only (does NOT pulse)
+**`TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW] [IDLE <FLOAT|HOLD>]`** - Configure only (does NOT pulse)
 - Bare `TARGET RESET` executes a pulse with the current config; any parameter switches
   to configure-only — follow with a bare `TARGET RESET` to actually pulse.
-- Defaults: 300ms pulse, GPIO 15, active low.
+- Defaults: 300ms pulse, GPIO 15, active low, idle FLOAT.
+- `IDLE FLOAT` leaves the reset pin high-Z after the pulse (TREF-safe default); `IDLE HOLD`
+  keeps driving it to the released level (more reliable nRST on a Nucleo, whose cap + weak
+  pull-up make a floated release edge marginal). `IDLE` with no/unknown mode errors.
 - Unknown or malformed options are rejected with an error (e.g. `TARGET RESET 400`
   errors — use `TARGET RESET PERIOD 400`). Never silently ignored.
 - `PIN` must be a valid GPIO and must not be a UART pin (GP0/1 ChipSHOUTER, GP4/5 Target,
@@ -508,11 +512,22 @@ UART is claimed are independent, which gives the two PSU rows.
 - `PSU RELEASE` leaves a PSU row and returns GP10/11 to the power group (the supply is then
   GP10 again, and is OFF until `TARGET POWER ON`).
 - `TARGET POWER INT` is refused while the PSU is claimed (it needs GP10/11); `EXT` is allowed.
+- **⚠ The crowbar is UNTESTED WIP.** The GP12 gate wiring, the `TARGET CROWBAR` flag/interlock
+  and the EXTERNAL-mode fire path are **not yet bench-validated against a real FET + target**.
+  The command surface and safety interlocks below are in place and safe to configure, but don't
+  rely on the crowbar actually glitching a target until it's been proven on the bench.
+- **The crowbar is EXTERNAL-only — it cannot coexist with INTERNAL.** GP12 is one pin:
+  ganged power in `INT`, the crowbar gate in `EXT`, never both. The gate polarity
+  (`AHIGH`/`ALOW`) is an `EXT`-only argument; `TARGET POWER INT AHIGH` is a mode mix-up and
+  **errors** rather than silently ignoring the polarity. (The firmware also hard-guards it:
+  arming in `INT` never drives GP12 as a gate.)
 - Mode changes are refused while armed (`ARM OFF` first).
 - GP2/GP7 (glitch output) and the ChipSHOUTER trigger work in every mode.
 
 **`TARGET POWER [INT|EXT [AHIGH|ALOW]]`** - Select how the GP10/11/12 group is driven
 - `INT` (default) - GP10/11/12 ganged as the target power source/sink (current behaviour).
+  Takes no argument — `AHIGH`/`ALOW` is EXTERNAL-only (there is no gate in INTERNAL), so
+  `TARGET POWER INT AHIGH` errors.
 - `EXT` - GP10 = supply enable, GP11 = reserved spare, **GP12 = crowbar gate** (PIO-driven,
   emits the same glitch waveform as GP2 for any trigger type). The gate is on GP12 so it
   keeps working while the external PSU holds GP10/11.
@@ -521,6 +536,20 @@ UART is claimed are independent, which gives the two PSU rows.
 - Bare `TARGET POWER` prints the power on/off state, the current mode, and gate polarity. Disarm (`ARM OFF`)
   before switching. The CPU-side power-group glitch routines (`SWEEP`/`GLITCH`/`PAYLOAD`/
   `BYPASS`/LPC bypass) are refused in `EXT` mode — use the PIO crowbar (`ARM` + trigger).
+
+**`TARGET CROWBAR [ON [AHIGH|ALOW] [PSU LOCAL|EXT]|OFF]`** - Flag that a crowbar MOSFET is
+wired to GP12, so the firmware keeps the bench safe.
+- `ON` forces EXTERNAL mode at the given gate polarity (`AHIGH` default) and idles the gate
+  de-asserted — the bench is immediately safe, with no INTERNAL window where GP12 is driven
+  as a power output into the gate FET.
+- `PSU LOCAL` = the supply is the Pico-driven PSU over UART1 (combo mode); `PSU EXT` = the
+  supply is host/USB-driven (or a bare bench supply) and the Pico does not control it. Shown
+  in `STATUS` and bare `TARGET CROWBAR`.
+- While flagged, **`TARGET POWER INTERNAL` is refused** (`ERROR: crowbar bench flagged …`) —
+  clear it with `TARGET CROWBAR OFF` first.
+- **Session-only: the flag clears on reboot** (the Pico has no settings persistence yet), so
+  re-issue it after every boot before any power-on / `SYNC` / `CONNECT`. See the crowbar
+  circuit, polarity, and PSU current-limit guidance under "EXTERNAL Power / Crowbar Mode".
 
 **`TARGET GLITCH SWEEP`** - Calibrate voltage glitch threshold
 - Ramps target power down via ADC monitoring to find brown-out reset voltage
@@ -1060,7 +1089,7 @@ Dump complete: 131072 bytes received
 
 The workflow above injects a fault and searches for a window by trial and error. This campaign inverts that: instead of firing energy and hoping to land near a target instruction, **fire a debug halt and simply look**. A halt is a zero-width "glitch" — it injects nothing, so it can't corrupt the target — but frozen at a chosen offset from a deterministic trigger edge, it answers the one question every glitch campaign has to guess otherwise: *where is the CPU, relative to the instruction I want to corrupt, at each point in the window?*
 
-The example: locating the RDP check that guards the STM32 bootloader's **Read Memory command (0x11)**, delivered over the undocumented **I2C boot interface** (see `TARGET GLITCH I2CGATE`/`I2CPROBE` above). On the wire, the sequence is fully deterministic — slave address, command byte, checksum, and the bus clock-stretch while the bootloader evaluates the command — so the edge at the end of the command frame is a trustworthy t=0. The same technique works for any target whose interesting instruction sits at a fixed offset from a repeatable trigger edge (a UART command byte, a GPIO pulse, a clock edge).
+The example: locating the RDP check that guards the STM32 bootloader's **Read Memory command (0x11)**, delivered over the **I2C boot interface** (see `TARGET GLITCH I2CGATE`/`I2CPROBE` above). On the wire, the sequence is fully deterministic — slave address, command byte, checksum, and the bus clock-stretch while the bootloader evaluates the command — so the edge at the end of the command frame is a trustworthy t=0. The same technique works for any target whose interesting instruction sits at a fixed offset from a repeatable trigger edge (a UART command byte, a GPIO pulse, a clock edge).
 
 #### Phase 1 — Establish the deterministic anchor
 
@@ -1373,6 +1402,52 @@ Pico GND ══════ target GND   (short, heavy — crowbar current retur
 
 GP2 stays the polarity-aware glitch/trigger output throughout, so an external glitcher
 (e.g. ChipSHOUTER) and the crowbar gate can be driven from the same trigger.
+
+#### The crowbar requires EXTERNAL mode — INTERNAL is prohibited (Pico/FET protection)
+
+A crowbar shorts the rail to ground. That is only safe when the rail is powered by an
+**external** supply (bench PSU / load switch), which EXTERNAL mode assumes. **Never run a
+crowbar in INTERNAL mode:**
+
+- **GP2-driven crowbar in INTERNAL** shorts the rail *while GP10/11/12 are sourcing it* —
+  a dead short straight through the RP2350 output drivers (≈ tens of mA per pin, bounded
+  only by the pins' on-resistance). A single short pulse survives; a stuck-on gate, a
+  reset-while-armed, or a tight burst makes it a sustained short that damages the pins.
+  The firmware gives GP2 **no interlock** (GP2 fires in every mode), so this is prohibited
+  by rule, not by code — **do not wire a crowbar to GP2.**
+- **GP12-driven crowbar in INTERNAL** is also unsafe: INTERNAL re-tasks GP12 as a ganged
+  power output driven HIGH, which latches a non-inverting gate **on** → sustained short of
+  the external rail. The firmware already refuses to *fire* the GP12 crowbar outside
+  EXTERNAL, but it cannot know a FET is attached, so switching to INTERNAL on a
+  crowbar-wired bench is an operator error to avoid.
+
+Keep a crowbar bench in **EXTERNAL** at all times; rest it de-energized (`TARGET POWER OFF`,
+which idles the GP12 gate de-asserted), never in INTERNAL.
+
+#### PSU current limit — set it before firing (backstop protection)
+
+Set the external supply's current limit *below the FET's safe sustained current and above
+the target's real draw*, so a stuck-on short folds the PSU back to CC (harmless) instead of
+feeding a dead short. The PSU is too slow to source the nanosecond crowbar peak anyway (that
+comes from the rail/output capacitance), so a modest limit does not weaken the glitch — it
+only caps the sustained-fault case. When the PSU is Pico-driven, `PSU VOLT <mV>` + `PSU CURR
+<mA>` set it; when it's USB-driven, dial the same limit in by hand.
+
+Rule of thumb: `ILIM ≈ 1.5–3 × measured idle draw`, capped at the FET's safe sustained
+current, and never so low the rail can't recharge between shots at your rep rate. Examples
+(3.3 V STM32 target, AO3400-class FET):
+
+| Target powered | `PSU VOLT` | `PSU CURR` | Why |
+|---|---|---|---|
+| Bare F401 MCU VDD (isolated) | `3300` | `100` | ~20–40 mA draw; 100 mA stuck-on short ≈ 0 W in the FET |
+| Whole Nucleo board at 3V3 | `3300` | `250` | board + LEDs + regulator quiescent |
+| Larger / higher-draw target | match rail | `1.5–3×` idle | keep ≤ FET safe sustained (e.g. ≤ ~500 mA for SOT-23) |
+
+Note the **crowbar node vs the supplied node** can differ: on an F401 you feed **VDD at
+3.3 V** (so `PSU VOLT 3300`) but may crowbar **VCAP** (the internal ~1.2 V core LDO output).
+Then the PSU limit protects the VDD feed, and the VCAP short is additionally bounded by the
+F401's own internal LDO. `SET WIDTH` small and a low rep rate keep both the FET and the
+average PSU current comfortable.
 
 ### SWD/JTAG Debug Interface
 

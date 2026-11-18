@@ -262,6 +262,26 @@ static uint32_t reset_period_ms = 300;  // Default 300ms reset period
 static bool reset_active_high = false;
 static bool reset_pin_initialized = false;
 
+// Reset idle state AFTER the release pulse: false = float (high-Z, TREF-safe
+// default), true = keep driving the inactive level (hard-hold high for an
+// active-low reset). Floating into a Nucleo's nRST net (weak ~40k pull-up + cap,
+// plus the on-board ST-LINK) gives a messy, slow recovery edge -> unreliable
+// bootloader entry. HOLD removes that; only use where there is no JTAG TREF net.
+static bool reset_idle_hold = false;
+void target_reset_set_idle_hold(bool hold) { reset_idle_hold = hold; }
+bool target_reset_get_idle_hold(void) { return reset_idle_hold; }
+// After a reset pulse, drive the release (inactive) edge actively for this long
+// before going high-Z, so nRST gets a clean, fast rising edge the target can
+// latch boot mode on even when the board has an nRST cap + weak pull-up.
+#define RESET_RELEASE_SETTLE_MS 5
+
+// After routing UART1 to the target pins, let the TX line settle to idle-high
+// before the first bootloader sync byte. Switching GP4 to the UART TX function
+// can glitch the edge, and an autobauding STM32 bootloader locks onto the FIRST
+// byte it sees — so a clean idle gap (and a post-settle FIFO flush) before 0x7F
+// is essential, or the autobaud latches on a glitch and sync fails silently.
+#define BOOTLOADER_UART_SETTLE_MS 20
+
 // Power configuration - 3 pins ganged for ~36mA total (3x 12mA drive)
 #define POWER_PIN1  10  // GP10
 #define POWER_PIN2  11  // GP11
@@ -281,6 +301,16 @@ extern bool psu_is_active(void);
 // Crowbar gate polarity in EXTERNAL mode: true = assert HIGH / idle LOW (low-side N-FET),
 // false = assert LOW / idle HIGH (high-side P-FET / active-low gate driver).
 static bool crowbar_gate_active_high = true;
+
+// Operator-declared crowbar bench (TARGET CROWBAR ON ...). When set, a crowbar MOSFET
+// is physically on GP12, so INTERNAL is forbidden (it would drive GP12 as a power output
+// straight into the gate FET = sustained short). Setting it forces EXTERNAL + idles the
+// gate. Session-only for now (no persistence — see the settings-store TODO), so it clears
+// on reboot, dropping back to INTERNAL default: re-flag after every boot.
+static bool crowbar_flagged = false;
+// How the external rail is supplied on a crowbar bench (informational + controls whether
+// the firmware manages the supply). Default EXTERNAL = hands-off (safest).
+static psu_source_t crowbar_psu_source = PSU_SRC_EXTERNAL;
 
 // GPIO mask that target_power_on/off/cycle actually drive:
 //   INTERNAL = the whole ganged group; EXTERNAL = GP10 (supply enable) only,
@@ -452,7 +482,13 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
     // We use blocking reads during bootloader sync, so interrupts would interfere
     uart_set_irq_enables(TARGET_UART_ID, false, false);
 
-    // Clear any stale data from UART RX FIFO that may have accumulated
+    // Let the freshly-routed UART line settle to idle-high before we sync. The
+    // GP4->TX function switch can glitch the edge, and the target bootloader
+    // autobauds on the first byte, so give it a clean idle gap first.
+    sleep_ms(BOOTLOADER_UART_SETTLE_MS);
+
+    // Clear any stale data from UART RX FIFO (incl. anything the switch/settle
+    // produced) so the autobaud reply isn't read out of a dirty FIFO.
     while (uart_is_readable(TARGET_UART_ID)) {
         uart_getc(TARGET_UART_ID);
     }
@@ -649,12 +685,31 @@ static int stm32_bl_send_addr(uint32_t addr) {
     return stm32_bl_wait_ack(1000);
 }
 
+// --- RX error-flag diagnostics (PL011 UARTDR bits [11:8] = OE,BE,PE,FE) ---
+// Tallied in stm32_bl_recv_bytes; reset + reported around stm32_bl_read.
+static uint32_t bl_rx_fe = 0;   // framing errors (stop bit wrong -> timing/baud/signal)
+static uint32_t bl_rx_pe = 0;   // parity errors
+static uint32_t bl_rx_be = 0;   // break errors
+static uint32_t bl_rx_oe = 0;   // overrun errors (FIFO overflow -> firmware too slow)
+static uint32_t bl_rx_first_err_idx = 0xFFFFFFFFu; // index of first byte carrying any flag
+
 static int stm32_bl_recv_bytes(uint8_t *buf, uint32_t count, uint32_t timeout_ms) {
     uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
     uint32_t received = 0;
     while (received < count && time_us_64() < deadline) {
         if (uart_is_readable(TARGET_UART_ID)) {
-            buf[received++] = uart_getc(TARGET_UART_ID);
+            // Read the raw data register so we keep the per-byte error flags that
+            // uart_getc() discards (bit8 FE, bit9 PE, bit10 BE, bit11 OE).
+            uint32_t dr = uart_get_hw(TARGET_UART_ID)->dr;
+            buf[received] = (uint8_t)(dr & 0xFF);
+            bool any = false;
+            if (dr & (1u << 8)) { bl_rx_fe++; any = true; }
+            if (dr & (1u << 9)) { bl_rx_pe++; any = true; }
+            if (dr & (1u << 10)) { bl_rx_be++; any = true; }
+            if (dr & (1u << 11)) { bl_rx_oe++; any = true; }
+            if (any && bl_rx_first_err_idx == 0xFFFFFFFFu)
+                bl_rx_first_err_idx = received;
+            received++;
         }
     }
     return received;
@@ -787,6 +842,9 @@ void stm32_bl_read(uint32_t addr, uint32_t count) {
     uart_cli_printf("Reading %lu bytes from 0x%08lX:\r\n", count, addr);
 
     stm32_bl_begin();
+    // reset RX error-flag diagnostics for this read
+    bl_rx_fe = bl_rx_pe = bl_rx_be = bl_rx_oe = 0;
+    bl_rx_first_err_idx = 0xFFFFFFFFu;
     uint32_t total = 0;
     while (total < count) {
         uint32_t chunk = count - total;
@@ -838,6 +896,13 @@ void stm32_bl_read(uint32_t addr, uint32_t count) {
         if (got < (int)chunk) break;
     }
     uart_cli_printf("OK: Read %lu bytes\r\n", total);
+    if (bl_rx_fe || bl_rx_pe || bl_rx_be || bl_rx_oe) {
+        uart_cli_printf("[RX ERR] FE=%lu PE=%lu BE=%lu OE=%lu first@%ld\r\n",
+                        bl_rx_fe, bl_rx_pe, bl_rx_be, bl_rx_oe,
+                        (bl_rx_first_err_idx == 0xFFFFFFFFu) ? -1L : (long)bl_rx_first_err_idx);
+    } else {
+        uart_cli_send("[RX ERR] none\r\n");
+    }
 done:
     stm32_bl_end();
 }
@@ -1410,14 +1475,28 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
 }
 
 void target_reset_execute(void) {
-    // Pulse reset pin. Drive only during the active phase, return to
-    // high-Z afterward so the target's own pull on nRST owns the line at
-    // idle (avoids leakage onto JTAG TREF).
+    // Pulse reset pin, then ACTIVELY drive the inactive (release) level for a
+    // short settle before going high-Z. Some targets rise too slowly to latch
+    // boot mode if we just let nRST float up on release: a Nucleo, for example,
+    // has an on-board nRST capacitor and only a weak (~40k) internal pull-up, so
+    // a pure float gives a slow, soft rising edge and the bootloader never comes
+    // up (this was a regression — see RESET_RELEASE_SETTLE_MS). Driving the
+    // release edge gives a clean, fast transition; we then return to high-Z so
+    // the target's own pull owns the idle line and 3.3 V stays off a JTAG TREF
+    // net between shots (the reason the idle state is float in the first place).
     gpio_set_dir(reset_pin, GPIO_OUT);
     gpio_put(reset_pin, reset_active_high ? 1 : 0);  // Active state
     sleep_ms(reset_period_ms);
-    gpio_set_dir(reset_pin, GPIO_IN);                // Inactive = float
-    gpio_disable_pulls(reset_pin);
+    gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state, driven
+    sleep_ms(RESET_RELEASE_SETTLE_MS);               // clean rising edge + latch
+    if (reset_idle_hold) {
+        // Keep DRIVING the inactive level — do not float. The pin stays hard at
+        // the idle level so a Nucleo nRST net (weak pull-up + cap + ST-LINK)
+        // can't drag the recovery edge around. (No JTAG TREF net on this bench.)
+    } else {
+        gpio_set_dir(reset_pin, GPIO_IN);            // Idle = float (TREF-safe)
+        gpio_disable_pulls(reset_pin);
+    }
 
     // A reset drops the target out of any synced bootloader session (it must be
     // re-entered + re-0x7F'd), so clear the latch — otherwise a later TARGET BL
@@ -1656,6 +1735,29 @@ void target_set_crowbar_polarity(bool active_high) {
     crowbar_gate_active_high = active_high;
     if (power_mode == POWER_MODE_EXTERNAL) {
         target_crowbar_gate_idle();
+    }
+}
+
+// ---- Crowbar bench flag (operator declares a FET on GP12) ----
+bool target_crowbar_flagged(void) {
+    return crowbar_flagged;
+}
+
+psu_source_t target_crowbar_psu_source(void) {
+    return crowbar_psu_source;
+}
+
+// Declare / clear a crowbar bench. Declaring (on=true) forces EXTERNAL mode at the
+// given gate polarity and idles the gate de-asserted, so the bench is immediately
+// safe (no INTERNAL window where GP12 is driven as a power output). Clearing leaves
+// the current mode untouched (the operator chooses the next mode explicitly).
+void target_set_power_mode(power_mode_t mode);  // defined below (this TU has no header include)
+void target_set_crowbar_flag(bool on, bool active_high, psu_source_t src) {
+    crowbar_flagged = on;
+    if (on) {
+        crowbar_psu_source = src;
+        target_set_crowbar_polarity(active_high);   // store polarity
+        target_set_power_mode(POWER_MODE_EXTERNAL); // force safe mode + idle the gate
     }
 }
 

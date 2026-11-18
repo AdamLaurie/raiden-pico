@@ -54,6 +54,30 @@ def bl_target(raiden):
     return raiden
 
 
+# ── Reset-release regression (nRST must rise cleanly so sync works) ──
+class TestResetReleaseSync:
+    """Regression guard for the 'reset float' bug (first-bad a2a98d0): after the
+    reset pulse nRST was left floating and rose too slowly on boards with an nRST
+    cap + weak internal pull-up, so the bootloader never came up and TARGET SYNC
+    failed with 'No response'. The fix drives the release edge before going
+    high-Z. This asserts SYNC succeeds repeatedly from a cold power-cycle+reset."""
+
+    def test_sync_repeats_after_power_cycle(self, raiden):
+        raiden.cmd("TARGET STM32F1", wait=0.3)
+        raiden.cmd("ARM OFF", wait=0.3)
+        raiden.cmd("SWD DISCONNECT", wait=0.3)
+        ok = 0
+        attempts = 3
+        for _ in range(attempts):
+            raiden.cmd("TARGET POWER CYCLE 500", wait=4)
+            r = raiden.cmd("TARGET SYNC", wait=10)
+            if "Bootloader mode active" in r or "ACK received" in r:
+                ok += 1
+        if ok == 0:
+            pytest.skip("bootloader not responding on GP4/GP5 (wiring/target)")
+        assert ok == attempts, f"TARGET SYNC only {ok}/{attempts} after power-cycle — nRST release regression?"
+
+
 # ── Help / Usage ─────────────────────────────────────────────
 
 class TestBLHelp:

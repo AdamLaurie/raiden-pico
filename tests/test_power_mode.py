@@ -42,6 +42,7 @@ def _restore_internal(raiden):
     raiden.cmd("PSU RELEASE")
     raiden.cmd("TRIGGER NONE")
     raiden.cmd("TARGET POWER OFF")
+    raiden.cmd("TARGET CROWBAR OFF")         # clear the flag or TARGET POWER INT is refused
     raiden.cmd("TARGET POWER INT")
 
 
@@ -181,6 +182,47 @@ class TestPowerModeErrors:
         r = raiden.cmd("TARGET POWER EXT BOGUS")
         assert "ERROR" in r
 
+    def test_internal_rejects_crowbar_polarity_arg(self, raiden):
+        # The crowbar gate (AHIGH/ALOW) is EXTERNAL-only — GP12 is ganged power in
+        # INTERNAL. Supplying a polarity on INTERNAL is a "crowbar + INT" mix-up and
+        # must ERROR, not silently swallow the token and report OK (cli-errors rule).
+        for arg in ("AHIGH", "ALOW"):
+            r = raiden.cmd(f"TARGET POWER INT {arg}")
+            assert "ERROR" in r, r
+            assert "EXTERNAL-only" in r, r
+            assert "OK: Power mode INTERNAL" not in r, r
+
+    def test_internal_rejects_trailing_garbage(self, raiden):
+        r = raiden.cmd("TARGET POWER INT WIBBLE")
+        assert "ERROR" in r
+
+    def test_ext_rejects_trailing_garbage_after_polarity(self, raiden):
+        r = raiden.cmd("TARGET POWER EXT AHIGH WIBBLE")
+        assert "ERROR" in r
+        assert "OK: Power mode EXTERNAL" not in r
+
+    # --- TARGET CROWBAR error paths (no hardware driven: all error before the flag set) ---
+    def test_crowbar_unknown_subcommand(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR WIBBLE")
+        assert "ERROR" in r and "Unknown CROWBAR" in r
+
+    def test_crowbar_on_bad_polarity(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR ON NOTAPOL")
+        assert "ERROR" in r
+
+    def test_crowbar_on_psu_missing_source(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR ON AHIGH PSU")
+        assert "ERROR" in r
+        assert "LOCAL" in r and "EXT" in r
+
+    def test_crowbar_on_psu_bad_source(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR ON AHIGH PSU BOGUS")
+        assert "ERROR" in r
+
+    def test_crowbar_off_rejects_trailing(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR OFF EXTRA")
+        assert "ERROR" in r
+
     def test_mode_change_while_armed_refused(self, raiden):
         raiden.cmd("TRIGGER GPIO RISING")
         raiden.cmd("ARM ON")
@@ -188,6 +230,47 @@ class TestPowerModeErrors:
         assert "ERROR" in r
         assert "disarm" in r.lower()
         raiden.cmd("ARM OFF")
+
+
+# ── Crowbar bench flag (TARGET CROWBAR) ──────────────────────
+# Operator declares a FET on GP12. ON forces EXTERNAL + idles the gate (drives
+# GP10/GP12), so these are config_power_ext. The flag is session-only (no
+# persistence yet). The autouse restore clears it so INTERNAL isn't left refused.
+
+@pytest.mark.config_power_ext
+class TestCrowbarFlag:
+
+    def test_flag_on_forces_external_and_reports(self, raiden):
+        r = raiden.cmd("TARGET CROWBAR ON AHIGH PSU EXT")
+        assert "OK: Crowbar bench ON" in r
+        assert "EXTERNAL" in r and "AHIGH" in r
+        assert "EXTERNAL (host/USB)" in r
+        assert "Power mode: EXTERNAL" in raiden.cmd("TARGET POWER")   # mode actually switched
+        raiden.cmd("TARGET CROWBAR OFF")
+
+    def test_flag_query_reflects_state(self, raiden):
+        raiden.cmd("TARGET CROWBAR ON ALOW PSU LOCAL")
+        r = raiden.cmd("TARGET CROWBAR")
+        assert "Crowbar bench: ON" in r
+        assert "ALOW" in r and "LOCAL (Pico UART)" in r
+        raiden.cmd("TARGET CROWBAR OFF")
+        assert "Crowbar bench: OFF" in raiden.cmd("TARGET CROWBAR")
+
+    def test_internal_refused_while_flagged(self, raiden):
+        raiden.cmd("TARGET CROWBAR ON AHIGH")
+        r = raiden.cmd("TARGET POWER INT")
+        assert "ERROR" in r and "crowbar bench" in r.lower()
+        raiden.cmd("TARGET CROWBAR OFF")
+
+    def test_off_clears_and_allows_internal(self, raiden):
+        raiden.cmd("TARGET CROWBAR ON AHIGH")
+        raiden.cmd("TARGET CROWBAR OFF")
+        assert "OK: Power mode INTERNAL" in raiden.cmd("TARGET POWER INT")
+
+    def test_flag_shows_in_status(self, raiden):
+        raiden.cmd("TARGET CROWBAR ON AHIGH PSU EXT")
+        assert "Crowbar bench: ON" in raiden.cmd("STATUS", wait=2)
+        raiden.cmd("TARGET CROWBAR OFF")
 
 
 # ── Crowbar gate firing path (EXTERNAL mode) ─────────────────

@@ -55,6 +55,9 @@ bool i2c_bl_go(uint8_t addr7, uint32_t addr);                    // 0x21 Go
 bool i2c_bl_write(uint8_t addr7, uint32_t addr, const uint8_t *data, uint32_t len); // 0x31 Write Memory
 bool i2c_bl_erase_mass(uint8_t addr7);                           // 0x45 Extended Erase (mass) — destructive
 bool i2c_bl_rp(uint8_t addr7);                                   // 0x83 Readout Protect (re-lock RDP1) — destructive-ish
+void i2c_bl_stretch_measure(uint8_t addr7, uint8_t cmd, uint32_t n);  // EXPERIMENTAL: time the clock-stretch (decision time) at a cmd-ACK vs addr-ACK control
+void i2c_bl_set_dly(uint32_t us);                               // EXPERIMENTAL: runtime master half-bit delay (sweep the I2C clock)
+uint32_t i2c_bl_get_dly(void);
 
 // --- Generic I2C glitch trigger ------------------------------------------
 // Register a fire hook that bl_cmd() calls mid-frame when an armed TRIGGER_I2C

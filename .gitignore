@@ -30,6 +30,12 @@ Makefile
 *.map
 *.dis
 *.lst
+*.o
+*.tar.gz
+
+# Bench scratch / tool artifacts (not part of the firmware project)
+tmp/
+*.jlink
 
 # IDE files
 .vscode/

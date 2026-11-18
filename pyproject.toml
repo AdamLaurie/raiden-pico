@@ -9,6 +9,7 @@ markers = [
     "config_power_int: Drives the GP10/11/12 group in INTERNAL mode — confirm INTERNAL/ganged wiring (or no target)",
     "config_power_ext: Drives GP10/11/12 in EXTERNAL mode and fires the crowbar gate — confirm EXTERNAL/crowbar wiring (or no target)",
     "config_psu: Claims the PSU UART (GP10 TX idles HIGH, GP11 RX) — GP10/11 to the PSU MAX3232 or unconnected",
+    "config_crowbar_wired: LIVE crowbar bench — FET on GP12 + EXTERNAL supply powering the rail; fires the crowbar into the live rail (never drives INTERNAL)",
     "destructive: Test modifies target state permanently",
 ]
 addopts = "--strict-markers"

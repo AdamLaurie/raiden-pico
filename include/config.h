@@ -45,6 +45,15 @@ typedef enum {
     POWER_MODE_EXTERNAL        // GP10 supply enable, GP11 spare, GP12 crowbar gate
 } power_mode_t;
 
+// Who drives the external supply on a crowbar bench (declared via TARGET CROWBAR).
+// Lets the firmware know whether it controls the rail (so TARGET POWER / the
+// SYNC/CONNECT auto-power-on mean something) or must keep hands off a rail the
+// host controls over USB.
+typedef enum {
+    PSU_SRC_LOCAL = 0,   // Pico-driven PSU over UART1 (GP10/11 + MAX3232) — combo mode
+    PSU_SRC_EXTERNAL     // host/USB-driven (or a bare bench supply) — Pico does not control it
+} psu_source_t;
+
 // Trigger Types
 typedef enum {
     TRIGGER_NONE = 0,

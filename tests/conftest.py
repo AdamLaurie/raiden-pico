@@ -12,6 +12,15 @@ Usage:
     pytest tests/ -v --config=power-int     # + INTERNAL-mode power tests
     pytest tests/ -v --config=power-ext     # + EXTERNAL/crowbar power tests
     pytest tests/ -v --config=psu           # + PSU UART claim (retasks GP10/11)
+    pytest tests/ -v --config=crowbar-wired # + LIVE crowbar bench (FET on GP12 + ext supply)
+
+SAFETY — crowbar-wired: for a FULLY-WIRED, LIVE crowbar bench — a MOSFET on GP12
+driven by an external supply powering the target rail. Unlike power-ext (which
+assumes the target is disconnected), this suite EXPECTS the FET + supply and FIRES
+the crowbar into the live rail, so run it ONLY on that bench. It stays in EXTERNAL
+throughout and NEVER drives INTERNAL (which would turn the GP12 gate FET into a
+sustained short). Set the supply's current limit first (the FET backstop). It skips
+itself if the rail isn't powered (ADC check), so a mis-run can't fire blind.
 
 SAFETY — power-int / power-ext: these drive the GP10/11/12 power group
 (power on/off/cycle, mode switching, and the crowbar gate fires in EXTERNAL).
@@ -45,6 +54,7 @@ _CONFIG_MARKERS = {
     "config_power_int": "power-int",
     "config_power_ext": "power-ext",
     "config_psu": "psu",
+    "config_crowbar_wired": "crowbar-wired",
 }
 
 
@@ -53,7 +63,7 @@ def pytest_addoption(parser):
         "--config",
         action="append",
         default=[],
-        help="Enable a wiring config: swd, sweep, trace, swd-rdp, power-int, power-ext, psu. Repeat for multiple.",
+        help="Enable a wiring config: swd, sweep, trace, swd-rdp, power-int, power-ext, psu, crowbar-wired. Repeat for multiple.",
     )
     parser.addoption(
         "--destructive",

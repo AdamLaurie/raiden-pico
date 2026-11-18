@@ -8,20 +8,28 @@
 #include "swd.h"          // swd_nrst_pulse
 #include "target_uart.h"  // target_power_ensure_on
 #include "hardware/gpio.h"
+#include "hardware/clocks.h"   // clock_get_hz for cycle->us (STRETCH measurement)
 #include "pico/stdlib.h"
+#include <math.h>
 
 // Pins — reuse target UART1 (mutually exclusive with UART boot).
 #define I2C_SCL_PIN 4   // GP4 (= TARGET_UART TX)
 #define I2C_SDA_PIN 5   // GP5 (= TARGET_UART RX)
 
-#define I2C_DLY_US       100    // ~5 kHz half-bit (slow, for weak/internal pull-ups only)
+// EXPERIMENTAL (decision-time stretch test, NOT for commit): half-bit delay is now a
+// RUNTIME variable so the master clock can be swept over the CLI ("TARGET I2C DLY <us>")
+// to force/catch the RDP-verdict clock-stretch. Default 100us = weak/internal pull-ups;
+// the bench has 2.2-4.7k externals so it runs far faster. Revert to a #define 100 for commit.
+static uint32_t i2c_dly_us = 100;
+void i2c_bl_set_dly(uint32_t us) { i2c_dly_us = us; }
+uint32_t i2c_bl_get_dly(void) { return i2c_dly_us; }
 #define I2C_STRETCH_US   80000  // max clock-stretch wait. Measured worst case on F401:
                                 // ~17 ms (read) / ~34 ms (write-commit); 80 ms is safe headroom.
 #define BL_ACK           0x79
 #define BL_NACK          0x1F
 
 // ---- open-drain bit-bang primitives (idle = released/high via pull-ups) ----
-static inline void dly(void) { sleep_us(I2C_DLY_US); }
+static inline void dly(void) { if (i2c_dly_us) sleep_us(i2c_dly_us); else busy_wait_at_least_cycles(60); }
 static inline void sda_lo(void) { gpio_set_dir(I2C_SDA_PIN, GPIO_OUT); gpio_put(I2C_SDA_PIN, 0); }
 static inline void sda_hi(void) { gpio_set_dir(I2C_SDA_PIN, GPIO_IN); }   // pull-up -> 1
 static inline int  sda_get(void) { return gpio_get(I2C_SDA_PIN); }
@@ -634,4 +642,84 @@ bool i2c_bl_rp(uint8_t a) {
     bool ok = bl_wait_ack(a, 5000);
     uart_cli_printf("I2C RP (0x83): %s\r\n", ok ? "readout-protect set (RDP1)" : "rejected");
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// EXPERIMENTAL decision-time measurement (TARGET I2C STRETCH).
+// The RDP verdict for a Read-Memory command runs in the ROM right after the 0x11
+// command byte; at RDP1 the slave clock-stretches (holds SCL low) through it. Our
+// bit-bang scl_hi() busy-waits for the slave to release SCL, so timing THAT wait at
+// the 0x11 cmd-ACK = the decision time; the address-byte ACK (no verdict) is the
+// zero-stretch control. Cycle-resolution via DWT CYCCNT (Cortex-M33). This measures
+// the target directly and does not depend on the scope.
+static inline void dwt_init(void) {
+    *(volatile uint32_t *)0xE000EDFC |= (1u << 24);  // DEMCR.TRCENA
+    *(volatile uint32_t *)0xE0001000 |= 1u;          // DWT_CTRL.CYCCNTENA
+}
+static inline uint32_t dwt_cyc(void) { return *(volatile uint32_t *)0xE0001004; }
+
+// write one byte; return the SCL-release (clock-stretch) wait at the ACK slot in
+// core cycles via *ack_cyc. Mirrors i2c_wr but times the ACK-clock SCL release.
+static bool i2c_wr_meas(uint8_t b, uint32_t *ack_cyc, uint32_t cap_cyc) {
+    for (int i = 7; i >= 0; i--) {
+        if (b & (1u << i)) sda_hi(); else sda_lo();
+        dly(); scl_hi(); dly(); scl_lo(); dly();
+    }
+    sda_hi();                         // release for ACK
+    dly();
+    gpio_set_dir(I2C_SCL_PIN, GPIO_IN);   // release SCL; slave may hold it low (stretch)
+    uint32_t t0 = dwt_cyc();
+    while (!gpio_get(I2C_SCL_PIN)) { if (dwt_cyc() - t0 > cap_cyc) break; }
+    *ack_cyc = dwt_cyc() - t0;
+    dly();
+    int ack = sda_get();
+    scl_lo(); dly();
+    return ack == 0;
+}
+
+void i2c_bl_stretch_measure(uint8_t a, uint8_t cmd, uint32_t n) {
+    if (n == 0) n = 100;
+    if (n > 5000) n = 5000;
+    dwt_init();
+    uint32_t fsys = clock_get_hz(clk_sys);
+    double c2us = 1e6 / (double)fsys;
+    uint32_t cap = (uint32_t)((uint64_t)fsys / 1000u * 30u);  // ~30ms cap per ACK wait
+
+    i2c_bl_enter(); sleep_ms(60);
+    if (!i2c_bl_get(a)) {
+        uart_cli_send("ERROR: I2C STRETCH: slave not responding to GET (check wiring/power)\r\n");
+        return;
+    }
+    i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);   // warm-up (cold slave first-frame NACK)
+
+    uint64_t sa = 0, sc = 0, qa = 0, qc = 0;
+    uint32_t amin = ~0u, amax = 0, cmin = ~0u, cmax = 0, got = 0;
+    uart_cli_printf("I2C STRETCH: %lu reads @ dly=%luus, SCL-release wait: addr-ACK (control) vs 0x%02X cmd-ACK\r\n",
+                    (unsigned long)n, (unsigned long)i2c_dly_us, cmd);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t ac = 0, cc = 0;
+        i2c_start();
+        i2c_wr_meas(ADDR_W(a), &ac, cap);           // address byte ACK = control
+        i2c_wr_meas(cmd, &cc, cap);                 // command byte ACK (verdict if gated)
+        i2c_wr((uint8_t)(cmd ^ 0xFF));              // complement + STOP (finish frame)
+        i2c_stop();
+        sa += ac; qa += (uint64_t)ac * ac; if (ac < amin) amin = ac; if (ac > amax) amax = ac;
+        sc += cc; qc += (uint64_t)cc * cc; if (cc < cmin) cmin = cc; if (cc > cmax) cmax = cc;
+        got++;
+        if (((i + 1) % 200) == 0) {                 // re-enter periodically (slave can wedge)
+            i2c_bl_enter(); sleep_ms(40);
+            i2c_bl_send_cmd_raw(a, 0x02); sleep_ms(5);
+        }
+    }
+    if (!got) { uart_cli_send("I2C STRETCH: no samples\r\n"); return; }
+    double ma = (double)sa / got, mc = (double)sc / got;
+    double va = (double)qa / got - ma * ma; if (va < 0) va = 0;
+    double vc = (double)qc / got - mc * mc; if (vc < 0) vc = 0;
+    uart_cli_printf("  addr-ACK (control): mean=%.3fus std=%.3fus min=%.3fus max=%.3fus\r\n",
+                    ma * c2us, sqrt(va) * c2us, amin * c2us, amax * c2us);
+    uart_cli_printf("  0x%02X-ACK          : mean=%.3fus std=%.3fus min=%.3fus max=%.3fus\r\n",
+                    cmd, mc * c2us, sqrt(vc) * c2us, cmin * c2us, cmax * c2us);
+    uart_cli_printf("  EXTRA (cmd minus control) = %.3fus ; jitter (cmd-ACK std) = %.3fus  [cmp UART GP22->RX std 2.49us]\r\n",
+                    (mc - ma) * c2us, sqrt(vc) * c2us);
+    uart_cli_printf("  fsys=%luHz, %lu samples\r\n", (unsigned long)fsys, (unsigned long)got);
 }

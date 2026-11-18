@@ -87,6 +87,10 @@ power_mode_t target_get_power_mode(void);
 void target_set_crowbar_polarity(bool active_high);
 bool target_crowbar_gate_active_high(void);
 void target_crowbar_gate_idle(void);  // drive GP11 to safe de-asserted idle (GPIO)
+// Crowbar bench flag: operator declares a FET on GP12 (TARGET CROWBAR). Session-only.
+bool target_crowbar_flagged(void);
+psu_source_t target_crowbar_psu_source(void);
+void target_set_crowbar_flag(bool on, bool active_high, psu_source_t src);
 void target_power_sweep(void);
 void target_power_glitch(float voltage, uint32_t count);
 // LPC CRP-bypass via ADC-controlled VDD glitch. Reads glitch config VMIN

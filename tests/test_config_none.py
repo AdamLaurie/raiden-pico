@@ -426,6 +426,25 @@ class TestTargetReset:
         assert "OK" in r and "400" in r
         raiden.cmd("TARGET RESET PERIOD 300")   # restore default
 
+    def test_reset_idle_float_configures(self, raiden):
+        # IDLE FLOAT = high-Z after the pulse (TREF-safe default). Configure only.
+        r = raiden.cmd("TARGET RESET IDLE FLOAT")
+        assert "OK" in r and "FLOAT" in r
+
+    def test_reset_idle_hold_configures(self, raiden):
+        # IDLE HOLD = keep driving nRST after the pulse (reliable on Nucleo).
+        r = raiden.cmd("TARGET RESET IDLE HOLD")
+        assert "OK" in r and "HOLD" in r
+        raiden.cmd("TARGET RESET IDLE FLOAT")   # restore default
+
+    def test_reset_idle_missing_mode_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET IDLE")
+        assert "ERROR" in r
+
+    def test_reset_idle_unknown_mode_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET IDLE WIBBLE")
+        assert "ERROR" in r and "WIBBLE" in r
+
     def test_target_timeout_roundtrip(self, raiden):
         raiden.cmd("TARGET TIMEOUT 100")
         r = raiden.cmd("TARGET TIMEOUT")
@@ -1022,3 +1041,39 @@ class TestShadowtraceErrors:
         r = raiden.cmd("TARGET GLITCH SHADOWTRACE 1400 WIBBLE")
         assert "ERROR" in r
         assert "Invalid reps" in r
+
+
+# ── TARGET I2C STRETCH / DLY (experimental; cli-errors rule) ──
+
+class TestI2CStretchDly:
+    """Experimental I2C clock-stretch decision-time tooling. config_none covers the
+    no-bus paths: DLY sets/queries a variable (no reset, no I2C traffic) and the
+    argument error paths. The STRETCH *measurement* drives the I2C bus, so its happy
+    path is gated behind --config=swd-bl, not here. (A target type must be set first
+    because the whole TARGET I2C path is STM32-only.)"""
+
+    def test_i2c_dly_set_and_query(self, raiden):
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C DLY 50")
+        assert "OK" in r and "50" in r
+        r = raiden.cmd("TARGET I2C DLY")
+        assert "50" in r
+        raiden.cmd("TARGET I2C DLY 100")   # restore default
+
+    def test_i2c_dly_out_of_range_rejected(self, raiden):
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C DLY 999999")
+        assert "ERROR" in r
+
+    def test_i2c_stretch_bad_count_rejected(self, raiden):
+        # Bad N errors before any bus activity (never reaches the measurement).
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C STRETCH notanumber")
+        assert "ERROR" in r
+
+    def test_i2c_non_stm32_target_rejected(self, raiden):
+        # The whole TARGET I2C path is STM32-only; a non-STM32 target must error.
+        raiden.cmd("TARGET LPC")
+        r = raiden.cmd("TARGET I2C DLY 50")
+        assert "ERROR" in r and "STM32" in r
+        raiden.cmd("TARGET STM32F4")   # restore a sane type for following tests
