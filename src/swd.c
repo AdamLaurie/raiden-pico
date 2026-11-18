@@ -456,9 +456,19 @@ void swd_nrst_release(void) {
 }
 
 void swd_nrst_pulse(uint32_t ms) {
-    swd_nrst_assert();
+    swd_nrst_assert();                   // drive nRST low
     sleep_ms(ms);
-    swd_nrst_release();
+    // Drive the release (high) edge actively for a short settle before going
+    // high-Z. A target with an on-board nRST cap + weak (~40k) pull-up — e.g. a
+    // Nucleo — rises too slowly if we just float on release, so it fails to latch
+    // boot mode (BOOT0) and the bootloader never comes up. This is the same
+    // regression fixed on the UART reset path (RESET_RELEASE_SETTLE_MS in
+    // target_uart.c); it was never applied here, which left the I2C bootloader
+    // entry (i2c_bl_enter -> swd_nrst_pulse) unable to enter — no I2C ACK. Drive
+    // the clean rising edge, then float so the target's pull owns the TREF-safe idle.
+    gpio_put(SWD_NRST_PIN, 1);           // dir is still OUT from assert
+    sleep_ms(5);                         // RESET_RELEASE_SETTLE_MS equivalent
+    swd_nrst_release();                  // high-Z idle
 }
 
 bool swd_read_dp(uint8_t addr, uint32_t *value) {
@@ -860,6 +870,22 @@ bool swd_halt(void) {
 bool swd_resume(void) {
     // C_DEBUGEN only (clear C_HALT)
     return mem_write32(DHCSR, DBGKEY | 0x1);
+}
+
+// Clear Cortex-M debug state over SWD: drop vector-catch, resume the core, then
+// release it from halting-debug (C_DEBUGEN=0) so it boots/runs normally after the
+// next reset. Power-agnostic — unlike a power-cycle this works on an externally
+// powered target whose rail we can't drop. Best-effort: returns false if no core
+// answers, but the caller carries on regardless.
+bool swd_clear_debug(void) {
+    if (!swd_is_connected()) {
+        if (!swd_connect()) return false;
+    }
+    mem_write32(DEMCR, 0);              // clear vector catch (no halt-at-reset)
+    mem_write32(DHCSR, DBGKEY | 0x1);   // C_DEBUGEN=1, C_HALT=0 : resume if halted
+    mem_write32(DHCSR, DBGKEY | 0x0);   // C_DEBUGEN=0 : fully release from debug
+    swd_clear_errors();
+    return true;
 }
 
 // Single-step one instruction. Core must already be halted (S_HALT set).

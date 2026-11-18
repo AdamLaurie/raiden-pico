@@ -131,10 +131,23 @@ crash on a sub-µs timescale. Two ways to get there:
    unchanged. Stop when ISP idle becomes unreliable — you've gone
    too far.
 2. **External MOSFET crowbar** between target Vcore and ground,
-   driven by `PIN_GLITCH_OUT` (GP2). The PIO pulse-gen already drives
-   GP2 and the existing trigger machinery (manual, UART, GPIO)
-   carries over directly. Costs hardware but doesn't modify the
-   target.
+   driven by the **GP12 crowbar gate in EXTERNAL power mode**
+   (`TARGET POWER EXT`). A second PIO pulse-gen SM drives GP12 with the
+   same WIDTH/GAP/COUNT waveform as GP2, from the same trigger (manual,
+   UART, GPIO, I2C), with selectable gate polarity (`AHIGH`/`ALOW`).
+   Costs hardware but doesn't modify the target. See the full circuit
+   and current-limit protections in README → "EXTERNAL Power / Crowbar
+   Mode".
+
+   > **The crowbar requires EXTERNAL mode — never INTERNAL.** In INTERNAL
+   > the GP10/11/12 group is the Pico's own ganged power *source*, so a
+   > crowbar short there is a dead short *through the RP2350 output
+   > drivers* (GP2-driven crowbar), and even a GP12-driven crowbar is
+   > unsafe because INTERNAL drives GP12 HIGH as a power output, latching
+   > the gate on into a sustained short. EXTERNAL powers the rail from an
+   > external supply and idles the gate de-asserted. Historically this
+   > crowbar was driven from GP2; it moved to the interlocked GP12 gate
+   > (EXTERNAL-only, PSU-compatible) — do not wire a crowbar to GP2.
 
 ## Probe placement
 

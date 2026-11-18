@@ -187,17 +187,17 @@ low_boost:
     set pins, 0         ; Set output LOW
 .wrap
 
-; IRQ trigger helper - sets IRQ 0 and pulses GP22 (GLITCH_FIRED) for clock boost
-; This allows CPU to trigger via pio_sm_exec without instruction overhead
-; SET pin should be configured to GP22 (GLITCH_FIRED boost semaphore)
+; IRQ trigger helper (manual GLITCH) - ONE-SHOT: raises IRQ 0 once and latches
+; GP22 (GLITCH_FIRED) HIGH until the next ARM (glitch_fired_reset), the same
+; "fired" latch as the GPIO edge / I2C paths. SET pin = GP22.
+; (It used to loop: GP22 high ~97 of every 99 cycles with a 2-cycle dip, IRQ0
+; re-raised each lap, and the CPU stopped it at an arbitrary point — leaving
+; GP22 stuck HIGH and putting extra rising edges on it.)
 .program irq_trigger
+    irq set 0           ; Trigger glitch via IRQ (once)
+    set pins, 1         ; GP22 (GLITCH_FIRED) HIGH — latched
 .wrap_target
-    irq set 0           ; Trigger glitch via IRQ
-    set pins, 1         ; Pulse GP22 (GLITCH_FIRED) HIGH
-    nop [31]            ; Hold for 32 cycles
-    nop [31]            ; Hold for 32 cycles
-    nop [31]            ; Hold for 32 cycles (total ~100 cycles = 667ns)
-    set pins, 0         ; Return GP22 (GLITCH_FIRED) LOW
+    nop                 ; Park: no further IRQs, GP22 stays HIGH
 .wrap
 
 ; One-shot pulse for CPU-synchronous glitching (I2CPULSE):

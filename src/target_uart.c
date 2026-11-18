@@ -1,3 +1,4 @@
+#include "uart_mux.h"
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
@@ -234,7 +235,12 @@ static const uint8_t f103_rdp_bypass_payload[] = {
 
 // UART configuration
 static uint32_t target_baud = 115200;
-static bool target_initialized = false;
+// UART1 ownership lives in uart_mux (uart_mux_is_owner(UART_OWNER_TARGET)); the
+// old target_initialized flag latched true and went stale whenever GRBL, the PSU
+// or the I2C bootloader took UART1 / GP4-5.
+// Set by target_uart_listen_raw(): UART1 is on GP4/5 but at a diagnostic 115200
+// 8N1 with the RX IRQ off, so the next ensure_active() must fully re-init.
+static bool target_uart_raw_mode = false;
 static bool bootloader_synced = false;
 
 // Target type
@@ -256,6 +262,26 @@ static uint32_t reset_period_ms = 300;  // Default 300ms reset period
 static bool reset_active_high = false;
 static bool reset_pin_initialized = false;
 
+// Reset idle state AFTER the release pulse: false = float (high-Z, TREF-safe
+// default), true = keep driving the inactive level (hard-hold high for an
+// active-low reset). Floating into a Nucleo's nRST net (weak ~40k pull-up + cap,
+// plus the on-board ST-LINK) gives a messy, slow recovery edge -> unreliable
+// bootloader entry. HOLD removes that; only use where there is no JTAG TREF net.
+static bool reset_idle_hold = false;
+void target_reset_set_idle_hold(bool hold) { reset_idle_hold = hold; }
+bool target_reset_get_idle_hold(void) { return reset_idle_hold; }
+// After a reset pulse, drive the release (inactive) edge actively for this long
+// before going high-Z, so nRST gets a clean, fast rising edge the target can
+// latch boot mode on even when the board has an nRST cap + weak pull-up.
+#define RESET_RELEASE_SETTLE_MS 5
+
+// After routing UART1 to the target pins, let the TX line settle to idle-high
+// before the first bootloader sync byte. Switching GP4 to the UART TX function
+// can glitch the edge, and an autobauding STM32 bootloader locks onto the FIRST
+// byte it sees — so a clean idle gap (and a post-settle FIFO flush) before 0x7F
+// is essential, or the autobaud latches on a glitch and sync fails silently.
+#define BOOTLOADER_UART_SETTLE_MS 20
+
 // Power configuration - 3 pins ganged for ~36mA total (3x 12mA drive)
 #define POWER_PIN1  10  // GP10
 #define POWER_PIN2  11  // GP11
@@ -268,15 +294,27 @@ static uint32_t power_cycle_time_ms = 300;  // Default 300ms cycle time
 static bool power_pin_initialized = false;
 
 // Power mode: how the GP10/11/12 group is driven (see power_mode_t in config.h).
-// INTERNAL (default) = ganged power source; EXTERNAL = GP10 supply, GP11 crowbar, GP12 spare.
+// INTERNAL (default) = ganged power source; EXTERNAL = GP10 supply, GP11 spare, GP12 crowbar.
 static power_mode_t power_mode = POWER_MODE_INTERNAL;
+// The PSU UART (psu.c) can own GP10/11. While it does, nothing here may touch them.
+extern bool psu_is_active(void);
 // Crowbar gate polarity in EXTERNAL mode: true = assert HIGH / idle LOW (low-side N-FET),
 // false = assert LOW / idle HIGH (high-side P-FET / active-low gate driver).
 static bool crowbar_gate_active_high = true;
 
+// Operator-declared crowbar bench (TARGET CROWBAR ON ...). When set, a crowbar MOSFET
+// is physically on GP12, so INTERNAL is forbidden (it would drive GP12 as a power output
+// straight into the gate FET = sustained short). Setting it forces EXTERNAL + idles the
+// gate. Session-only for now (no persistence — see the settings-store TODO), so it clears
+// on reboot, dropping back to INTERNAL default: re-flag after every boot.
+static bool crowbar_flagged = false;
+// How the external rail is supplied on a crowbar bench (informational + controls whether
+// the firmware manages the supply). Default EXTERNAL = hands-off (safest).
+static psu_source_t crowbar_psu_source = PSU_SRC_EXTERNAL;
+
 // GPIO mask that target_power_on/off/cycle actually drive:
 //   INTERNAL = the whole ganged group; EXTERNAL = GP10 (supply enable) only,
-//   so we never re-grab GP11 (crowbar gate) / GP12 (spare) as power outputs.
+//   so we never re-grab GP11 (spare) / GP12 (crowbar gate) as power outputs.
 static inline uint32_t power_active_mask(void) {
     return (power_mode == POWER_MODE_EXTERNAL) ? (1u << POWER_PIN1) : POWER_MASK;
 }
@@ -320,6 +358,8 @@ void target_uart_send_byte(uint8_t byte);
 void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 void target_uart_clear_response(void);
 void target_uart_print_response_hex(void);
+
+static void target_uart_attach(void);
 
 // UART RX interrupt handler
 void target_uart_irq_handler(void) {
@@ -366,18 +406,17 @@ void target_init(void) {
     gpio_clr_mask(POWER_MASK);  // boot default OFF (de-energized)
     power_pin_initialized = true;
 
-    // Pre-initialize and deinit UART1 to ensure clean state after Pico boot
+    // Target's UART1 hooks: attach (re)enables the RX trigger IRQ whenever the
+    // target gets UART1 back (including after a PSU borrow); uart_mux disables the
+    // IRQ when anyone else takes it.
+    uart_mux_set_hooks(UART_OWNER_TARGET, target_uart_attach, NULL);
+
+    // Pre-initialize and release UART1 to ensure clean state after Pico boot
     // This works around an issue where first UART TX after boot fails
-    gpio_init(TARGET_UART_TX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    uart_mux_set_line(UART_OWNER_TARGET, 115200, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_TARGET);
     sleep_ms(10);
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_TX_PIN);
-    gpio_deinit(TARGET_UART_RX_PIN);
+    uart_mux_release(UART_OWNER_TARGET);
 }
 
 // Helper function to wait for and read a response with timeout
@@ -443,7 +482,13 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
     // We use blocking reads during bootloader sync, so interrupts would interfere
     uart_set_irq_enables(TARGET_UART_ID, false, false);
 
-    // Clear any stale data from UART RX FIFO that may have accumulated
+    // Let the freshly-routed UART line settle to idle-high before we sync. The
+    // GP4->TX function switch can glitch the edge, and the target bootloader
+    // autobauds on the first byte, so give it a clean idle gap first.
+    sleep_ms(BOOTLOADER_UART_SETTLE_MS);
+
+    // Clear any stale data from UART RX FIFO (incl. anything the switch/settle
+    // produced) so the autobaud reply isn't read out of a dirty FIFO.
     while (uart_is_readable(TARGET_UART_ID)) {
         uart_getc(TARGET_UART_ID);
     }
@@ -577,23 +622,21 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
 #define BL_ACK  0x79
 #define BL_NACK 0x1F
 
-// Ensure UART1 is routed to the Target pins (GP4/5). target_uart_init() releases
-// GRBL (GP8/9) via grbl_deinit() and re-points the peripheral. We re-init when
-// the target UART was never set up OR when GRBL currently owns UART1.
-//
-// The grbl_is_active() check is the fix for the Target<->GRBL "TTL bleed":
-// target_initialized latches true and is never cleared when GRBL takes UART1, so
-// without this check a TARGET SEND / bootloader command after any GRBL command
-// would write to UART1 while it is still on GP8/9 — bleeding bootloader traffic
-// onto the GRBL controller (and leaving GRBL's pins live). Auto-switching here
+// Ensure UART1 is routed to the Target pins (GP4/5). target_uart_init() claims
+// UART1 through uart_mux, which detaches whoever had it (GRBL GP8/9, PSU GP10/11)
+// and parks their pins, so target traffic can never bleed onto them (the old
+// Target<->GRBL "TTL bleed" was the first instance of this). Auto-switching here
 // also removes the old "run TARGET SYNC after GRBL first" requirement.
 void target_uart_ensure_active(void) {
-    extern bool grbl_is_active(void);
-    bool was_grbl = grbl_is_active();
-    if (!target_initialized || was_grbl) {
+    // Re-init when UART1 is not ours (never claimed, or GRBL / the PSU / the I2C
+    // bootloader took it), or when a raw diagnostic listener left it at 8N1/no IRQ.
+    // A PSU *borrow* (power verbs mid-session) hands UART1 back to us itself.
+    uart_owner_t prev = uart_mux_owner(1);
+    if (prev != UART_OWNER_TARGET || target_uart_raw_mode) {
         target_uart_init(TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, target_baud);
-        if (was_grbl)
-            uart_cli_send("OK: UART1 reclaimed from GRBL for Target (GP4/5)\r\n");
+        if (prev != UART_OWNER_TARGET && prev != UART_OWNER_NONE)
+            uart_cli_printf("OK: UART1 reclaimed from %s for Target (GP4/5)\r\n",
+                            uart_mux_name(prev));
     }
 }
 
@@ -642,12 +685,31 @@ static int stm32_bl_send_addr(uint32_t addr) {
     return stm32_bl_wait_ack(1000);
 }
 
+// --- RX error-flag diagnostics (PL011 UARTDR bits [11:8] = OE,BE,PE,FE) ---
+// Tallied in stm32_bl_recv_bytes; reset + reported around stm32_bl_read.
+static uint32_t bl_rx_fe = 0;   // framing errors (stop bit wrong -> timing/baud/signal)
+static uint32_t bl_rx_pe = 0;   // parity errors
+static uint32_t bl_rx_be = 0;   // break errors
+static uint32_t bl_rx_oe = 0;   // overrun errors (FIFO overflow -> firmware too slow)
+static uint32_t bl_rx_first_err_idx = 0xFFFFFFFFu; // index of first byte carrying any flag
+
 static int stm32_bl_recv_bytes(uint8_t *buf, uint32_t count, uint32_t timeout_ms) {
     uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000;
     uint32_t received = 0;
     while (received < count && time_us_64() < deadline) {
         if (uart_is_readable(TARGET_UART_ID)) {
-            buf[received++] = uart_getc(TARGET_UART_ID);
+            // Read the raw data register so we keep the per-byte error flags that
+            // uart_getc() discards (bit8 FE, bit9 PE, bit10 BE, bit11 OE).
+            uint32_t dr = uart_get_hw(TARGET_UART_ID)->dr;
+            buf[received] = (uint8_t)(dr & 0xFF);
+            bool any = false;
+            if (dr & (1u << 8)) { bl_rx_fe++; any = true; }
+            if (dr & (1u << 9)) { bl_rx_pe++; any = true; }
+            if (dr & (1u << 10)) { bl_rx_be++; any = true; }
+            if (dr & (1u << 11)) { bl_rx_oe++; any = true; }
+            if (any && bl_rx_first_err_idx == 0xFFFFFFFFu)
+                bl_rx_first_err_idx = received;
+            received++;
         }
     }
     return received;
@@ -780,6 +842,9 @@ void stm32_bl_read(uint32_t addr, uint32_t count) {
     uart_cli_printf("Reading %lu bytes from 0x%08lX:\r\n", count, addr);
 
     stm32_bl_begin();
+    // reset RX error-flag diagnostics for this read
+    bl_rx_fe = bl_rx_pe = bl_rx_be = bl_rx_oe = 0;
+    bl_rx_first_err_idx = 0xFFFFFFFFu;
     uint32_t total = 0;
     while (total < count) {
         uint32_t chunk = count - total;
@@ -831,6 +896,13 @@ void stm32_bl_read(uint32_t addr, uint32_t count) {
         if (got < (int)chunk) break;
     }
     uart_cli_printf("OK: Read %lu bytes\r\n", total);
+    if (bl_rx_fe || bl_rx_pe || bl_rx_be || bl_rx_oe) {
+        uart_cli_printf("[RX ERR] FE=%lu PE=%lu BE=%lu OE=%lu first@%ld\r\n",
+                        bl_rx_fe, bl_rx_pe, bl_rx_be, bl_rx_oe,
+                        (bl_rx_first_err_idx == 0xFFFFFFFFu) ? -1L : (long)bl_rx_first_err_idx);
+    } else {
+        uart_cli_send("[RX ERR] none\r\n");
+    }
 done:
     stm32_bl_end();
 }
@@ -979,65 +1051,27 @@ void stm32_bl_readout_protect(void) {
     stm32_bl_end();
 }
 
-void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
-    target_baud = baud;
-
-    // If Grbl UART is active, deinitialize it first
-    // Grbl uses UART1 on GP8/GP9, we need UART1 on GP4/GP5
-    extern bool grbl_is_active(void);
-    extern void grbl_deinit(void);
-    if (grbl_is_active()) {
-        grbl_deinit();
-    }
-
-    // Always deinitialize first to ensure clean state
-    // After Pico boot, UART peripheral and GPIO may be in undefined state
-    if (target_initialized) {
-        uart_set_irq_enables(TARGET_UART_ID, false, false);
-        irq_set_enabled(UART1_IRQ, false);
-    }
-    uart_deinit(TARGET_UART_ID);  // Always deinit, even on first use
-
-    // Deinitialize GPIO pins to clear any previous state
-    // Critical for first use after Pico reboot
-    gpio_deinit(tx_pin);
-    gpio_deinit(rx_pin);
-
-    // Initialize GPIO pins before UART (like SDK examples)
-    gpio_init(tx_pin);
-    gpio_init(rx_pin);
-
-    // Initialize UART1
-    uart_init(TARGET_UART_ID, baud);
-
-    // Set UART format: STM32 bootloader requires EVEN parity, others use no parity
-    if (target_is_stm32(current_target_type)) {
-        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_EVEN);
-    } else {
-        uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    }
-
-    // Set TX and RX pins for UART1 (GP4/GP5 are default UART1 pins)
-    gpio_set_function(tx_pin, GPIO_FUNC_UART);
-    gpio_set_function(rx_pin, GPIO_FUNC_UART);
-
-    // Clear RP2350 GPIO isolation bit on TX and RX pins so PIO can also read them
-    // gpio_set_function sets ISO, blocking PIO UART trigger from snooping the pin
-    hw_clear_bits(&padsbank0_hw->io[tx_pin], PADS_BANK0_GPIO0_ISO_BITS);
-    hw_clear_bits(&padsbank0_hw->io[rx_pin], PADS_BANK0_GPIO0_ISO_BITS);
-
-    // Enable UART FIFO
-    uart_set_fifo_enabled(TARGET_UART_ID, true);
-
-    // Small delay to allow UART hardware to stabilize after initialization
-    sleep_us(100);
-
-    // Enable UART RX interrupt for minimal trigger latency
+// Attach hook (uart_mux): runs whenever the target gets UART1 — a full init or a
+// hand-back after another owner borrowed it. Restores the RX trigger IRQ.
+static void target_uart_attach(void) {
     irq_set_exclusive_handler(UART1_IRQ, target_uart_irq_handler);
     irq_set_enabled(UART1_IRQ, true);
     uart_set_irq_enables(TARGET_UART_ID, true, false);  // RX interrupt enabled, TX disabled
+}
 
-    target_initialized = true;
+void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
+    target_baud = baud;
+    (void)tx_pin; (void)rx_pin;   // always GP4/GP5 — the pins live in the uart_mux owner table
+
+    // STM32 bootloader requires EVEN parity, others use no parity. Stored in the
+    // mux so a hand-back after a PSU borrow restores exactly this.
+    uart_mux_set_line(UART_OWNER_TARGET, baud, 8,
+                      target_is_stm32(current_target_type) ? UART_PARITY_EVEN : UART_PARITY_NONE, 1);
+    // Fresh init even if we already own UART1: detaches GRBL/PSU (their pins are
+    // parked, never left selected to UART), routes GP4/5, flushes the FIFO,
+    // and the attach hook enables the RX IRQ.
+    uart_mux_reclaim(UART_OWNER_TARGET);
+    target_uart_raw_mode = false;
 
     // Clear response buffer
     memset(target_response, 0, TARGET_RESPONSE_SIZE);
@@ -1045,7 +1079,17 @@ void target_uart_init(uint8_t tx_pin, uint8_t rx_pin, uint32_t baud) {
     target_response_count = 0;
 
     uart_cli_printf("OK: Target UART1 initialized on GP%u (TX), GP%u (RX) at %u baud\r\n",
-                    tx_pin, rx_pin, baud);
+                    TARGET_UART_TX_PIN, TARGET_UART_RX_PIN, baud);
+}
+
+// Diagnostic-payload listener used by the glitch/payload routines: UART1 on GP4/5
+// at 115200 8N1 with the RX IRQ OFF (callers poll the FIFO). Goes through the mux
+// so GRBL/PSU pins are released; it used to re-init UART1 behind every owner's back.
+static void target_uart_listen_raw(void) {
+    uart_mux_set_line(UART_OWNER_TARGET, 115200, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_TARGET);
+    uart_set_irq_enables(TARGET_UART_ID, false, false);
+    target_uart_raw_mode = true;   // next ensure_active() re-inits normally
 }
 
 void target_uart_send_byte(uint8_t byte) {
@@ -1232,9 +1276,8 @@ bool target_uart_set_console_baud(uint32_t baud) {
         return false;
     }
     console_baud = baud;
-    extern bool grbl_is_active(void);
-    if (target_initialized && !grbl_is_active()) {
-        uart_set_baudrate(TARGET_UART_ID, console_baud);
+    if (uart_mux_is_owner(UART_OWNER_TARGET)) {
+        uart_mux_set_baud(UART_OWNER_TARGET, console_baud);   // baud only — keep e.g. the STM32 8E1
     }
     return true;
 }
@@ -1274,9 +1317,8 @@ bool target_uart_set_console_format(const char *spec) {
     console_bits   = bits;
     console_parity = par;
     console_stop   = stop;
-    extern bool grbl_is_active(void);
-    if (target_initialized && !grbl_is_active()) {
-        uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+    if (uart_mux_is_owner(UART_OWNER_TARGET)) {
+        uart_mux_set_format(UART_OWNER_TARGET, console_bits, console_parity, console_stop);  // format only
     }
     return true;
 }
@@ -1297,8 +1339,7 @@ void target_uart_terminal(bool send_autobaud) {
     target_uart_ensure_active();
 
     // Apply the console line settings (overriding any bootloader-left parity).
-    uart_set_baudrate(TARGET_UART_ID, console_baud);
-    uart_set_format(TARGET_UART_ID, console_bits, console_stop, console_parity);
+    uart_mux_set_line(UART_OWNER_TARGET, console_baud, console_bits, console_parity, console_stop);
 
     uart_cli_printf("OK: TARGET TERM @ %u %s on GP%u/GP%u. Press Ctrl-] to exit.\r\n",
                     console_baud, target_uart_get_console_format(),
@@ -1434,14 +1475,28 @@ void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high) {
 }
 
 void target_reset_execute(void) {
-    // Pulse reset pin. Drive only during the active phase, return to
-    // high-Z afterward so the target's own pull on nRST owns the line at
-    // idle (avoids leakage onto JTAG TREF).
+    // Pulse reset pin, then ACTIVELY drive the inactive (release) level for a
+    // short settle before going high-Z. Some targets rise too slowly to latch
+    // boot mode if we just let nRST float up on release: a Nucleo, for example,
+    // has an on-board nRST capacitor and only a weak (~40k) internal pull-up, so
+    // a pure float gives a slow, soft rising edge and the bootloader never comes
+    // up (this was a regression — see RESET_RELEASE_SETTLE_MS). Driving the
+    // release edge gives a clean, fast transition; we then return to high-Z so
+    // the target's own pull owns the idle line and 3.3 V stays off a JTAG TREF
+    // net between shots (the reason the idle state is float in the first place).
     gpio_set_dir(reset_pin, GPIO_OUT);
     gpio_put(reset_pin, reset_active_high ? 1 : 0);  // Active state
     sleep_ms(reset_period_ms);
-    gpio_set_dir(reset_pin, GPIO_IN);                // Inactive = float
-    gpio_disable_pulls(reset_pin);
+    gpio_put(reset_pin, reset_active_high ? 0 : 1);  // Inactive state, driven
+    sleep_ms(RESET_RELEASE_SETTLE_MS);               // clean rising edge + latch
+    if (reset_idle_hold) {
+        // Keep DRIVING the inactive level — do not float. The pin stays hard at
+        // the idle level so a Nucleo nRST net (weak pull-up + cap + ST-LINK)
+        // can't drag the recovery edge around. (No JTAG TREF net on this bench.)
+    } else {
+        gpio_set_dir(reset_pin, GPIO_IN);            // Idle = float (TREF-safe)
+        gpio_disable_pulls(reset_pin);
+    }
 
     // A reset drops the target out of any synced bootloader session (it must be
     // re-entered + re-0x7F'd), so clear the latch — otherwise a later TARGET BL
@@ -1452,7 +1507,7 @@ void target_reset_execute(void) {
 }
 
 bool target_is_initialized(void) {
-    return target_initialized;
+    return uart_mux_is_owner(UART_OWNER_TARGET);
 }
 
 bool target_is_bl_synced(void) {
@@ -1476,36 +1531,82 @@ uint32_t target_get_timeout(void) {
 }
 
 static void power_ensure_init(void) {
+    // GP10/11 belong to the PSU UART while it is claimed — never re-grab them.
+    if (psu_is_active()) return;
     if (!power_pin_initialized) {
+        // In EXTERNAL mode GP12 is the crowbar gate, owned by
+        // target_crowbar_gate_idle() / the crowbar SM. Re-initialising it here
+        // (e.g. after PSU RELEASE) would drive it LOW = asserted in ALOW polarity.
         const uint8_t pins[] = {POWER_PIN1, POWER_PIN2, POWER_PIN3};
-        for (int i = 0; i < 3; i++) {
+        int n = (power_mode == POWER_MODE_EXTERNAL) ? 2 : 3;
+        for (int i = 0; i < n; i++) {
             gpio_init(pins[i]);
             gpio_set_dir(pins[i], GPIO_OUT);
             gpio_set_drive_strength(pins[i], GPIO_DRIVE_STRENGTH_12MA);
+            gpio_put(pins[i], 0);   // boot default OFF (matches target_init); EXT spare LOW
         }
-        gpio_clr_mask(POWER_MASK);  // boot default OFF (matches target_init)
         power_pin_initialized = true;
     }
 }
 
-// Release the GP10/11/12 power-group GPIOs so another owner (the external PSU
-// UART on GP10/11) can retask them. Pins are re-initialised lazily by the next
-// power command via power_ensure_init(). Caller must ensure the supply is OFF.
+// Release the power-group GPIOs so another owner (the external PSU UART on
+// GP10/11) can retask them. Pins are re-initialised lazily by the next power
+// command via power_ensure_init(). Caller must ensure the supply is OFF.
+// In EXTERNAL mode only GP10/11 are released: GP12 stays the crowbar gate (it
+// may be PIO-driven by an armed crowbar SM), so the PSU and crowbar coexist.
 void power_group_release(void) {
     if (power_pin_initialized) {
         gpio_deinit(POWER_PIN1);
         gpio_deinit(POWER_PIN2);
-        gpio_deinit(POWER_PIN3);
+        if (power_mode != POWER_MODE_EXTERNAL) {
+            gpio_deinit(POWER_PIN3);
+        }
         power_pin_initialized = false;
     }
+}
+
+// ---- PSU as the target supply ----
+// While the PSU UART holds GP10/11 the PSU output IS the target supply, so the
+// TARGET POWER verbs and the auto power-on drive it instead of GP10. Typical use
+// is the combo of PSU supply + EXTERNAL-mode crowbar gate on GP12.
+#define PSU_OFF_THRESHOLD_MV  300    // output counts as discharged at/below this
+#define PSU_OFF_TIMEOUT_MS    5000   // max wait for the output to discharge (CYCLE)
+#define PSU_ON_TIMEOUT_MS     3000   // max wait for the output to reach 90% of Vset
+
+extern bool psu_supply_state(bool *on);
+extern bool psu_supply_set(bool on);
+extern int32_t psu_setpoint_mv(void);
+extern int32_t psu_wait_vout(bool rising, int32_t threshold_mv, uint32_t timeout_ms);
+
+// Turn the PSU output on (if not already) and wait for the rail plus target POR.
+// Already-on returns immediately, so repeated SYNCs per shot cost nothing.
+static bool psu_power_on_quiet(void) {
+    bool on;
+    if (psu_supply_state(&on) && on) return true;
+    if (!psu_supply_set(true)) return false;
+    int32_t set = psu_setpoint_mv();
+    if (set > 0) psu_wait_vout(true, set * 9 / 10, PSU_ON_TIMEOUT_MS);
+    sleep_ms(POWER_ON_SETTLE_MS);
+    return true;
+}
+
+static void psu_power_error(const char *what) {
+    uart_cli_printf("ERROR: PSU did not confirm output %s (check PSU wiring / MAX3232 / baud)\r\n", what);
 }
 
 // Power the target on WITHOUT emitting a CLI line. Used by the auto-power-on at
 // the connect/sync choke points (TARGET SYNC, SWD CONNECT) so a target that boots
 // unpowered (power-off boot default) is energised before we reset/connect — no
 // host script needs its own POWER ON. Respects the mode: drives GP10 only in
-// EXTERNAL, the full GP10/11/12 group in INTERNAL.
+// EXTERNAL, the full GP10/11/12 group in INTERNAL, the PSU output while claimed
+// (only a failure is reported there, as a WARNING, since the caller carries on).
 void target_power_ensure_on(void) {
+    if (psu_is_active()) {
+        if (!psu_power_on_quiet()) {
+            uart_cli_send("WARNING: PSU did not confirm output ON — target may be unpowered\r\n");
+        }
+        return;
+    }
     power_ensure_init();
     // Only settle if we actually transition the supply OFF->ON. A cold target
     // (power-off boot default) needs its rail to rise and finish its power-on
@@ -1520,17 +1621,49 @@ void target_power_ensure_on(void) {
 }
 
 void target_power_on(void) {
+    if (psu_is_active()) {
+        if (psu_power_on_quiet()) uart_cli_send("OK: Target power ON (PSU output)\r\n");
+        else psu_power_error("ON");
+        return;
+    }
     target_power_ensure_on();   // silent core: power_ensure_init + power_drive(...on)
     uart_cli_send("OK: Target power ON\r\n");
 }
 
 void target_power_off(void) {
+    if (psu_is_active()) {
+        if (psu_supply_set(false)) uart_cli_send("OK: Target power OFF (PSU output)\r\n");
+        else psu_power_error("OFF");
+        return;
+    }
     power_ensure_init();
     power_drive(power_active_mask(), false);
     uart_cli_send("OK: Target power OFF\r\n");
 }
 
+// PSU-routed CYCLE: the PSU's output capacitance can hold the rail up long after
+// OUT0 (worse with a light target load), so wait on the measured VOUT reaching
+// PSU_OFF_THRESHOLD_MV before starting the OFF time — otherwise the target might
+// never actually drop below its POR threshold.
+static void psu_power_cycle(uint32_t time_ms) {
+    if (!psu_supply_set(false)) { psu_power_error("OFF"); return; }
+    uint32_t t0 = to_ms_since_boot(get_absolute_time());
+    int32_t mv = psu_wait_vout(false, PSU_OFF_THRESHOLD_MV, PSU_OFF_TIMEOUT_MS);
+    uint32_t waited = to_ms_since_boot(get_absolute_time()) - t0;
+    uart_cli_printf("OK: Target power cycling via PSU (output %ld mV after %lu ms; OFF for %u ms)...\r\n",
+                    (long)mv, (unsigned long)waited, time_ms);
+    if (mv < 0 || mv > PSU_OFF_THRESHOLD_MV) {
+        uart_cli_printf("WARNING: PSU output not below %d mV after %d ms — target may not have reset\r\n",
+                        PSU_OFF_THRESHOLD_MV, PSU_OFF_TIMEOUT_MS);
+    }
+    sleep_ms(time_ms);
+    bootloader_synced = false;
+    if (!psu_power_on_quiet()) { psu_power_error("ON"); return; }
+    uart_cli_send("OK: Target power ON (PSU output)\r\n");
+}
+
 void target_power_cycle(uint32_t time_ms) {
+    if (psu_is_active()) { psu_power_cycle(time_ms); return; }
     power_ensure_init();
     power_drive(power_active_mask(), false);
     uart_cli_printf("OK: Target power cycling (OFF for %u ms)...\r\n", time_ms);
@@ -1544,8 +1677,18 @@ void target_power_cycle(uint32_t time_ms) {
     uart_cli_send("OK: Target power ON\r\n");
 }
 
+// Supply state: GP10, or the PSU output while the PSU UART holds GP10/11 (never
+// touching those pins then). A PSU that does not answer reads as OFF — callers
+// that must tell "off" from "no answer" use psu_supply_state() directly.
 bool target_power_get_state(void) {
-    power_ensure_init();
+    if (psu_is_active()) {
+        bool on;
+        return psu_supply_state(&on) && on;
+    }
+    // Released (e.g. just after PSU RELEASE) = undriven = OFF. Don't init here:
+    // psu_begin() asks this before claiming, and initialising would drive GP11
+    // LOW against the MAX3232 receiver output for the duration of the claim.
+    if (!power_pin_initialized) return false;
     return gpio_get(POWER_PIN1);
 }
 
@@ -1559,23 +1702,31 @@ bool target_crowbar_gate_active_high(void) {
     return crowbar_gate_active_high;
 }
 
-// Drive the crowbar gate (GP11) to its safe, de-asserted idle level as a plain
+// Drive the crowbar gate (GP12) to its safe, de-asserted idle level as a plain
 // GPIO output. Used at mode switch, disarm, and boot so a wrong/floating idle
 // can never clamp the rail. Polarity-aware: idle = LOW when active-high, HIGH
 // when active-low. Clears any PIO outover left over from an armed window.
 void target_crowbar_gate_idle(void) {
+    // Fast edges into the gate driver: 12mA + fast slew (pad default is 4mA/slow,
+    // which rounds off the ~5-cycle pulses crowbar glitching needs). Pad settings
+    // survive the SIO<->PIO function switches.
+    gpio_set_drive_strength(PIN_CROWBAR_GATE, GPIO_DRIVE_STRENGTH_12MA);
+    gpio_set_slew_rate(PIN_CROWBAR_GATE, GPIO_SLEW_RATE_FAST);
     // Stage the SIO output (de-asserted value + output-enable) while the pin is
     // still PIO-held at its idle level, then switch the function mux to SIO LAST.
-    // GP11 is driven to the de-asserted level the instant SIO takes over — with
+    // GP12 is driven to the de-asserted level the instant SIO takes over — with
     // NO high-Z window and NO driven-assert. gpio_set_function() writes the whole
     // CTRL register, resetting OUTOVER to NORMAL atomically with the mux switch, so
     // the de-asserted value (set directly via gpio_put) needs no inversion.
-    // (The old gpio_init-first order forced the pin to input first, leaving GP11
-    //  briefly floating = a shallow spurious dip in active-low mode; and enabling
+    // (The old gpio_init-first order forced the pin to input first, leaving the
+    //  gate briefly floating = a shallow spurious dip in active-low mode; and enabling
     //  the output before clearing the armed INVERT drove a full spurious assert.)
     gpio_put(PIN_CROWBAR_GATE, crowbar_gate_active_high ? 0 : 1);  // SIO_OUT (staged)
     gpio_set_dir(PIN_CROWBAR_GATE, GPIO_OUT);                      // SIO_OE  (staged)
     gpio_set_function(PIN_CROWBAR_GATE, GPIO_FUNC_SIO);            // mux -> SIO (resets OUTOVER -> NORMAL)
+    // Un-isolate the pad in case it was released (gpio_deinit) by an earlier PSU
+    // claim in INTERNAL mode, so the staged idle level actually reaches the pin.
+    hw_clear_bits(&padsbank0_hw->io[PIN_CROWBAR_GATE], PADS_BANK0_GPIO0_ISO_BITS);
 }
 
 // Set crowbar gate polarity. Re-applies a safe idle immediately when already in
@@ -1587,11 +1738,43 @@ void target_set_crowbar_polarity(bool active_high) {
     }
 }
 
+// ---- Crowbar bench flag (operator declares a FET on GP12) ----
+bool target_crowbar_flagged(void) {
+    return crowbar_flagged;
+}
+
+psu_source_t target_crowbar_psu_source(void) {
+    return crowbar_psu_source;
+}
+
+// Declare / clear a crowbar bench. Declaring (on=true) forces EXTERNAL mode at the
+// given gate polarity and idles the gate de-asserted, so the bench is immediately
+// safe (no INTERNAL window where GP12 is driven as a power output). Clearing leaves
+// the current mode untouched (the operator chooses the next mode explicitly).
+void target_set_power_mode(power_mode_t mode);  // defined below (this TU has no header include)
+void target_set_crowbar_flag(bool on, bool active_high, psu_source_t src) {
+    crowbar_flagged = on;
+    if (on) {
+        crowbar_psu_source = src;
+        target_set_crowbar_polarity(active_high);   // store polarity
+        target_set_power_mode(POWER_MODE_EXTERNAL); // force safe mode + idle the gate
+    }
+}
+
 // Switch the GP10/11/12 group between INTERNAL (ganged power source) and
-// EXTERNAL (GP10 supply enable, GP11 crowbar gate, GP12 reserved spare).
+// EXTERNAL (GP10 supply enable, GP11 reserved spare, GP12 crowbar gate).
 // Both directions honour the current GP10 supply on/off state (boot default is
 // OFF; an explicit POWER ON / choke-point auto-power-on before the switch stays on).
+// While the PSU UART holds GP10/11, only EXTERNAL is reachable (the CLI refuses
+// INTERNAL) and only the GP12 gate is touched — the PSU keeps its UART pins.
 void target_set_power_mode(power_mode_t mode) {
+    if (psu_is_active()) {
+        if (mode == POWER_MODE_EXTERNAL) {
+            power_mode = mode;
+            target_crowbar_gate_idle();
+        }
+        return;
+    }
     power_ensure_init();
     bool supply_on = gpio_get(POWER_PIN1);
 
@@ -1602,15 +1785,15 @@ void target_set_power_mode(power_mode_t mode) {
         gpio_set_dir(POWER_PIN1, GPIO_OUT);
         gpio_set_drive_strength(POWER_PIN1, GPIO_DRIVE_STRENGTH_12MA);
         gpio_put(POWER_PIN1, supply_on);
-        // GP11 = crowbar gate at safe de-asserted idle (plain GPIO until
+        // GP12 = crowbar gate at safe de-asserted idle (plain GPIO until
         // glitch_arm hands it to the crowbar pulse SM).
         target_crowbar_gate_idle();
-        // GP12 = reserved spare: driven LOW (defined safe level). A bare input
+        // GP11 = reserved spare: driven LOW (defined safe level). A bare input
         // floats/reads HIGH on RP2350 (erratum E9 input leakage), so we drive
         // it low rather than leave it high-Z.
-        gpio_init(POWER_PIN3);
-        gpio_set_dir(POWER_PIN3, GPIO_OUT);
-        gpio_put(POWER_PIN3, 0);
+        gpio_init(POWER_PIN2);
+        gpio_set_dir(POWER_PIN2, GPIO_OUT);
+        gpio_put(POWER_PIN2, 0);
     } else {
         // Keep GP10 a driven output (no gpio_init -> no low blip) and re-gang
         // GP11/GP12 as 12mA power outputs, all matching the honoured supply state.
@@ -1629,12 +1812,17 @@ void target_set_power_mode(power_mode_t mode) {
 }
 
 // True when a CPU-side power-group glitch routine must not run because the group
-// is in EXTERNAL mode (GP11 belongs to the crowbar gate, GP12 is a spare).
-// Emits a CLI error pointing at the PIO crowbar path.
+// is in EXTERNAL mode (GP12 belongs to the crowbar gate, GP11 is a spare), or the
+// PSU UART holds GP10/11. Emits a CLI error pointing at the right path.
 static bool power_group_glitch_blocked(void) {
+    if (psu_is_active()) {
+        uart_cli_send("ERROR: power-group glitch unavailable while the PSU holds GP10/11 "
+                      "(PSU RELEASE first, or use the PIO crowbar in EXTERNAL mode).\r\n");
+        return true;
+    }
     if (power_mode == POWER_MODE_EXTERNAL) {
         uart_cli_send("ERROR: power-group glitch unavailable in EXTERNAL mode "
-                      "(GP11 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
+                      "(GP12 = crowbar gate). Use the PIO crowbar (ARM + trigger), "
                       "or switch back with 'TARGET POWER INT'.\r\n");
         return true;
     }
@@ -2875,12 +3063,7 @@ void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t gl
     uart_cli_send("[4] Initializing UART RX (GP5, 115200, 8N1)...\r\n");
 
     // Init UART1 for RX at 115200 baud (matches payload USART1 config)
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // === Step 5: Set BOOT0=0, pulse nRST — stage 2 sends flash via UART ===
     // Matches Joe Grand's stm32-fault-injection notebook (cell 30): BOOT0=LOW,
@@ -3106,11 +3289,7 @@ void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint3
     adc_power_init();
 
     // UART RX ready on GP5 @115200 8N1.
-    uart_deinit(TARGET_UART_ID);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t attempt = 0, effects = 0, reuploads = 0;
     uint32_t off = OFF_MIN; int wi = 0;
@@ -4627,12 +4806,7 @@ void target_power_halt(uint32_t dump_bytes) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
     // Init UART before resume so we catch stage 1's diagnostic output
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // BMP cortexm_detach: 3-step DHCSR to clear C_DEBUGEN via DAP
     extern uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count);
@@ -4939,12 +5113,7 @@ void target_power_cleanwake(void) {
     uart_cli_send("    Payload uploaded and verified\r\n");
 
     // Listen on target UART1 RX (GP5) before the payload starts talking
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
     while (uart_is_readable(TARGET_UART_ID)) uart_getc(TARGET_UART_ID);
 
     // Set SP + PC to the payload entry and RESUME with debug still enabled
@@ -5351,12 +5520,7 @@ void target_power_literal(void) {
     swd_write_core_reg(15, stage1_addr);
 
     // Init UART before resume
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // BMP cortexm_detach: 3-step DHCSR
     uint32_t dhcsr_val;
@@ -5608,12 +5772,7 @@ void target_power_regdump(void) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
 
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t dhcsr_val;
     dhcsr_val = 0xA05F0003;
@@ -6237,12 +6396,7 @@ void target_power_glitch_regdump(uint32_t max_attempts) {
 
     // === Step 4: Init UART ===
     uart_cli_send("[4] Initializing UART RX...\r\n");
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     // === Step 5: Set BOOT0=0, pulse nRST — flash boot with FPB redirect to stage 2 ===
     uart_cli_send("[5] Setting BOOT0=LOW (flash boot), pulsing nRST...\r\n");
@@ -6363,12 +6517,7 @@ void target_power_resettest(void) {
     swd_write_core_reg(13, 0x20005000);
     swd_write_core_reg(15, stage1_addr);
 
-    uart_deinit(TARGET_UART_ID);
-    gpio_deinit(TARGET_UART_RX_PIN);
-    gpio_init(TARGET_UART_RX_PIN);
-    uart_init(TARGET_UART_ID, 115200);
-    uart_set_format(TARGET_UART_ID, 8, 1, UART_PARITY_NONE);
-    gpio_set_function(TARGET_UART_RX_PIN, GPIO_FUNC_UART);
+    target_uart_listen_raw();
 
     uint32_t dhcsr_val;
     dhcsr_val = 0xA05F0003;

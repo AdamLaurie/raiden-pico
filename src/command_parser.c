@@ -1,4 +1,5 @@
 #include "command_parser.h"
+#include "uart_mux.h"
 #include "uart_cli.h"
 #include "glitch.h"
 #include "target_uart.h"
@@ -36,6 +37,7 @@ static bool api_mode = false;
 // Returns true on success, false on overflow or empty input
 static bool parse_u32(const char *str, int base, uint32_t *out) {
     if (!str || !*str) return false;
+    if (*str == '-') return false;   // strtoul accepts "-1" and wraps it to 0xFFFFFFFF
     char *end;
     unsigned long val = strtoul(str, &end, base);
     if (end == str || *end != '\0') return false;  // no digits or trailing junk
@@ -271,13 +273,19 @@ static bool target_bl_sync_sequence(uint32_t baud, uint32_t crystal_khz,
     // Release the SWD debug port so the target can reset into the bootloader.
     extern void swd_deinit(void);
     extern bool swd_is_connected(void);
-    extern void target_power_cycle(uint32_t time_ms);
+    extern bool swd_clear_debug(void);
     bool was_swd = swd_is_connected();
-    swd_deinit();
-    // If SWD was active, power-cycle to fully clear Cortex-M debug state
-    // (nRST alone doesn't clear a debug halt on Cortex-M3).
+    // If SWD was active, clear the Cortex-M debug state OVER SWD (resume + disable
+    // halting-debug) before releasing the port. nRST alone doesn't clear a debug
+    // halt, and the old power-cycle approach is a no-op on an externally-powered
+    // target (the Pico can't drop its rail) — swd_clear_debug() works regardless.
     if (was_swd) {
-        target_power_cycle(100);
+        swd_clear_debug();
+    }
+    swd_deinit();
+    if (was_swd) {
+        // Let the just-released SWD lines (SWCLK/SWDIO = target PA14/PA13) and the
+        // resumed core settle before we reset into the bootloader.
         sleep_ms(100);
     }
 
@@ -485,9 +493,28 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
             const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
                                               "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL", "I2C",
-                                              "TERM", "BAUD", "FORMAT"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 22, "TARGET sub-command")) {
+                                              "TERM", "BAUD", "FORMAT", "REBOOT", "CROWBAR"};
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 24, "TARGET sub-command")) {
                 goto api_response;
+            }
+            // Alias: TARGET REBOOT [ms] == TARGET POWER CYCLE [ms] (rewritten here so
+            // it shares the CYCLE path, incl. PSU routing and argument validation).
+            if (strcmp(parts->parts[1], "REBOOT") == 0) {
+                if (parts->count > 3) {
+                    api_error("ERROR: Usage: TARGET REBOOT [ms]\r\n");
+                    goto api_response;
+                }
+                // Writable copies, NOT literals: the compiler merges identical
+                // literals, so a "CYCLE" literal would share the candidate's address
+                // and match_and_replace() would take it for the no-match passthrough.
+                static char kw_power[] = "POWER";
+                static char kw_cycle[] = "CYCLE";
+                if (parts->count == 3) {
+                    parts->parts[3] = parts->parts[2];
+                }
+                parts->parts[1] = kw_power;
+                parts->parts[2] = kw_cycle;
+                parts->count++;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE", "FILL", "IDCODE",
@@ -575,6 +602,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== Glitch Configuration ==\r\n");
         uart_cli_send("GET [PAUSE|WIDTH|GAP|COUNT|VMIN] - Get current glitch parameter(s)\r\n");
         uart_cli_send("SET [PAUSE|WIDTH|GAP|COUNT] [<cycles>] - Set/get glitch parameter(s)\r\n");
+        uart_cli_send("       WIDTH/GAP are exact pin times; PIO minimum WIDTH 3, GAP 4 cycles\r\n");
         uart_cli_send("       PAUSE 0 = no pause (min latency); non-zero PAUSE must be >= trigger offset\r\n");
         uart_cli_send("SET VMIN <mV>             - 0 = WIDTH-only PIO pulse, !=0 = ADC-gated drop\r\n");
         uart_cli_send("                            (CPU-side, drops GP10/11/12 until ADC<VMIN,\r\n");
@@ -593,7 +621,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("PINS                   - Show pin configuration\r\n");
         uart_cli_send("REBOOT [BL]            - Reboot Pico (BL = bootloader mode)\r\n");
         uart_cli_send("RESET                  - Reset system\r\n");
-        uart_cli_send("STATUS                 - Show current status\r\n");
+        uart_cli_send("STATUS                 - Show current status (incl. GP22 fired-marker level)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
         uart_cli_send("TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
@@ -604,9 +632,13 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
         uart_cli_send("                   (defaults: 115200 baud, 12000 kHz crystal)\r\n");
         uart_cli_send("TARGET POWER [ON|OFF|CYCLE [ms]]  - Control target power (GP10/11/12)\r\n");
+        uart_cli_send("TARGET REBOOT [ms]     - Alias for TARGET POWER CYCLE [ms] (also TARGET POWER REBOOT)\r\n");
+        uart_cli_send("                   (drives the PSU output instead while the PSU is claimed)\r\n");
         uart_cli_send("TARGET POWER [INT|EXT [AHIGH|ALOW]] - Set power group mode\r\n");
         uart_cli_send("                   INT = GP10/11/12 ganged power source (default)\r\n");
-        uart_cli_send("                   EXT = GP10 supply, GP11 crowbar gate, GP12 spare\r\n");
+        uart_cli_send("                   EXT = GP10 supply, GP11 spare, GP12 crowbar gate\r\n");
+        uart_cli_send("TARGET CROWBAR [ON [AHIGH|ALOW] [PSU LOCAL|EXT]|OFF] - Flag a crowbar FET on GP12\r\n");
+        uart_cli_send("                   ON forces EXTERNAL + idles the gate, refuses INTERNAL (session-only)\r\n");
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
@@ -626,7 +658,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH I2CPROBE [samples] [us] - SWD-halt mid-stretch, read PC to map RDP-check timing [STM32F401]\r\n");
         uart_cli_send("TARGET GLITCH I2CPULSE [n] [lo] [hi] [step] [w] - PIO ns-resolution rail-pulse sweep (ticks) [STM32F401]\r\n");
         uart_cli_send("TARGET RESET           - Pulse reset now (bare = execute, default GP15 300ms active-low)\r\n");
-        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW] - Configure only (then bare RESET to pulse)\r\n");
+        uart_cli_send("TARGET RESET [PERIOD <ms>] [PIN <n>] [HIGH|LOW] [IDLE <FLOAT|HOLD>] - Configure only (then bare RESET to pulse)\r\n");
+        uart_cli_send("                         IDLE FLOAT=high-Z after pulse (TREF-safe default); HOLD=keep driving (reliable nRST on Nucleo)\r\n");
         uart_cli_send("                   (defaults: 300ms, GP15, active low)\r\n");
         uart_cli_send("TARGET RESPONSE        - Show response from target\r\n");
         uart_cli_send("TARGET SEND <hex|\"text\"> - Send hex bytes or quoted text (appends \\r)\r\n");
@@ -696,7 +729,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("PSU BAUD [rate]        - Show/set PSU UART baud (default 9600; 1200-921600)\r\n");
         uart_cli_send("PSU RELEASE            - Return GP10/11 to the target power group\r\n");
         uart_cli_send("  UART1 on GP10/GP11 @ 9600 8N1 default (PSU BAUD to change; needs a MAX3232 on the DB9).\r\n");
-        uart_cli_send("  Mutually exclusive with TARGET POWER (shares GP10/11).\r\n");
+        uart_cli_send("  While claimed the PSU is the target supply: TARGET POWER ON/OFF/CYCLE and the\r\n");
+        uart_cli_send("  auto power-on drive its output; TARGET POWER INT is refused (needs GP10/11);\r\n");
+        uart_cli_send("  TARGET POWER EXT + the GP12 crowbar gate stay usable alongside the PSU.\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
@@ -755,7 +790,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.24\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.25\r\n");
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -815,6 +850,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_printf("Gap:          %u cycles (%.2f us)\r\n", cfg->gap_cycles, cfg->gap_cycles / 150.0f);
         uart_cli_printf("Count:        %u\r\n", cfg->count);
         uart_cli_printf("Output Pins:  GP%u (normal), GP%u (inverted)\r\n", PIN_GLITCH_OUT, PIN_GLITCH_OUT_INV);
+        // Pad input level — valid whether GP22 is SIO- or PIO-driven. LOW from ARM
+        // until a fire; HIGH after (until the next ARM).
+        uart_cli_printf("Fired (GP%u): %s\r\n", PIN_GLITCH_FIRED, gpio_get(PIN_GLITCH_FIRED) ? "HIGH" : "LOW");
         uart_cli_send("\r\n");
 
         // Trigger configuration
@@ -852,18 +890,53 @@ void command_parser_execute(cmd_parts_t *parts) {
             target_type_str = info ? info->name : "STM32";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
+        extern bool psu_is_active(void);
         if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
-            uart_cli_printf("Power mode:   EXTERNAL (GP10 supply enable, GP11 crowbar gate %s, GP12 spare)\r\n",
+            uart_cli_printf("Power mode:   EXTERNAL (GP10 supply enable, GP11 spare, GP12 crowbar gate %s)\r\n",
                             target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
                                                               : "active-LOW/idle-HIGH");
-            uart_cli_printf("Supply (GP10):%s\r\n", target_power_get_state() ? " ON" : " OFF");
+            if (psu_is_active()) {
+                extern bool psu_supply_state(bool *on);
+                bool on;
+                uart_cli_printf("Supply (PSU): %s\r\n",
+                                !psu_supply_state(&on) ? "NO RESPONSE" : on ? "ON" : "OFF");
+            } else {
+                uart_cli_printf("Supply (GP10):%s\r\n", target_power_get_state() ? " ON" : " OFF");
+            }
         } else {
             uart_cli_send("Power mode:   INTERNAL (GP10/11/12 ganged source)\r\n");
-            uart_cli_printf("Power (GP10/11/12): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+            if (psu_is_active()) {
+                extern bool psu_supply_state(bool *on);
+                bool on;
+                uart_cli_printf("Supply (PSU): %s  (GP10/11 = PSU UART)\r\n",
+                                !psu_supply_state(&on) ? "NO RESPONSE" : on ? "ON" : "OFF");
+            } else {
+                uart_cli_printf("Power (GP10/11/12): %s\r\n", target_power_get_state() ? "ON" : "OFF");
+            }
+        }
+        if (target_crowbar_flagged()) {
+            uart_cli_printf("Crowbar bench: ON (gate %s, PSU %s) — INTERNAL refused\r\n",
+                            target_crowbar_gate_active_high() ? "AHIGH" : "ALOW",
+                            target_crowbar_psu_source() == PSU_SRC_LOCAL
+                                ? "LOCAL (Pico UART)" : "EXTERNAL (host/USB)");
         }
         uart_cli_printf("Reset (GP15): HIGH, LOW 300ms pulse\r\n");
         uart_cli_printf("Debug Mode:   %s\r\n", target_get_debug() ? "ON" : "OFF");
         uart_cli_printf("UART Timeout: %u ms\r\n", target_get_timeout());
+
+        // Hardware UART ownership (uart_mux): who holds each peripheral right now.
+        uart_cli_send("\r\n== UARTs ==\r\n");
+        for (uint n = 0; n < 2; n++) {
+            uart_owner_t o = uart_mux_owner(n);
+            if (o == UART_OWNER_NONE) {
+                uart_cli_printf("UART%u:        free\r\n", n);
+            } else {
+                uint8_t tx, rx;
+                uart_mux_pins(o, &tx, &rx);
+                uart_cli_printf("UART%u:        %s (GP%u/GP%u) %lu %s\r\n", n, uart_mux_name(o), tx, rx,
+                                (unsigned long)uart_mux_get_baud(o), uart_mux_line_str(o));
+            }
+        }
 
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
@@ -965,7 +1038,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("       VMIN value is millivolts (0 = disabled)\r\n");
             goto api_response;
         } else {
-            uint32_t value = atoi(parts->parts[2]);
+            uint32_t value;
+            // Strict base-10 parse: atoi() silently turned garbage ("abc", "5us")
+            // into 0/5. Base 10, not 0, so a leading zero isn't read as octal.
+            if (!parse_u32(parts->parts[2], 10, &value)) {
+                api_error_printf("ERROR: Invalid %s value '%s' (expected a non-negative integer)\r\n",
+                                 parts->parts[1], parts->parts[2]);
+                goto api_response;
+            }
 
             if (strcmp(parts->parts[1], "PAUSE") == 0) {
                 // A non-zero PAUSE below a positive trigger-pipeline offset cannot be
@@ -984,9 +1064,21 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else if (strcmp(parts->parts[1], "WIDTH") == 0) {
                 glitch_set_width(value);
                 uart_cli_printf("OK: WIDTH set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                if (value < GLITCH_PULSE_MIN_WIDTH) {
+                    // Accepted (WIDTH 0 is documented for VMIN mode), but say what the
+                    // PIO pulse will actually be rather than let it pass silently.
+                    uart_cli_printf("NOTE: PIO pulse minimum is %u cycles (%.1f ns); GP2/GP12 pulses will be %u cycles\r\n",
+                                    GLITCH_PULSE_MIN_WIDTH, GLITCH_PULSE_MIN_WIDTH * 1000.0f / 150.0f,
+                                    GLITCH_PULSE_MIN_WIDTH);
+                }
             } else if (strcmp(parts->parts[1], "GAP") == 0) {
                 glitch_set_gap(value);
                 uart_cli_printf("OK: GAP set to %u cycles (%.2f us)\r\n", value, value / 150.0f);
+                if (value < GLITCH_PULSE_MIN_GAP) {
+                    uart_cli_printf("NOTE: PIO gap minimum is %u cycles (%.1f ns); gaps between COUNT>1 pulses will be %u cycles\r\n",
+                                    GLITCH_PULSE_MIN_GAP, GLITCH_PULSE_MIN_GAP * 1000.0f / 150.0f,
+                                    GLITCH_PULSE_MIN_GAP);
+                }
             } else if (strcmp(parts->parts[1], "VMIN") == 0) {
                 glitch_set_vmin(value);
                 if (value == 0) {
@@ -1065,7 +1157,12 @@ void command_parser_execute(cmd_parts_t *parts) {
                     if (gc->trigger == TRIGGER_NONE) {
                         uart_cli_send("WARNING: no trigger set (TRIGGER NONE) — only a manual GLITCH will fire\r\n");
                     }
-                    if (!target_power_get_state()) {
+                    extern bool psu_is_active(void);
+                    extern bool psu_supply_state(bool *on);
+                    bool psu_on;
+                    if (psu_is_active() && !psu_supply_state(&psu_on)) {
+                        uart_cli_send("WARNING: PSU not responding — can't confirm target power\r\n");
+                    } else if (!target_power_get_state()) {
                         uart_cli_send("WARNING: target power is OFF — glitch will not affect the target\r\n");
                     }
                     uart_cli_send("OK: System armed\r\n");
@@ -1223,17 +1320,18 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("== Target Control ==\r\n");
         if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
             uart_cli_send("GP10 - Target Power supply enable (EXTERNAL mode)\r\n");
-            uart_cli_printf("GP11 - Crowbar gate, PIO-driven, same waveform as GP2 (%s)\r\n",
+            uart_cli_send("GP11 - Reserved spare (EXTERNAL mode, driven LOW)\r\n");
+            uart_cli_printf("GP12 - Crowbar gate, PIO-driven, same waveform as GP2 (%s)\r\n",
                             target_crowbar_gate_active_high() ? "active-HIGH, idle LOW"
                                                               : "active-LOW, idle HIGH");
-            uart_cli_send("GP12 - Reserved spare (EXTERNAL mode, no function)\r\n");
         } else {
             uart_cli_send("GP10 - Target Power (ganged, default ON, 12mA drive)\r\n");
             uart_cli_send("GP11 - Target Power (ganged, default ON, 12mA drive)\r\n");
             uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
         }
         uart_cli_send("       (GP10/11/12 mode: TARGET POWER [INT|EXT])\r\n");
-        uart_cli_send("       (or GP10/11 = external PSU UART1 via PSU cmds — needs MAX3232)\r\n");
+        uart_cli_send("       (or GP10/11 = external PSU UART1 via PSU cmds — needs MAX3232;\r\n");
+        uart_cli_send("        the EXTERNAL-mode GP12 crowbar gate coexists with the PSU)\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("GP13 - BOOT0 Control\r\n");
@@ -1382,6 +1480,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_uart_clear_response(void);
         extern void target_reset_execute(void);
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
+        extern void target_reset_set_idle_hold(bool hold);
+        extern bool target_reset_get_idle_hold(void);
 
         if (parts->count < 2) {
             uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|TERM|BAUD|FORMAT|POWER|I2C>\r\n");
@@ -1520,7 +1620,22 @@ void command_parser_execute(cmd_parts_t *parts) {
                         api_error("ERROR: TARGET RESET PIN requires a GPIO number\r\n");
                         parse_ok = false; break;
                     }
-                    pin = atoi(parts->parts[++i]);
+                    uint32_t p;
+                    const char *arg = parts->parts[++i];
+                    if (!parse_u32(arg, 10, &p) || p >= NUM_BANK0_GPIOS) {
+                        api_error_printf("ERROR: Invalid TARGET RESET PIN '%s' (GPIO 0-%u)\r\n",
+                                         arg, NUM_BANK0_GPIOS - 1);
+                        parse_ok = false; break;
+                    }
+                    // Never let the reset line take a UART pin (gpio_init would cut
+                    // that UART off its pins — e.g. PIN 0/1 silences ChipSHOUTER).
+                    uart_owner_t uo = uart_mux_pin_owner(p);
+                    if (uo != UART_OWNER_NONE) {
+                        api_error_printf("ERROR: GP%lu is a %s UART pin — pick another TARGET RESET PIN\r\n",
+                                         (unsigned long)p, uart_mux_name(uo));
+                        parse_ok = false; break;
+                    }
+                    pin = (uint8_t)p;
                 } else if (strcmp(parts->parts[i], "PERIOD") == 0) {
                     if (i + 1 >= parts->count) {
                         api_error("ERROR: TARGET RESET PERIOD requires a value in ms\r\n");
@@ -1531,9 +1646,23 @@ void command_parser_execute(cmd_parts_t *parts) {
                     active_high = true;
                 } else if (strcmp(parts->parts[i], "LOW") == 0) {
                     active_high = false;
+                } else if (strcmp(parts->parts[i], "IDLE") == 0) {
+                    if (i + 1 >= parts->count) {
+                        api_error("ERROR: TARGET RESET IDLE requires FLOAT or HOLD\r\n");
+                        parse_ok = false; break;
+                    }
+                    const char *m = parts->parts[++i];
+                    if (strcmp(m, "FLOAT") == 0) {
+                        target_reset_set_idle_hold(false);
+                    } else if (strcmp(m, "HOLD") == 0) {
+                        target_reset_set_idle_hold(true);
+                    } else {
+                        api_error_printf("ERROR: Unknown TARGET RESET IDLE mode '%s' (use FLOAT or HOLD)\r\n", m);
+                        parse_ok = false; break;
+                    }
                 } else {
                     api_error_printf("ERROR: Unknown TARGET RESET option '%s' "
-                                     "(use PIN <n>, PERIOD <ms>, HIGH, or LOW; bare TARGET RESET pulses)\r\n",
+                                     "(use PIN <n>, PERIOD <ms>, HIGH, LOW, or IDLE <FLOAT|HOLD>; bare TARGET RESET pulses)\r\n",
                                      parts->parts[i]);
                     parse_ok = false; break;
                 }
@@ -1548,8 +1677,9 @@ void command_parser_execute(cmd_parts_t *parts) {
 
             if (has_params) {
                 // Params = configure only (bare TARGET RESET is what pulses).
-                uart_cli_printf("OK: Reset configured: GP%u, %u ms, active %s (use bare 'TARGET RESET' to pulse)\r\n",
-                                pin, period, active_high ? "HIGH" : "LOW");
+                uart_cli_printf("OK: Reset configured: GP%u, %u ms, active %s, idle %s (use bare 'TARGET RESET' to pulse)\r\n",
+                                pin, period, active_high ? "HIGH" : "LOW",
+                                target_reset_get_idle_hold() ? "HOLD" : "FLOAT");
             } else {
                 // No parameters given — also execute the reset
                 target_reset_execute();
@@ -1616,18 +1746,22 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
             extern bool psu_is_active(void);
-            if (parts->count >= 3 && psu_is_active()) {
-                api_error("ERROR: GP10/11 held by the PSU UART — run PSU RELEASE before using TARGET POWER\r\n");
-                goto api_response;
-            }
             if (parts->count < 3) {
-                // Query: power on/off state + current group mode / crowbar polarity
-                bool power_state = target_power_get_state();
+                // Query: power on/off state + current group mode / crowbar polarity.
+                // With the PSU claimed, the supply is the PSU output (GP10/11 = its UART).
                 bool ext = (target_get_power_mode() == POWER_MODE_EXTERNAL);
-                uart_cli_printf("Target power (%s): %s\r\n",
-                                ext ? "GP10 supply" : "GP10/11/12", power_state ? "ON" : "OFF");
+                if (psu_is_active()) {
+                    extern bool psu_supply_state(bool *on);
+                    bool on;
+                    uart_cli_printf("Target power (PSU output): %s\r\n",
+                                    !psu_supply_state(&on) ? "NO RESPONSE" : on ? "ON" : "OFF");
+                } else {
+                    uart_cli_printf("Target power (%s): %s\r\n",
+                                    ext ? "GP10 supply" : "GP10/11/12",
+                                    target_power_get_state() ? "ON" : "OFF");
+                }
                 if (ext) {
-                    uart_cli_printf("Power mode: EXTERNAL (GP10 supply enable, GP11 crowbar gate %s, GP12 spare)\r\n",
+                    uart_cli_printf("Power mode: EXTERNAL (GP10 supply enable, GP11 spare, GP12 crowbar gate %s)\r\n",
                                     target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
                                                                       : "active-LOW/idle-HIGH");
                 } else {
@@ -1636,8 +1770,18 @@ void command_parser_execute(cmd_parts_t *parts) {
             } else {
                 // ON/OFF/CYCLE drive the supply; INTERNAL/EXTERNAL set the GP10/11/12
                 // group mode directly (INT/EXT resolve via prefix match).
-                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "INTERNAL", "EXTERNAL"};
-                if (!match_and_replace(&parts->parts[2], power_cmds, 5, "POWER command")) {
+                const char *power_cmds[] = {"ON", "OFF", "CYCLE", "REBOOT", "INTERNAL", "EXTERNAL"};
+                if (!match_and_replace(&parts->parts[2], power_cmds, 6, "POWER command")) {
+                    goto api_response;
+                }
+                if (strcmp(parts->parts[2], "REBOOT") == 0) {
+                    parts->parts[2] = (char *)"CYCLE";   // alias
+                }
+                // The PSU UART holds GP10/11: ON/OFF/CYCLE are routed to the PSU
+                // output (target_power_*), EXTERNAL only touches the GP12 crowbar
+                // gate — but INTERNAL needs GP10/11 as power outputs.
+                if (psu_is_active() && strcmp(parts->parts[2], "INTERNAL") == 0) {
+                    api_error("ERROR: GP10/11 held by the PSU UART — PSU RELEASE before TARGET POWER INTERNAL\r\n");
                     goto api_response;
                 }
 
@@ -1647,23 +1791,32 @@ void command_parser_execute(cmd_parts_t *parts) {
                     target_power_off();
                 } else if (strcmp(parts->parts[2], "CYCLE") == 0) {
                     uint32_t cycle_time_ms = 300;
-                    if (parts->count >= 4) {
+                    if (parts->count > 4) {
+                        api_error("ERROR: Usage: TARGET POWER CYCLE [ms] (alias TARGET REBOOT [ms])\r\n");
+                        goto api_response;
+                    }
+                    if (parts->count == 4) {
                         if (!parse_u32(parts->parts[3], 0, &cycle_time_ms)) {
-                            api_error("ERROR: Invalid cycle time. Usage: TARGET POWER CYCLE [ms]\r\n");
+                            api_error("ERROR: Invalid cycle time. Usage: TARGET POWER CYCLE [ms] (alias TARGET REBOOT [ms])\r\n");
                             goto api_response;
                         }
                     }
                     target_power_cycle(cycle_time_ms);
                 } else {
                     // INTERNAL / EXTERNAL — set the group mode. Changing mode while
-                    // armed would tear GP11 out from under the crowbar pulse SM, so
+                    // armed would tear GP12 out from under the crowbar pulse SM, so
                     // refuse and make the user disarm first.
                     if (glitch_get_flags()->armed) {
                         api_error("ERROR: disarm (ARM OFF) before changing power mode\r\n");
                         goto api_response;
                     }
                     if (strcmp(parts->parts[2], "EXTERNAL") == 0) {
-                        // Optional crowbar gate polarity: AHIGH (default) | ALOW
+                        // Optional crowbar gate polarity: AHIGH (default) | ALOW.
+                        // Nothing may follow the polarity token.
+                        if (parts->count > 4) {
+                            api_error("ERROR: Usage: TARGET POWER EXT [AHIGH|ALOW]\r\n");
+                            goto api_response;
+                        }
                         if (parts->count >= 4) {
                             const char *pol_names[] = {"AHIGH", "ALOW"};
                             if (!match_and_replace(&parts->parts[3], pol_names, 2, "gate polarity")) {
@@ -1672,14 +1825,106 @@ void command_parser_execute(cmd_parts_t *parts) {
                             target_set_crowbar_polarity(strcmp(parts->parts[3], "AHIGH") == 0);
                         }
                         target_set_power_mode(POWER_MODE_EXTERNAL);
-                        uart_cli_printf("OK: Power mode EXTERNAL (GP10 supply, GP11 crowbar gate %s, GP12 spare)\r\n",
+                        uart_cli_printf("OK: Power mode EXTERNAL (GP10 supply, GP11 spare, GP12 crowbar gate %s)\r\n",
                                         target_crowbar_gate_active_high() ? "active-HIGH/idle-LOW"
                                                                           : "active-LOW/idle-HIGH");
                     } else {  // INTERNAL
+                        // The crowbar gate is EXTERNAL-only: in INTERNAL, GP12 is a
+                        // ganged power pin, not a gate, so AHIGH/ALOW (or any other
+                        // trailing token) here is a mode mix-up. Reject it explicitly
+                        // rather than silently ignore it and imply a crowbar was set.
+                        if (parts->count >= 4) {
+                            api_error("ERROR: INTERNAL takes no argument "
+                                      "(AHIGH/ALOW gate polarity is EXTERNAL-only; "
+                                      "GP12 is ganged power in INTERNAL)\r\n");
+                            goto api_response;
+                        }
+                        // A flagged crowbar bench has a FET on GP12: INTERNAL would
+                        // drive GP12 HIGH as a power output straight into the gate =
+                        // sustained short. Refuse until the operator clears the flag.
+                        if (target_crowbar_flagged()) {
+                            api_error("ERROR: crowbar bench flagged — INTERNAL would drive "
+                                      "the GP12 gate FET into a short. TARGET CROWBAR OFF first.\r\n");
+                            goto api_response;
+                        }
                         target_set_power_mode(POWER_MODE_INTERNAL);
                         uart_cli_send("OK: Power mode INTERNAL (GP10/11/12 ganged power source)\r\n");
                     }
                 }
+            }
+        } else if (strcmp(parts->parts[1], "CROWBAR") == 0) {
+            // TARGET CROWBAR [ON [AHIGH|ALOW] [PSU LOCAL|EXT] | OFF]
+            // Operator declares a crowbar MOSFET on GP12 (session flag, no persistence
+            // yet). ON forces EXTERNAL at the given polarity + idles the gate, and
+            // INTERNAL is refused while flagged. Bare query prints the state.
+            if (parts->count < 3) {
+                // Query.
+                if (target_crowbar_flagged()) {
+                    uart_cli_printf("Crowbar bench: ON (gate %s, PSU %s)\r\n",
+                                    target_crowbar_gate_active_high() ? "AHIGH/idle-LOW"
+                                                                      : "ALOW/idle-HIGH",
+                                    target_crowbar_psu_source() == PSU_SRC_LOCAL
+                                        ? "LOCAL (Pico UART)" : "EXTERNAL (host/USB)");
+                } else {
+                    uart_cli_send("Crowbar bench: OFF\r\n");
+                }
+            } else if (strcmp(parts->parts[2], "OFF") == 0) {
+                if (parts->count > 3) {
+                    api_error("ERROR: Usage: TARGET CROWBAR OFF\r\n");
+                    goto api_response;
+                }
+                target_set_crowbar_flag(false, target_crowbar_gate_active_high(),
+                                        target_crowbar_psu_source());
+                uart_cli_send("OK: Crowbar bench OFF (power mode unchanged — set INT/EXT explicitly)\r\n");
+            } else if (strcmp(parts->parts[2], "ON") == 0) {
+                // Optional, order-fixed: [AHIGH|ALOW] then [PSU LOCAL|EXT].
+                bool active_high = target_crowbar_gate_active_high();   // keep current unless given
+                psu_source_t src = target_crowbar_psu_source();
+                int i = 3;
+                // Optional gate polarity: any token here that isn't the PSU keyword.
+                if (i < parts->count && strcmp(parts->parts[i], "PSU") != 0) {
+                    const char *pol_names[] = {"AHIGH", "ALOW"};
+                    if (!match_and_replace(&parts->parts[i], pol_names, 2, "gate polarity")) {
+                        goto api_response;
+                    }
+                    active_high = (strcmp(parts->parts[i], "AHIGH") == 0);
+                    i++;
+                }
+                // Optional PSU source.
+                if (i < parts->count) {
+                    // Remaining must be: PSU LOCAL|EXT
+                    if (strcmp(parts->parts[i], "PSU") != 0) {
+                        api_error("ERROR: Unknown CROWBAR ON argument "
+                                  "(expected [AHIGH|ALOW] [PSU LOCAL|EXT])\r\n");
+                        goto api_response;
+                    }
+                    i++;
+                    if (i >= parts->count) {
+                        api_error("ERROR: PSU needs a source: LOCAL (Pico UART) or EXT (host/USB)\r\n");
+                        goto api_response;
+                    }
+                    const char *src_names[] = {"LOCAL", "EXT"};
+                    if (!match_and_replace(&parts->parts[i], src_names, 2, "PSU source")) {
+                        goto api_response;
+                    }
+                    src = (strcmp(parts->parts[i], "LOCAL") == 0) ? PSU_SRC_LOCAL : PSU_SRC_EXTERNAL;
+                    i++;
+                }
+                if (i < parts->count) {
+                    api_error("ERROR: Usage: TARGET CROWBAR ON [AHIGH|ALOW] [PSU LOCAL|EXT]\r\n");
+                    goto api_response;
+                }
+                target_set_crowbar_flag(true, active_high, src);
+                uart_cli_printf("OK: Crowbar bench ON — EXTERNAL, gate %s, PSU %s. "
+                                "INTERNAL now refused.\r\n",
+                                target_crowbar_gate_active_high() ? "AHIGH/idle-LOW"
+                                                                  : "ALOW/idle-HIGH",
+                                src == PSU_SRC_LOCAL ? "LOCAL (Pico UART)" : "EXTERNAL (host/USB)");
+            } else {
+                api_error_printf("ERROR: Unknown CROWBAR command '%s' "
+                                 "(use ON|OFF or bare TARGET CROWBAR to query)\r\n",
+                                 parts->parts[2]);
+                goto api_response;
             }
         } else if (strcmp(parts->parts[1], "BL") == 0) {
             if (parts->count < 3) {
@@ -1989,6 +2234,33 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
                 i2c_bl_enter();
                 i2c_bl_get_id((uint8_t)a);
+            } else if (strcmp(parts->parts[2], "STRETCH") == 0) {
+                // EXPERIMENTAL: time the SCL-release clock-stretch at a cmd-ACK (RDP
+                // verdict = decision time, when gated) vs the address-byte ACK (control),
+                // over N reads. Cycle-resolution; measures the target directly (no scope).
+                // Usage: TARGET I2C STRETCH [n] [cmd_hex]  (default n=100, cmd=0x11)
+                uint32_t nn = 100, cc = 0x11;
+                if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &nn)) {
+                    api_error("ERROR: Usage: TARGET I2C STRETCH [n] [cmd_hex]\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 5 && (!parse_u32(parts->parts[4], 16, &cc) || cc > 0xFF)) {
+                    api_error("ERROR: Usage: TARGET I2C STRETCH [n] [cmd_hex]\r\n");
+                    goto api_response;
+                }
+                i2c_bl_stretch_measure(I2C_BL_ADDR7_DEFAULT, (uint8_t)cc, nn);
+            } else if (strcmp(parts->parts[2], "DLY") == 0) {
+                // EXPERIMENTAL: set/show the bit-bang master half-bit delay (us) to sweep
+                // the I2C clock. Usage: TARGET I2C DLY [us]
+                if (parts->count >= 4) {
+                    uint32_t us = 0;
+                    if (!parse_u32(parts->parts[3], 0, &us) || us > 100000) {
+                        api_error("ERROR: Usage: TARGET I2C DLY [us]  (0..100000)\r\n");
+                        goto api_response;
+                    }
+                    i2c_bl_set_dly(us);
+                }
+                uart_cli_printf("OK: I2C master half-bit delay = %lu us\r\n", (unsigned long)i2c_bl_get_dly());
             } else if (strcmp(parts->parts[2], "READ") == 0) {
                 uint32_t addr = 0, len = 0, a = I2C_BL_ADDR7_DEFAULT;
                 if (parts->count < 5 ||

@@ -1,5 +1,6 @@
 #include "config.h"
 #include "uart_cli.h"
+#include "uart_mux.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "pico/time.h"
@@ -22,21 +23,11 @@ static uint32_t last_rx_time = 0;  // Track last character received time
 static bool chipshot_armed = false;
 
 void chipshot_uart_init(void) {
-    // Initialize UART for ChipShouter - UART0 on GP0/GP1
-    uart_init(CHIPSHOT_UART_ID, CHIPSHOT_UART_BAUD);
-
-    // Set UART format: 8 data bits, 1 stop bit, no parity
-    uart_set_format(CHIPSHOT_UART_ID, 8, 1, UART_PARITY_NONE);
-
-    // Configure GPIO pins for UART
-    gpio_set_function(CHIPSHOT_UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(CHIPSHOT_UART_RX_PIN, GPIO_FUNC_UART);
-
-    // Enable FIFO
-    uart_set_fifo_enabled(CHIPSHOT_UART_ID, true);
-
-    // Disable hardware flow control
-    uart_set_hw_flow(CHIPSHOT_UART_ID, false, false);
+    // Claim UART0 on GP0/GP1 through uart_mux (8N1, FIFO on, no flow control).
+    // ChipSHOUTER is UART0's only owner today; going through the mux keeps UART0
+    // under the same rules as UART1 if another UART0 alternate is ever added.
+    uart_mux_set_line(UART_OWNER_CHIPSHOT, CHIPSHOT_UART_BAUD, 8, UART_PARITY_NONE, 1);
+    uart_mux_reclaim(UART_OWNER_CHIPSHOT);
 
     // Clear any stale data in RX FIFO
     while (uart_is_readable(CHIPSHOT_UART_ID)) {
@@ -52,6 +43,7 @@ void chipshot_uart_init(void) {
 }
 
 void chipshot_uart_send(const char *data) {
+    uart_mux_claim(UART_OWNER_CHIPSHOT);   // no-op while ChipSHOUTER owns UART0
     uart_puts(CHIPSHOT_UART_ID, data);
     // Wait for TX FIFO to drain to ensure command is fully sent
     uart_tx_wait_blocking(CHIPSHOT_UART_ID);
@@ -61,6 +53,10 @@ void chipshot_uart_process(void) {
     // Read incoming data from ChipShouter
     // ChipShouter sends multi-line responses, so we need to collect all lines
     // A response is complete when no new data arrives for 50ms
+
+    // Only drain UART0 while ChipSHOUTER owns it (it always does today; the
+    // check keeps a future UART0 owner's bytes from being eaten here).
+    if (!uart_mux_is_owner(UART_OWNER_CHIPSHOT)) return;
 
     // Don't read new data if response is already ready (prevents corruption)
     if (!response_ready) {

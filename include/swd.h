@@ -149,6 +149,12 @@ bool swd_halt(void);
 // Resume target core
 bool swd_resume(void);
 
+// Clear Cortex-M debug state (resume + disable halting-debug) over SWD, so the core
+// runs normally after the next reset. Power-agnostic (works on externally-powered
+// targets where a power-cycle can't drop the rail). Best-effort; returns false if no
+// core answers.
+bool swd_clear_debug(void);
+
 // Single-step one instruction (core must be halted). Waits for re-halt.
 bool swd_step(void);
 

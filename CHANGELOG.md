@@ -1,3 +1,171 @@
+## [0.25] — 2026-11-08 — Crowbar gate moved to GP12; PSU + crowbar combo mode
+
+### Added
+- **`TARGET RESET … IDLE <FLOAT|HOLD>`** — choose the reset pin's post-pulse state.
+  `FLOAT` leaves it high-Z (TREF-safe, default); `HOLD` keeps driving it to the released
+  level, which is more reliable nRST on a Nucleo (its VCAP cap + weak pull-up make a floated
+  release edge marginal). `IDLE` with a missing/unknown mode errors.
+- **`swd_clear_debug()` on the sync path** — when SWD was attached, `TARGET SYNC` now clears
+  the Cortex-M debug state *over SWD* (resume + disable halting-debug) before releasing the
+  port, instead of relying on a power-cycle. This is power-agnostic, so the first
+  `TARGET SYNC` after an `SWD ID` connects cleanly on the first try even on an externally
+  powered target (verified 6/6 at RDP0). Note: at RDP1 the debug port is walled, so a stuck
+  RDP1 target still needs a real `TARGET POWER CYCLE`.
+- **`[RX ERR]` diagnostic on `TARGET BL READ`** — reports the PL011 UART framing/parity/
+  break/overrun error counts (and first bad-byte index) seen while receiving the data phase.
+  `[RX ERR] none` with corrupt data means the bytes were received cleanly but are wrong (a
+  target-side fault), vs. FE/PE/OE which indicate a reception/signal problem. (This is how
+  the VCAP-cap read-corruption was pinned to the target, not the link.)
+- **`TARGET I2C STRETCH [n] [cmd_hex]` / `TARGET I2C DLY [us]`** *(experimental)* — STRETCH
+  times the SCL clock-stretch at a command-ACK over N reads (RDP decision-time recon, cycle
+  resolution, no scope); DLY sets/shows the bit-bang master half-bit delay (0–100000 µs) to
+  sweep the I2C clock. Both validate their arguments and error on bad input.
+
+### Changed
+- **EXTERNAL-mode crowbar gate moved GP11 → GP12** (GP11 is now the reserved spare,
+  driven LOW). The PSU UART owns GP10/11, so on GP11 the crowbar and PSU could never
+  be used together. **Rewire:** gate driver input from Pico pin 15 (GP11) to pin 16 (GP12).
+- The gate pad is driven at 12mA with fast slew (was the 4mA/slow-slew default), for
+  clean ns-scale edges into a gate driver.
+- **Docs reconciled + crowbar safety rule made explicit.** The crowbar requires EXTERNAL
+  mode — INTERNAL is prohibited for Pico/FET protection (a crowbar short in INTERNAL goes
+  through the RP2350 source drivers, and INTERNAL drives GP12 HIGH as a power output,
+  latching the gate on). VMIN.md still said to drive the crowbar from GP2; it now points to
+  the interlocked GP12 gate with the INT-prohibition note, and README's crowbar section adds
+  the rule plus PSU current-limit guidance + examples. `scripts/crowbar_scope_test.py` now
+  sets PSU VOLT/CURR protection (`--psu --volts --ilimit-ma`), rests the bench de-energized
+  in EXTERNAL (was INTERNAL — unsafe with a FET on GP12), and gates the INTERNAL baseline
+  behind `--allow-int`.
+- **⚠ The crowbar is UNTESTED WIP.** The GP12 gate wiring, the `TARGET CROWBAR` flag/interlock,
+  and the EXTERNAL-mode fire path have **not been bench-validated against a real FET + target**.
+  The command surface, safety interlock (INTERNAL refused) and PIO gate are in place, but do not
+  rely on the crowbar actually glitching a target until it's been proven on the bench.
+- **`TARGET CROWBAR [ON [AHIGH|ALOW] [PSU LOCAL|EXT]|OFF]`** — the operator flags a crowbar
+  FET on GP12. `ON` forces EXTERNAL at the given gate polarity, idles the gate de-asserted
+  (immediately safe), records whether the supply is Pico-driven (`PSU LOCAL`) or host/USB
+  (`PSU EXT`), and makes `TARGET POWER INTERNAL` **refuse** (INTERNAL would drive GP12 as a
+  power output into the gate FET = sustained short). Bare `TARGET CROWBAR` queries; `STATUS`
+  shows the flag. **Session-only — clears on reboot** (no config persistence yet; see the
+  settings-store TODO), so re-flag after every boot.
+- **PSU + crowbar combo mode.** `TARGET POWER EXT [AHIGH|ALOW]` now works while the PSU
+  is claimed (it only touches GP12), and the PSU becomes the target supply:
+  `TARGET POWER ON/OFF/CYCLE` and the auto power-on at SYNC/CONNECT/I2C entry drive the
+  PSU output (OUT1/OUT0, confirmed via STATUS? bit6) instead of being refused, so
+  campaign scripts work unchanged. `CYCLE` waits (≤5 s) for VOUT ≤300 mV before the
+  OFF time and warns if it never gets there; `ON` waits for VOUT ≥90 % of Vset. Bare
+  `TARGET POWER` / `STATUS` report the PSU output. Only `TARGET POWER INT` is refused
+  while claimed. An unknown sub-command now reports "Unknown" instead of the PSU error.
+- README: power-modes table (INTERNAL / EXTERNAL / EXTERNAL+PSU / INTERNAL+PSU).
+- New aliases `TARGET REBOOT [ms]` and `TARGET POWER REBOOT [ms]` = `TARGET POWER CYCLE [ms]`
+  (same path, including PSU routing). `TARGET POWER CYCLE` now rejects extra arguments
+  instead of ignoring them.
+- **`WIDTH` / `GAP` are now the exact pin times** (scope-verified on GP2 + GP12, WIDTH
+  3/4/5/6/10/100, GAP 4/10). The pulse program's fixed cost is 3 cycles per pulse and 4
+  per gap, but the firmware subtracted a flat 5 (and nothing at all for values ≤ 5), so
+  every pulse was WIDTH−2 and every gap GAP−1, and the bottom end was non-monotonic.
+  **Recorded campaign values change meaning** — to reproduce an old setting:
+
+  | old `SET WIDTH` | old actual pulse | new `SET WIDTH` for the same pulse |
+  |---|---|---|
+  | 0–5 | WIDTH+3 cycles (0→3 … 5→8) | WIDTH+3 |
+  | ≥ 6 | WIDTH−2 cycles (6→4, 10→8, 100→98) | WIDTH−2 |
+
+  Old GAP g (COUNT > 1): ≥ 6 → g−1; ≤ 5 → g+4. Minimums are WIDTH 3 (20 ns) and GAP 4;
+  smaller values are accepted (`SET WIDTH 0` is documented for VMIN) and the reply notes
+  the minimum. The F401 "33 ns ≈ WIDTH 5, sweep 4–6" recipe really produced 47/53/27 ns
+  before this fix; it is now 27/33/40 ns as intended. I2CPULSE (its own program) and
+  PAUSE timing are unchanged.
+- `SET <param> <value>` rejects non-integers and negatives (`abc`, `5us`, `1.5`, `-1`)
+  with an ERROR; `atoi()` used to turn them silently into 0 or a truncated number.
+  (`parse_u32` now rejects a leading `-`, which `strtoul` wrapped to 0xFFFFFFFF.)
+- `STATUS` shows the GP22 fired-marker level (`Fired (GP22): HIGH|LOW`).
+
+### Fixed
+- **I2C bootloader entry — same nRST-float regression on the SWD reset path.** The sync
+  fix below only touched `target_reset_execute()` (UART/power path). The I2C bootloader
+  entry (`i2c_bl_enter` → `swd_nrst_pulse` in `swd.c`) used a separate reset that still
+  floated nRST immediately on release, so a Nucleo (nRST cap + weak pull-up) never latched
+  BOOT0 and `TARGET I2C SCAN/GET` returned **no ACK** on correct PB6/PB7 wiring.
+  `swd_nrst_pulse()` now drives the release edge HIGH for ~5 ms before high-Z (mirrors
+  `RESET_RELEASE_SETTLE_MS`). Verified F401: SCAN → `I2C ACK at 0x39`, GET → bootloader
+  v1.1 / 17 commands, 6/6 reliable. (Also benefits the `SWD`-nrst CLI pulse.)
+- **Bootloader sync regression (nRST left floating on release).** Since v0.6
+  (`a2a98d0`, "reset float"), `target_reset_execute()` drove nRST during the active
+  pulse and then went straight to high-Z, relying on the target's own pull-up to
+  bring the line back up. That keeps 3.3 V off a JTAG TREF probe on the glitch bench,
+  but on a board with an nRST capacitor and only a weak (~40 kΩ) internal pull-up (e.g.
+  a Nucleo) the release edge rose too slowly/softly for the target to latch boot mode,
+  so `TARGET SYNC` (and the STM32/LPC UART bootloaders downstream) failed with "No
+  response from bootloader" on otherwise-good wiring. The reset now **drives the
+  inactive (release) edge actively for `RESET_RELEASE_SETTLE_MS` (5 ms), then returns
+  to high-Z** — a clean, fast rising edge for latching, with the idle state still
+  floating so TREF stays clean between shots. Bisected good `600d4c0` → bad `a2a98d0`;
+  verified on an STM32F401 Nucleo (8/8 UART syncs, SWD unaffected).
+- `STATUS`, bare `TARGET POWER`, the `ARM ON` power warning, and the auto power-on
+  at `TARGET SYNC` / `SWD CONNECT` / I2C entry no longer re-initialise GP10/11 while
+  the PSU UART holds them (this silently broke the PSU link). `ARM ON` warns
+  "PSU not responding" instead of a misleading "power is OFF" when the PSU is silent. CPU-side power-group
+  glitch routines refuse while the PSU is claimed.
+- After `PSU RELEASE` in EXTERNAL mode, lazy re-init of the power pins no longer
+  drives the crowbar gate LOW (= asserted in `ALOW` polarity).
+- **GP22 (GLITCH_FIRED) stuck HIGH.** `ARM` cleared GP22 with a SIO `gpio_put`, which
+  can't touch a PIO-owned pin, and PIO0's latch for GP22 was never cleared. After a
+  manual `GLITCH` GP22 stayed HIGH through the next ARM (no rising edge for a scope or
+  `TRACE`, clock boost active from arm), and a later UART arm or `ARM TRACE` picked up
+  the stale HIGH. Every ARM / ARM TRACE now clears the PIO latch and drives GP22 LOW.
+- Manual `GLITCH` is a one-shot: IRQ0 raised once, GP22 latched HIGH until the next
+  ARM (same as the GPIO and I2C triggers). It used to loop for several µs, re-raising
+  IRQ0 and dipping GP22 every 99 cycles (extra rising edges). Scope-verified: GP2 and
+  GP12 both fire on the single IRQ, and GP22→GP2 is unchanged (PAUSE + 10 cycles on
+  this path).
+- PSU tests no longer drive GP10/11 into the MAX3232: the claim check doesn't
+  initialise the power pins, and `TestPsuCrowbarCombo` claims and releases once.
+
+- **Hardware-UART ownership arbiter (`uart_mux`).** UART1 is one peripheral with three
+  pin alternates (Target GP4/5, GRBL GP8/9, PSU GP10/11), but each subsystem called
+  `uart_init()` on it independently and kept its own "active" flag, and nothing un-routed
+  the previous owner's pins. So `TARGET TERM`/`BAUD`, bootloader commands or GRBL taking
+  UART1 silently killed a claimed PSU link (re-programmed baud, PSU still "claimed") and
+  sent their traffic out of GP10 to the PSU as well; after `PSU ID` the target/STM32/LPC
+  paths talked to the PSU; GRBL could send G-code to the PSU; the I2C bootloader left the
+  target thinking it still owned an unrouted UART; `PSU RELEASE` deinit'd UART1 even when
+  the target held it; eight glitch/payload routines re-initialised UART1 behind everyone's
+  back. Now every user claims/borrows through `uart_mux`: claiming detaches the previous
+  owner and parks its pins (never left selected to UART; PSU TX parked HIGH into the
+  MAX3232), stored line settings are re-applied on every hand-over, and each PSU
+  transaction borrows UART1 and hands it back with the previous owner's settings and IRQ
+  restored. UART0 (ChipSHOUTER) goes through the same arbiter. `STATUS` shows the owner
+  of each UART. Bench-verified with a real PSU: it keeps answering across target
+  `SEND`/`BAUD`/`FORMAT 8E1` and GRBL, and UART1 returns to whoever had it.
+- `TARGET RESET PIN` validates the GPIO (number, range) and refuses UART pins — `PIN 0/1`
+  used to silently cut ChipSHOUTER off UART0.
+- **`TARGET POWER INT` now rejects a crowbar-polarity argument.** The gate is EXTERNAL-only
+  (GP12 is ganged power in INTERNAL), but `TARGET POWER INT AHIGH|ALOW` silently swallowed
+  the token and reported `OK: Power mode INTERNAL`, implying a crowbar was configured when
+  none was — a "crowbar + INT" mix-up. It (and any trailing token) now errors; `TARGET
+  POWER EXT …` likewise rejects a token after the polarity. The crowbar can never be
+  armed in INTERNAL (hard-guarded in `crowbar_pulse_start()`); this closes the CLI gap.
+
+### Known issues (not fixed here)
+- At boot GP10/11/12 are driven LOW (INTERNAL default), which fights a MAX3232 on GP11
+  until the PSU is claimed. Leaving them undriven needs ~10 CPU-side glitch routines
+  that skip `power_ensure_init()` fixed first.
+
+### Tests
+- New `--config=psu` wiring marker. `TestPsuCrowbarCombo`: EXT allowed while claimed;
+  INT refused; ON/OFF/CYCLE route to the PSU (OK with a PSU attached, `ERROR: PSU did
+  not confirm` without one — never a false OK); query/STATUS leave the PSU claimed;
+  crowbar fires with the PSU claimed (also needs `--config=power-ext`).
+- PSU-routed power verbs bench-tested against a real Multicomp Pro 72-2540 driving a
+  12.6 V target (combo class + `TARGET POWER ON/CYCLE` / `TARGET REBOOT` via the PSU).
+- `TestGlitchFiredMarker`: GP22 LOW after every ARM and HIGH after every GLITCH (3×), and
+  cleared when re-arming on UART / GPIO / I2C with `ARM ON` and `ARM TRACE`.
+- `SET` garbage/negative values error; WIDTH < 3 / GAP < 4 accepted with a NOTE.
+- `tests/test_uart_mux.py`: UART0/UART1 ownership in STATUS, Target↔GRBL hand-over, STM32
+  8E1 re-init, live `TARGET BAUD`, `TARGET RESET PIN` guards (config_none); PSU borrow /
+  restore across target SEND/BAUD/FORMAT and GRBL, power verbs after a target session
+  (`--config=psu`).
+
 ## [0.22] — 2026-11-03 — Interactive target console (TARGET TERM + settable line params)
 
 ### Added
@@ -302,8 +470,8 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 - Config_none tests cover the argument-validation paths.
 
 ### Verified (bench, F401 DEV_ID 0x433)
-- I2C boot interface **is reachable** on the F401 at slave 0x39 (undocumented in
-  AN2606). At RDP0 the full command set works (Write DEADBEEF → READ-back verified).
+- I2C boot interface **is reachable** on the F401 at slave 0x39. At RDP0 the full
+  command set works (Write DEADBEEF → READ-back verified).
 - **RDP1 command gating mapped** (via `PROBE`): only **Get (0x00), GV (0x01),
   GID (0x02)** and the RDP-management pair **RP/RU** are accepted; **Read (0x11),
   Go (0x21), Write (0x31), Erase (0x44), Write-Protect (0x63) are all NACK'd**.

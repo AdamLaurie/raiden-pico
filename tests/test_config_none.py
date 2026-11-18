@@ -99,6 +99,29 @@ class TestGlitchParams:
         r = raiden.cmd("SET FOOBAR 100")
         assert "ERROR" in r
 
+    @pytest.mark.parametrize("cmd", ["SET WIDTH abc", "SET WIDTH 5us", "SET GAP -1",
+                                     "SET PAUSE 1.5", "SET COUNT x", "SET VMIN 2V"])
+    def test_set_garbage_value_errors(self, raiden, cmd):
+        """atoi() used to turn garbage into 0 (or a truncated number) silently."""
+        raiden.cmd("SET WIDTH 100")
+        r = raiden.cmd(cmd)
+        assert "ERROR" in r and "Invalid" in r
+        assert "100" in raiden.cmd("GET WIDTH")   # WIDTH unchanged by a rejected SET
+
+    def test_set_width_below_minimum_accepted_with_note(self, raiden):
+        # WIDTH 0 is documented (VMIN mode), so it's accepted — but the reply must
+        # say the PIO pulse is the 3-cycle minimum, not pass silently.
+        r = raiden.cmd("SET WIDTH 0")
+        assert "OK: WIDTH set to 0" in r and "minimum is 3 cycles" in r
+        assert "NOTE" not in raiden.cmd("SET WIDTH 3")
+        raiden.cmd("SET WIDTH 100")
+
+    def test_set_gap_below_minimum_accepted_with_note(self, raiden):
+        r = raiden.cmd("SET GAP 2")
+        assert "OK: GAP set to 2" in r and "minimum is 4 cycles" in r
+        assert "NOTE" not in raiden.cmd("SET GAP 4")
+        raiden.cmd("SET GAP 100")
+
     def test_get_unknown_param(self, raiden):
         r = raiden.cmd("GET FOOBAR")
         assert "ERROR" in r
@@ -403,6 +426,25 @@ class TestTargetReset:
         assert "OK" in r and "400" in r
         raiden.cmd("TARGET RESET PERIOD 300")   # restore default
 
+    def test_reset_idle_float_configures(self, raiden):
+        # IDLE FLOAT = high-Z after the pulse (TREF-safe default). Configure only.
+        r = raiden.cmd("TARGET RESET IDLE FLOAT")
+        assert "OK" in r and "FLOAT" in r
+
+    def test_reset_idle_hold_configures(self, raiden):
+        # IDLE HOLD = keep driving nRST after the pulse (reliable on Nucleo).
+        r = raiden.cmd("TARGET RESET IDLE HOLD")
+        assert "OK" in r and "HOLD" in r
+        raiden.cmd("TARGET RESET IDLE FLOAT")   # restore default
+
+    def test_reset_idle_missing_mode_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET IDLE")
+        assert "ERROR" in r
+
+    def test_reset_idle_unknown_mode_rejected(self, raiden):
+        r = raiden.cmd("TARGET RESET IDLE WIBBLE")
+        assert "ERROR" in r and "WIBBLE" in r
+
     def test_target_timeout_roundtrip(self, raiden):
         raiden.cmd("TARGET TIMEOUT 100")
         r = raiden.cmd("TARGET TIMEOUT")
@@ -494,6 +536,21 @@ class TestTargetReset:
     def test_target_power_cycle(self, raiden):
         r = raiden.cmd("TARGET POWER CYCLE 100", wait=1.5)
         assert "ERROR" not in r
+
+    @pytest.mark.parametrize("cmd", ["TARGET REBOOT", "TARGET REBOOT 100",
+                                     "TARGET POWER REBOOT 100", "TARGET REB 100"])
+    def test_target_reboot_alias(self, raiden, cmd):
+        """TARGET REBOOT / TARGET POWER REBOOT are aliases for TARGET POWER CYCLE."""
+        r = raiden.cmd(cmd, wait=1.5)
+        assert "ERROR" not in r
+        assert "OK: Target power cycling" in r
+
+    @pytest.mark.parametrize("cmd", ["TARGET REBOOT WIBBLE", "TARGET REBOOT 100 200",
+                                     "TARGET POWER REBOOT WIBBLE", "TARGET POWER CYCLE 100 200"])
+    def test_target_reboot_bad_args(self, raiden, cmd):
+        r = raiden.cmd(cmd, wait=1.5)
+        assert "ERROR" in r
+        assert "cycling" not in r
 
     def test_target_bad_subcommand(self, raiden):
         r = raiden.cmd("TARGET FOOBAR")
@@ -634,6 +691,13 @@ class TestPsu:
         finally:
             raiden.cmd("TARGET POWER OFF")
 
+    def test_help_documents_gp12_crowbar_coexistence(self, raiden):
+        """The crowbar gate is GP12 (moved off GP11 so it coexists with the PSU
+        UART on GP10/11); HELP must say so. Text-only — no pin is driven."""
+        r = raiden.cmd("HELP", wait=5)
+        assert "EXT = GP10 supply, GP11 spare, GP12 crowbar gate" in r
+        assert "GP12 crowbar gate stay usable alongside the PSU" in r
+
 
 # ── Glitch execution ─────────────────────────────────────────
 
@@ -671,6 +735,61 @@ class TestGlitch:
     def test_reset_command(self, raiden):
         r = raiden.cmd("RESET")
         assert "ERROR" not in r
+
+
+# ── GLITCH_FIRED (GP22) marker latch ─────────────────────────
+# GP22 is LOW from ARM until a fire and HIGH afterwards (until the next ARM).
+# Regression: PIO0's GP22 output latch was never cleared, so after a manual
+# GLITCH it stayed HIGH through the next ARM (no rising edge for a scope / TRACE,
+# and clock boost started at arm), and any later arm that handed GP22 back to
+# PIO (UART, ARM TRACE) picked the stale HIGH up. STATUS reports the pad level,
+# so this is checkable over USB with nothing wired (only GP2/GP7/GP22 toggle).
+
+def _gp22(raiden):
+    r = raiden.cmd("STATUS", wait=2)
+    m = re.search(r"Fired \(GP22\):\s*(HIGH|LOW)", r)
+    assert m, "STATUS is missing the 'Fired (GP22):' line"
+    return m.group(1)
+
+
+def _manual_fire(raiden):
+    raiden.cmd("ARM OFF")
+    raiden.cmd("TRIGGER NONE")
+    raiden.cmd("SET PAUSE 0")
+    assert "OK: System armed" in raiden.cmd("ARM ON")
+    assert "Glitch executed" in raiden.cmd("GLITCH")
+
+
+class TestGlitchFiredMarker:
+
+    def test_manual_glitch_latches_and_rearm_clears(self, raiden):
+        for _ in range(3):   # repeatable: every ARM clears, every GLITCH sets
+            raiden.cmd("ARM OFF")
+            raiden.cmd("TRIGGER NONE")
+            raiden.cmd("ARM ON")
+            assert _gp22(raiden) == "LOW", "GP22 not cleared by ARM"
+            raiden.cmd("GLITCH")
+            assert _gp22(raiden) == "HIGH", "GP22 not latched by GLITCH"
+        raiden.cmd("ARM OFF")
+
+    @pytest.mark.parametrize("trigger,arm", [
+        ("TRIGGER UART 3F RX", "ARM ON"),      # hands GP22 back to PIO (UART decoder)
+        ("TRIGGER GPIO RISING", "ARM ON"),
+        ("TRIGGER I2C 0x11", "ARM ON"),        # GP22 on SIO
+        ("TRIGGER UART 3F RX", "ARM TRACE"),   # the stale-latch case on the trace path
+        ("TRIGGER GPIO RISING", "ARM TRACE"),
+        ("TRIGGER I2C 0x11", "ARM TRACE"),
+    ])
+    def test_rearm_on_other_trigger_clears_gp22(self, raiden, trigger, arm):
+        _manual_fire(raiden)
+        assert _gp22(raiden) == "HIGH"
+        raiden.cmd(trigger)
+        assert "armed" in raiden.cmd(arm).lower()
+        try:
+            assert _gp22(raiden) == "LOW", f"GP22 still HIGH after {trigger} + {arm}"
+        finally:
+            raiden.cmd("ARM OFF")
+            raiden.cmd("TRIGGER NONE")
 
 
 # ── Auto power-on at the connect/sync choke points ───────────
@@ -922,3 +1041,39 @@ class TestShadowtraceErrors:
         r = raiden.cmd("TARGET GLITCH SHADOWTRACE 1400 WIBBLE")
         assert "ERROR" in r
         assert "Invalid reps" in r
+
+
+# ── TARGET I2C STRETCH / DLY (experimental; cli-errors rule) ──
+
+class TestI2CStretchDly:
+    """Experimental I2C clock-stretch decision-time tooling. config_none covers the
+    no-bus paths: DLY sets/queries a variable (no reset, no I2C traffic) and the
+    argument error paths. The STRETCH *measurement* drives the I2C bus, so its happy
+    path is gated behind --config=swd-bl, not here. (A target type must be set first
+    because the whole TARGET I2C path is STM32-only.)"""
+
+    def test_i2c_dly_set_and_query(self, raiden):
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C DLY 50")
+        assert "OK" in r and "50" in r
+        r = raiden.cmd("TARGET I2C DLY")
+        assert "50" in r
+        raiden.cmd("TARGET I2C DLY 100")   # restore default
+
+    def test_i2c_dly_out_of_range_rejected(self, raiden):
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C DLY 999999")
+        assert "ERROR" in r
+
+    def test_i2c_stretch_bad_count_rejected(self, raiden):
+        # Bad N errors before any bus activity (never reaches the measurement).
+        raiden.cmd("TARGET STM32F4")
+        r = raiden.cmd("TARGET I2C STRETCH notanumber")
+        assert "ERROR" in r
+
+    def test_i2c_non_stm32_target_rejected(self, raiden):
+        # The whole TARGET I2C path is STM32-only; a non-STM32 target must error.
+        raiden.cmd("TARGET LPC")
+        r = raiden.cmd("TARGET I2C DLY 50")
+        assert "ERROR" in r and "STM32" in r
+        raiden.cmd("TARGET STM32F4")   # restore a sane type for following tests

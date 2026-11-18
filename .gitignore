@@ -30,6 +30,12 @@ Makefile
 *.map
 *.dis
 *.lst
+*.o
+*.tar.gz
+
+# Bench scratch / tool artifacts (not part of the firmware project)
+tmp/
+*.jlink
 
 # IDE files
 .vscode/
@@ -52,5 +58,10 @@ node_modules/
 *.csv
 *.uue
 glitch_log_*.html
+jtag_glitch_log_*.html
 .claude/settings.local.json
 .claude/scheduled_tasks.*
+
+# Claude Code local tooling / session artifacts (not part of the firmware project)
+.claude/
+blocked-session.txt
